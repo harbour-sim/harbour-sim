@@ -27,7 +27,11 @@ you leave them, with a centre detent — drive with two thumbs. Drag the two
 compass dials (top corners) to set wind and current — drag direction is
 where the flow goes toward, distance is speed (centre = calm). Pinch
 anywhere on the water to zoom — from a berth-threading close-up out to a
-~450 m sweep of the marina (scroll wheel does the same with a mouse). The
+~450 m sweep of the marina (scroll wheel does the same with a mouse) —
+and drag with one finger (or the mouse) to pan — the camera keeps
+following the boat at the panned offset, so you can watch your own
+approach from over the berth; a CENTER button appears while panned to
+snap the view back onto the boat. The
 RESET button returns the boat to its fairway start, engine to neutral,
 helm amidships.
 
@@ -43,6 +47,7 @@ helm amidships.
 | J / L | Rotate current direction |
 | I / K | Current speed |
 | + / - | Zoom in / out (also mouse wheel) |
+| C | Centre the camera back on the boat |
 | R | Reset the boat to its fairway start |
 | E | Keel design editor |
 

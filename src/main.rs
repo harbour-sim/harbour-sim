@@ -257,6 +257,19 @@ async fn main() {
     // a camera preference — it survives resets and respawns.
     let mut zoom = 1.0f32;
     let mut pinch: Option<(u64, u64, f32)> = None;
+    // Camera pan: an OFFSET from the boat, in world metres (one-finger
+    // drag on the water, or a mouse drag — mouse_claim 4). The camera
+    // keeps FOLLOWING the boat while panned, displaced by this — watch
+    // your own approach from over the berth, say — rather than freezing
+    // on a fixed world point (owner request 2026-08-05; the fixed-anchor
+    // version was tried first and replaced). Cleared by the CENTER
+    // button / C key and by any respawn.
+    let mut cam_offset = Vec2::ZERO;
+    let mut pan_touch: Option<(u64, Vec2)> = None;
+    let mut pan_mouse_prev = Vec2::ZERO;
+    // Last frame's camera scale, for converting a pan's screen delta to
+    // world metres at input time (the camera block runs later).
+    let mut last_scale = 1.0f32;
 
     loop {
         let dt = get_frame_time().min(0.05);
@@ -310,6 +323,16 @@ async fn main() {
             keel_w,
             keel_h,
         );
+        // CENTER button, left of KEEL — the touch/mouse twin of the C key.
+        // Only shown (and only hittable) while the camera is panned away
+        // from the boat, so the button row stays uncluttered otherwise.
+        let center_w = fs * 5.2;
+        let center_rect = Rect::new(
+            keel_rect.x - margin - center_w,
+            sh - sa_b - margin - keel_h,
+            center_w,
+            keel_h,
+        );
         // Helm/engine sliders on the mid-left/mid-right edges — the
         // two-thumb zone on a phone, clear of the dials above (centre at
         // 0.56·sh keeps the throttle's top under the wind dial's label
@@ -328,6 +351,7 @@ async fn main() {
         if !editor.active {
             let mut do_reset = is_key_pressed(KeyCode::R);
             let mut do_open_editor = false;
+            let mut do_center = is_key_pressed(KeyCode::C);
 
             // --- Touch input: dial drags + reset/keel taps -----------------
             let ts = touches();
@@ -361,6 +385,8 @@ async fn main() {
                         do_reset = true;
                     } else if keel_rect.contains(p) {
                         do_open_editor = true;
+                    } else if cam_offset.length() > 0.5 && center_rect.contains(p) {
+                        do_center = true;
                     }
                 }
                 if wind_claim == Some(t.id) {
@@ -391,10 +417,13 @@ async fn main() {
             }
             prev_touch_ids = cur_ids;
 
-            // --- Pinch to zoom: exactly two fingers that are NOT holding a
-            // HUD control. Tracked by the sorted id pair so a third finger
-            // landing on a slider (or one of the pair being recycled) ends
-            // the gesture instead of jumping the zoom.
+            // --- Pan and pinch on fingers that are NOT holding a HUD
+            // control. One free finger drags the camera's follow-offset
+            // off the boat (see `cam_offset`); exactly two free fingers
+            // pinch-zoom, tracked by the sorted id pair so a third finger
+            // landing on a slider (or one of the pair being recycled)
+            // ends the gesture instead of jumping the zoom. Pinch does
+            // NOT pan — zoom leaves the offset alone.
             let free: Vec<(u64, Vec2)> = ts
                 .iter()
                 .filter(|t| {
@@ -405,18 +434,34 @@ async fn main() {
                 })
                 .map(|t| (t.id, t.position / dpi))
                 .collect();
-            if let [(ida, pa), (idb, pb)] = free[..] {
-                let key = (ida.min(idb), ida.max(idb));
-                let d = (pa - pb).length();
-                if let Some((a, b, d0)) = pinch
-                    && (a, b) == key
-                    && d0 > 1.0
-                {
-                    zoom *= d / d0;
+            match free[..] {
+                [(id, p)] => {
+                    if let Some((pid, prev)) = pan_touch
+                        && pid == id
+                    {
+                        let d = p - prev;
+                        cam_offset.x -= d.x / last_scale;
+                        cam_offset.y += d.y / last_scale; // screen y is inverted
+                    }
+                    pan_touch = Some((id, p));
+                    pinch = None;
                 }
-                pinch = Some((key.0, key.1, d));
-            } else {
-                pinch = None;
+                [(ida, pa), (idb, pb)] => {
+                    let key = (ida.min(idb), ida.max(idb));
+                    let d = (pa - pb).length();
+                    if let Some((a, b, d0)) = pinch
+                        && (a, b) == key
+                        && d0 > 1.0
+                    {
+                        zoom *= d / d0;
+                    }
+                    pinch = Some((key.0, key.1, d));
+                    pan_touch = None;
+                }
+                _ => {
+                    pinch = None;
+                    pan_touch = None;
+                }
             }
 
             // --- Mouse input: same dials, same gesture ---------------------
@@ -434,6 +479,12 @@ async fn main() {
                     do_reset = true;
                 } else if keel_rect.contains(mp) {
                     do_open_editor = true;
+                } else if cam_offset.length() > 0.5 && center_rect.contains(mp) {
+                    do_center = true;
+                } else {
+                    // Anywhere on the water: drag to pan (claim 4).
+                    mouse_claim = Some(4);
+                    pan_mouse_prev = mp;
                 }
             }
             if is_mouse_button_down(MouseButton::Left) {
@@ -450,6 +501,12 @@ async fn main() {
                     }
                     Some(2) => input.throttle = throttle_slider.value(mp),
                     Some(3) => input.rudder = rudder_slider.value(mp),
+                    Some(4) => {
+                        let d = mp - pan_mouse_prev;
+                        cam_offset.x -= d.x / last_scale;
+                        cam_offset.y += d.y / last_scale; // screen y is inverted
+                        pan_mouse_prev = mp;
+                    }
                     _ => {}
                 }
             } else {
@@ -521,6 +578,9 @@ async fn main() {
                 zoom *= 2.0f32.powf(-dt);
             }
 
+            if do_center {
+                cam_offset = Vec2::ZERO;
+            }
             if do_reset {
                 // Fresh Sim per run — never reuse one (determinism rule).
                 (sim, prev_pos, prev_heading, cur_pos, cur_heading) = respawn(&design);
@@ -528,6 +588,8 @@ async fn main() {
                 // Helm and engine come back neutral with the fresh boat;
                 // the environment deliberately persists (same as always).
                 input = InputState::NEUTRAL;
+                // A fresh boat gets the camera back too (zoom persists).
+                cam_offset = Vec2::ZERO;
             }
             if do_open_editor {
                 editor.load_design(&design);
@@ -564,16 +626,28 @@ async fn main() {
         let (wb, wt) = (bmin.y - 6.0, bmax.y + 6.0);
         let vis_hw = sw * 0.5 / scale;
         let vis_hh = sh * 0.5 / scale;
+        // Keep the pan target inside the world, so shoving the offset
+        // against the edge racks up no invisible travel to undo later —
+        // clamped as a POINT (boat + offset), then folded back into the
+        // offset. With a zero offset the boat is always inside the world,
+        // so this can never conjure an offset out of nothing.
+        cam_offset = vec2(
+            (pos.x + cam_offset.x).clamp(wl, wr) - pos.x,
+            (pos.y + cam_offset.y).clamp(wb, wt) - pos.y,
+        );
+        // Follow the boat, displaced by the pan offset.
+        let follow = pos + cam_offset;
         let cam_x = if vis_hw * 2.0 >= wr - wl {
             (wl + wr) * 0.5
         } else {
-            pos.x.clamp(wl + vis_hw, wr - vis_hw)
+            follow.x.clamp(wl + vis_hw, wr - vis_hw)
         };
         let cam_y = if vis_hh * 2.0 >= wt - wb {
             (wb + wt) * 0.5
         } else {
-            pos.y.clamp(wb + vis_hh, wt - vis_hh)
+            follow.y.clamp(wb + vis_hh, wt - vis_hh)
         };
+        last_scale = scale;
         let w2s = |p: Vec2| -> Vec2 {
             vec2(sw * 0.5 + (p.x - cam_x) * scale, sh * 0.5 - (p.y - cam_y) * scale)
         };
@@ -1121,26 +1195,56 @@ async fn main() {
             text,
         );
 
+        // Centre-on-boat button (left of KEEL) — only while the camera is
+        // panned off the boat; the touch/mouse twin of the C key.
+        if cam_offset.length() > 0.5 {
+            draw_rectangle(
+                center_rect.x,
+                center_rect.y,
+                center_rect.w,
+                center_rect.h,
+                Color::from_rgba(10, 20, 30, 170),
+            );
+            draw_rectangle_lines(
+                center_rect.x,
+                center_rect.y,
+                center_rect.w,
+                center_rect.h,
+                2.0,
+                dim,
+            );
+            let cl = measure_text("CENTER", None, fs as u16, 1.0);
+            draw_text(
+                "CENTER",
+                center_rect.x + (center_rect.w - cl.width) * 0.5,
+                center_rect.y + center_rect.h * 0.5 + fs * 0.35,
+                fs,
+                text,
+            );
+        }
+
         // Hints, bottom-left. Keyboard lines only where a keyboard is
         // likely (wide screens); ASCII only — the built-in font has no
         // arrow glyphs. Indented past the HTML About button (index.html),
         // which owns the bottom-left corner itself (30 px + gaps; the
         // indent is harmless dead space in native builds, which have no
         // HTML layer).
-        let mut help: Vec<&str> =
-            vec!["left slider = engine, right = rudder; dials set wind & current; pinch = zoom"];
+        let mut help: Vec<&str> = vec![
+            "left slider = engine, right = rudder; dials set wind & current; pinch/drag = zoom/pan",
+        ];
         if sw >= 700.0 {
             help.push("keys: W/S throttle, A/D rudder, Space stop engine, arrows wind");
-            help.push("I/K+J/L = current, R = reset, E = keel editor, wheel or +/- = zoom");
+            help.push("I/K+J/L = current, R = reset, E = keel editor, wheel/+- = zoom, C = centre");
         }
         let help_x = sa_l + margin + 40.0;
-        // On narrow screens the hint line runs under the KEEL/RESET buttons
-        // (they share the bottom edge) — lift the block above them then.
+        // On narrow screens the hint line runs under the buttons (they
+        // share the bottom edge) — lift the block above them then.
+        let buttons_left = if cam_offset.length() > 0.5 { center_rect.x } else { keel_rect.x };
         let help_w = help
             .iter()
             .map(|l| measure_text(l, None, (fs * 0.8) as u16, 1.0).width)
             .fold(0.0, f32::max);
-        let help_base = if help_x + help_w > keel_rect.x - margin {
+        let help_base = if help_x + help_w > buttons_left - margin {
             keel_rect.y - margin
         } else {
             sh - sa_b - margin
@@ -1174,6 +1278,8 @@ async fn main() {
                     design = editor.design();
                     (sim, prev_pos, prev_heading, cur_pos, cur_heading) = respawn(&design);
                     accum = 0.0;
+                    // Respawn = camera back on the boat (zoom persists).
+                    cam_offset = Vec2::ZERO;
                     editor.active = false;
                 }
                 EditorAction::Cancel => {

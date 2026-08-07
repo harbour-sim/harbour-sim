@@ -889,11 +889,25 @@ like Pegasus.
   admitted. Pinch = exactly two touches NOT claimed by any HUD control,
   tracked by sorted id pair (a control-claimed finger never pinches; a
   recycled or third finger ends the gesture instead of jumping the
-  zoom); zooming is about the follow-point, no panning. **Wheel-delta
+  zoom). **Wheel-delta
   gotcha**: native reports ±1 per notch, web reports deltaY PIXELS
   (~±100 per notch) — deltas ≥40 are treated as pixels (/240), smaller
   ones as notches (×0.25), both bounded per event. Zoom is a camera
-  preference: it survives R-reset and editor Apply.
+  preference: it survives R-reset and editor Apply. **Pan** (2026-08-05):
+  ONE free finger dragging the water (or a mouse drag — `mouse_claim` 4)
+  shifts a FOLLOW-OFFSET (`cam_offset`, world metres relative to the
+  boat) — the camera keeps following the boat while panned, displaced
+  by the offset (owner spec, second pass same day: a fixed-world-point
+  anchor was tried first and replaced — it froze the view while the
+  boat sailed off). Pan deltas convert screen→world via the PREVIOUS
+  frame's scale (`last_scale` — input runs before the camera block).
+  The offset is folded through a world-rect clamp of the target POINT
+  each frame, so shoving against the edge racks up no invisible travel,
+  and a zero offset can never turn nonzero on its own (the boat is
+  always inside the world). Pinch/wheel zoom leaves the offset alone.
+  A CENTER button (twin of the C key) appears left of KEEL ONLY while
+  the offset is >0.5 m; C, CENTER, R-reset and editor Apply all zero it
+  (zoom persists throughout).
 - **Touch controls**: the two HUD compass indicators are draggable **dials**
   (`Dial` struct) — drag direction from the dial centre = the flow's TOWARD
   direction (wind label still displays the mariners' FROM convention:
@@ -935,8 +949,10 @@ like Pegasus.
   boil forward along the quarters astern; the rudder blade itself is drawn
   BEFORE the hull fill (root under the counter), swinging by the same
   blade-angle formula sim-core uses.
-- Controls: touch/mouse = drag the dials/sliders + RESET/KEEL buttons,
-  pinch = zoom, scroll wheel / +/- keys = zoom (desktop twin);
+- Controls: touch/mouse = drag the dials/sliders + RESET/KEEL buttons
+  (+ CENTER while panned), pinch = zoom, one-finger/mouse drag on the
+  water = pan, scroll wheel / +/- keys = zoom and C = centre (desktop
+  twins);
   keyboard = **the boat has the primary keys** (agreed 2026-08-03: driving
   is the main activity): W/S throttle up/down, A/D helm port/starboard
   (continuous `is_key_down`×dt like the env keys), Space = engine to
