@@ -13,8 +13,8 @@
 
 use harbour_sim_core::boat::BoatDesign;
 use harbour_sim_core::sim::{
-    BASIN_BOTTOM_Y, BASIN_HALF_W, Env, HULL_PTS, InputState, PHYSICS_DT, QUAY_DEPTH, QUAY_HALF_W,
-    QUAY_Y, Sim,
+    Env, HULL_PTS, InputState, JETTY_HALF_W, PHYSICS_DT, POLE_RADIUS, Sim, head_arc, hill_shore,
+    jetties, marina_shore_len, moored_boats, pole_positions, road_shore, world_bounds,
 };
 use keel_editor::{EditorAction, EditorLayout, KeelEditor};
 use macroquad::prelude::*;
@@ -26,9 +26,10 @@ mod keel_editor;
 // VIEW_MAX_W × VIEW_MAX_H metres, never fewer than VIEW_MIN_W metres across.
 // The camera fills the window (cropping the other axis) and follows the
 // boat, clamped to the world rect — that's what makes a portrait phone show
-// a sensible close-up instead of letterboxing the whole 88 m basin.
-const VIEW_MAX_W: f32 = 88.0;
-const VIEW_MAX_H: f32 = 46.0;
+// a sensible close-up. The marina itself is ~400 m long, so even at max
+// zoom-out only a stretch of it is in frame and the camera pans with you.
+const VIEW_MAX_W: f32 = 150.0;
+const VIEW_MAX_H: f32 = 85.0;
 const VIEW_MIN_W: f32 = 30.0;
 
 // Environment knob rates (per second of key held) and ranges. The touch
@@ -95,6 +96,33 @@ fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
         d += std::f32::consts::TAU;
     }
     a + d * t
+}
+
+/// Offset a polyline to the LEFT of its direction of travel by `d`
+/// (per-vertex averaged segment normals — plenty for the shore's gentle
+/// bends). The road shore runs SW→NE, so left = inland NW; the hill
+/// shore's inland side is its right (pass a negative `d`).
+fn offset_polyline(pts: &[Vec2], d: f32) -> Vec<Vec2> {
+    let n = pts.len();
+    (0..n)
+        .map(|i| {
+            let din = if i > 0 { (pts[i] - pts[i - 1]).normalize_or_zero() } else { Vec2::ZERO };
+            let dout =
+                if i + 1 < n { (pts[i + 1] - pts[i]).normalize_or_zero() } else { Vec2::ZERO };
+            let t = (din + dout).normalize_or_zero();
+            pts[i] + vec2(-t.y, t.x) * d
+        })
+        .collect()
+}
+
+/// Fill the ribbon between two equal-length polylines (a quad strip).
+fn draw_strip(a: &[Vec2], b: &[Vec2], w2s: impl Fn(Vec2) -> Vec2, col: Color) {
+    for i in 0..a.len().min(b.len()).saturating_sub(1) {
+        let (p0, p1) = (w2s(a[i]), w2s(a[i + 1]));
+        let (q0, q1) = (w2s(b[i]), w2s(b[i + 1]));
+        draw_triangle(p0, p1, q1, col);
+        draw_triangle(p0, q1, q0, col);
+    }
 }
 
 /// A draggable compass dial (screen-space geometry, css px).
@@ -166,6 +194,31 @@ async fn main() {
     let mut design = BoatDesign::hallberg_rassy_38();
     let mut sim = Sim::new_with_design(&design);
     let mut editor = KeelEditor::new(&design);
+
+    // --- Static scenery, computed once. sim-core is the single source of
+    // truth for all of it: what's drawn IS what collides.
+    let jetty_list = jetties();
+    let poles = pole_positions();
+    let moored = moored_boats();
+    let road = road_shore();
+    let hill = hill_shore();
+    let head = head_arc();
+    let n_marina = marina_shore_len();
+    let (bmin, bmax) = world_bounds();
+    // Land fills reach far enough inland to cover the whole view whenever
+    // the camera sits against the world clamp.
+    let road_land = offset_polyline(&road, 260.0);
+    let road_apron = offset_polyline(&road, 1.8);
+    let hill_rock = offset_polyline(&hill, -2.0);
+    let hill_land = offset_polyline(&hill, -260.0);
+    // The rounded bay head's land rings: scaled copies of the arc about
+    // its chord centre (a silt-green waterline band, then grass beyond).
+    let head_center = (road[0] + hill[0]) * 0.5;
+    let head_ring = |k: f32| -> Vec<Vec2> {
+        head.iter().map(|&p| head_center + (p - head_center) * k).collect()
+    };
+    let head_silt = head_ring(1.18);
+    let head_land = head_ring(5.0);
     let mut env = Env {
         wind_from_deg: 315.0,
         wind_speed: 6.0,
@@ -442,8 +495,8 @@ async fn main() {
 
         // --- Camera: fill the screen, follow the boat, clamp to world ----
         let scale = (sw / VIEW_MAX_W).max(sh / VIEW_MAX_H).min(sw / VIEW_MIN_W);
-        let (wl, wr) = (-BASIN_HALF_W - 1.5, BASIN_HALF_W + 1.5);
-        let (wb, wt) = (BASIN_BOTTOM_Y - 1.5, QUAY_Y + QUAY_DEPTH);
+        let (wl, wr) = (bmin.x - 6.0, bmax.x + 6.0);
+        let (wb, wt) = (bmin.y - 6.0, bmax.y + 6.0);
         let vis_hw = sw * 0.5 / scale;
         let vis_hh = sh * 0.5 / scale;
         let cam_x = if vis_hw * 2.0 >= wr - wl {
@@ -459,79 +512,249 @@ async fn main() {
         let w2s = |p: Vec2| -> Vec2 {
             vec2(sw * 0.5 + (p.x - cam_x) * scale, sh * 0.5 - (p.y - cam_y) * scale)
         };
+        // Cheap visibility cull for the marina's many static props.
+        let vis_r = vec2(vis_hw, vis_hh).length();
+        let visible = |p: Vec2, r: f32| (p - vec2(cam_x, cam_y)).length() < vis_r + r;
 
         // --- Water -------------------------------------------------------
-        clear_background(Color::from_rgba(9, 26, 38, 255));
-        let water_a = w2s(vec2(-BASIN_HALF_W, QUAY_Y));
-        let water_b = w2s(vec2(BASIN_HALF_W, BASIN_BOTTOM_Y));
-        draw_rectangle(
-            water_a.x,
-            water_a.y,
-            water_b.x - water_a.x,
-            water_b.y - water_a.y,
-            Color::from_rgba(16, 48, 66, 255),
-        );
+        clear_background(Color::from_rgba(12, 38, 54, 255));
+        let water = Color::from_rgba(16, 48, 66, 255);
+        // One strip covers the channel AND the widening sea past the
+        // entrance (the shore polylines continue out along the sea coast);
+        // a fan over the head arc fills the rounded bay head.
+        draw_strip(&road, &hill, w2s, water);
+        for i in 1..head.len() - 1 {
+            draw_triangle(w2s(head[0]), w2s(head[i]), w2s(head[i + 1]), water);
+        }
 
         // Cosmetic ripples: short streaks drifting with the current (and a
-        // touch of wind), wrapped over the basin. Purely render-side.
+        // touch of wind), wrapped over the world box. Purely render-side —
+        // the land fills drawn next cover the strays that land ashore.
         let t = get_time() as f32;
         let drift = env.current_vel() + env.wind_vel() * 0.02;
-        for i in 0u32..70 {
+        let (bw, bh) = (bmax.x - bmin.x, bmax.y - bmin.y);
+        for i in 0u32..220 {
             let h = i.wrapping_mul(2654435761);
             let fx = (h & 0xffff) as f32 / 65535.0;
             let fy = ((h >> 16) & 0xffff) as f32 / 65535.0;
-            let bw = BASIN_HALF_W * 2.0;
-            let bh = QUAY_Y - BASIN_BOTTOM_Y;
-            let x = (fx * bw + drift.x * t).rem_euclid(bw) - BASIN_HALF_W;
-            let y = (fy * bh + drift.y * t).rem_euclid(bh) + BASIN_BOTTOM_Y;
+            let x = (fx * bw + drift.x * t).rem_euclid(bw) + bmin.x;
+            let y = (fy * bh + drift.y * t).rem_euclid(bh) + bmin.y;
+            if !visible(vec2(x, y), 2.0) {
+                continue;
+            }
             let a = w2s(vec2(x, y));
             let b = w2s(vec2(x + 1.4, y));
             draw_line(a.x, a.y, b.x, b.y, 1.5, Color::from_rgba(120, 170, 190, 26));
         }
 
-        // --- Quay + breakwaters -----------------------------------------
-        let qa = w2s(vec2(-QUAY_HALF_W, QUAY_Y + QUAY_DEPTH));
-        let qb = w2s(vec2(QUAY_HALF_W, QUAY_Y));
-        draw_rectangle(qa.x, qa.y, qb.x - qa.x, qb.y - qa.y, Color::from_rgba(88, 92, 99, 255));
-        let mut jx = -QUAY_HALF_W + 4.0;
-        while jx < QUAY_HALF_W {
-            let a = w2s(vec2(jx, QUAY_Y));
-            let b = w2s(vec2(jx, QUAY_Y + QUAY_DEPTH));
-            draw_line(a.x, a.y, b.x, b.y, 1.0, Color::from_rgba(70, 74, 80, 255));
-            jx += 4.0;
+        // --- Shore (Hinsholmen look: road side NW, wooded hill SE) --------
+        // Deterministic scatter helper for trees: same hash idiom as the
+        // ripples, but static (no time term) — pure scenery.
+        let hash01 = |i: u32, salt: u32| -> (f32, f32, f32) {
+            let h = i.wrapping_add(salt).wrapping_mul(2654435761);
+            (
+                (h & 0xffff) as f32 / 65535.0,
+                ((h >> 16) & 0x7fff) as f32 / 32767.0,
+                ((h >> 8) & 0xff) as f32 / 255.0,
+            )
+        };
+        let grass = Color::from_rgba(58, 88, 52, 255);
+        let tree_a = Color::from_rgba(40, 70, 40, 255);
+        let tree_b = Color::from_rgba(48, 80, 44, 255);
+        let rock = Color::from_rgba(98, 100, 96, 255);
+        let forest = Color::from_rgba(36, 60, 40, 255);
+        // Road (dock-carrying) shore: grass from the waterline inland,
+        // with the concrete quay apron drawn over it along the MARINA
+        // stretch only — past the entrance the coast runs wild.
+        draw_strip(&road, &road_land, w2s, grass);
+        draw_strip(
+            &road[..n_marina],
+            &road_apron[..n_marina],
+            w2s,
+            Color::from_rgba(126, 128, 126, 255),
+        );
+        for i in 0..road.len() - 1 {
+            let (sa, sb) = (road[i], road[i + 1]);
+            let seg = sb - sa;
+            let n = vec2(-seg.y, seg.x).normalize_or_zero(); // inland
+            for k in 0u32..6 {
+                let (f, d, r) = hash01(i as u32 * 8 + k, 11);
+                let p = sa + seg * f + n * (4.0 + d * 22.0);
+                if !visible(p, 3.0) {
+                    continue;
+                }
+                let sp = w2s(p);
+                let col = if (i + k as usize).is_multiple_of(2) { tree_a } else { tree_b };
+                draw_circle(sp.x, sp.y, (0.8 + r * 1.0) * scale, col);
+            }
         }
-        // Edge kerb + hanging fenders (visual; the collider is the line).
-        let ea = w2s(vec2(-QUAY_HALF_W, QUAY_Y + 0.35));
-        let eb = w2s(vec2(QUAY_HALF_W, QUAY_Y));
-        draw_rectangle(ea.x, ea.y, eb.x - ea.x, eb.y - ea.y, Color::from_rgba(60, 63, 68, 255));
-        let mut fx = -QUAY_HALF_W + 2.0;
-        while fx < QUAY_HALF_W {
-            let f = w2s(vec2(fx, QUAY_Y - 0.35));
-            draw_rectangle(
-                f.x - 0.25 * scale,
-                f.y - 0.35 * scale,
-                0.5 * scale,
-                0.7 * scale,
-                Color::from_rgba(20, 22, 26, 255),
-            );
-            fx += 4.0;
+        // Hill (SE) shore: a rocky waterline, forest behind.
+        draw_strip(&hill_rock, &hill, w2s, rock);
+        draw_strip(&hill_land, &hill_rock, w2s, forest);
+        for i in 0..hill.len() - 1 {
+            let (sa, sb) = (hill[i], hill[i + 1]);
+            let seg = sb - sa;
+            let n = vec2(seg.y, -seg.x).normalize_or_zero(); // inland (SE)
+            for k in 0u32..8 {
+                let (f, d, r) = hash01(i as u32 * 8 + k, 97);
+                let p = sa + seg * f + n * (2.5 + d * 26.0);
+                if !visible(p, 3.0) {
+                    continue;
+                }
+                let sp = w2s(p);
+                let col = if (i + k as usize).is_multiple_of(2) { tree_a } else { tree_b };
+                draw_circle(sp.x, sp.y, (0.9 + r * 1.2) * scale, col);
+            }
         }
-        let mut bx = -QUAY_HALF_W + 4.0;
-        while bx < QUAY_HALF_W {
-            let b = w2s(vec2(bx, QUAY_Y + 1.0));
-            draw_circle(b.x, b.y, 0.35 * scale, Color::from_rgba(30, 32, 36, 255));
-            bx += 8.0;
+        // The rounded bay head: a silted-green shallow band right at the
+        // waterline, grass beyond (the land rings are scaled copies of
+        // the same arc the wall collider uses).
+        draw_strip(&head, &head_silt, w2s, Color::from_rgba(74, 96, 74, 255));
+        draw_strip(&head_silt, &head_land, w2s, grass);
+        // The skerry line closing the open sea (the boundary polyline's
+        // segment between the two coasts' far ends): a chain of rocky
+        // islets along the world's edge.
+        {
+            let (a, b) = (road[road.len() - 1], hill[hill.len() - 1]);
+            for i in 0u32..14 {
+                let (f, d, r) = hash01(i, 53);
+                let p = a + (b - a) * ((i as f32 + 0.5 + (f - 0.5) * 0.6) / 14.0)
+                    + (b - a).normalize_or_zero().perp() * ((d - 0.5) * 6.0);
+                if !visible(p, 8.0) {
+                    continue;
+                }
+                let sp = w2s(p);
+                draw_circle(sp.x, sp.y, (2.0 + r * 3.5) * scale, rock);
+            }
         }
-        // Breakwaters: the three basin walls, drawn as stone strips.
-        let stone = Color::from_rgba(66, 70, 76, 255);
-        for (a, b) in [
-            (vec2(-BASIN_HALF_W - 1.5, QUAY_Y), vec2(-BASIN_HALF_W, BASIN_BOTTOM_Y - 1.5)),
-            (vec2(-BASIN_HALF_W - 1.5, BASIN_BOTTOM_Y), vec2(BASIN_HALF_W + 1.5, BASIN_BOTTOM_Y - 1.5)),
-            (vec2(BASIN_HALF_W, QUAY_Y), vec2(BASIN_HALF_W + 1.5, BASIN_BOTTOM_Y - 1.5)),
-        ] {
-            let sa = w2s(a);
-            let sb = w2s(b);
-            draw_rectangle(sa.x, sa.y, sb.x - sa.x, sb.y - sa.y, stone);
+
+        // --- Pontoon jetties ----------------------------------------------
+        let deck = Color::from_rgba(168, 162, 148, 255);
+        let deck_seam = Color::from_rgba(146, 140, 126, 255);
+        let deck_edge = Color::from_rgba(110, 104, 92, 255);
+        for j in &jetty_list {
+            let mid = j.root + j.dir * (j.len * 0.5);
+            if !visible(mid, j.len * 0.5 + 6.0) {
+                continue;
+            }
+            let side = j.side();
+            let (r0, r1) = (j.root + side * JETTY_HALF_W, j.root - side * JETTY_HALF_W);
+            let (t0, t1) =
+                (r0 + j.dir * j.len, r1 + j.dir * j.len);
+            let (sr0, sr1, st0, st1) = (w2s(r0), w2s(r1), w2s(t0), w2s(t1));
+            draw_triangle(sr0, sr1, st1, deck);
+            draw_triangle(sr0, st1, st0, deck);
+            // Transverse deck seams every couple of metres.
+            let mut d = 2.0;
+            while d < j.len {
+                let l = w2s(r0 + j.dir * d);
+                let r = w2s(r1 + j.dir * d);
+                draw_line(l.x, l.y, r.x, r.y, 1.0, deck_seam);
+                d += 2.0;
+            }
+            draw_line(sr0.x, sr0.y, st0.x, st0.y, 1.5, deck_edge);
+            draw_line(sr1.x, sr1.y, st1.x, st1.y, 1.5, deck_edge);
+            draw_line(st0.x, st0.y, st1.x, st1.y, 1.5, deck_edge);
+        }
+
+        // --- Moored boats (static in sim-core) + their mooring lines ------
+        let moor_line = Color::from_rgba(200, 198, 190, 200);
+        let moored_line_col = Color::from_rgba(46, 48, 54, 255);
+        let moored_fills = [
+            Color::from_rgba(226, 222, 208, 255),
+            Color::from_rgba(212, 216, 220, 255),
+            Color::from_rgba(230, 224, 212, 255),
+            Color::from_rgba(206, 200, 188, 255),
+        ];
+        for (bi, mb) in moored.iter().enumerate() {
+            if !visible(mb.pos, 16.0) {
+                continue;
+            }
+            let (mc, ms) = (mb.heading.cos(), mb.heading.sin());
+            let ml = |lx: f32, ly: f32| -> Vec2 {
+                w2s(mb.pos + vec2(lx * mc - ly * ms, lx * ms + ly * mc))
+            };
+            let fwd = vec2(mc, ms);
+            let port = vec2(-ms, mc);
+
+            // Crossed lines from the outboard end's quarters to its pole
+            // pair — the classic Swedish pole berth from the photos.
+            let (end_x, quarter_x) = if mb.bow_to_jetty { (-5.9, -5.6) } else { (6.0, 4.2) };
+            let end_c = mb.pos + fwd * end_x;
+            for p in mb.poles {
+                let side_sign = if (p - end_c).dot(port) >= 0.0 { 1.0 } else { -1.0 };
+                let q = ml(quarter_x, -1.5 * side_sign);
+                let pw = w2s(p);
+                draw_line(q.x, q.y, pw.x, pw.y, (0.07 * scale).max(1.0), moor_line);
+            }
+            // Short breast lines from the jetty end's quarters to the face.
+            let jetty_quarter_x = if mb.bow_to_jetty { 4.2 } else { -5.6 };
+            let across = vec2(-mb.out.y, mb.out.x);
+            for side in [1.0f32, -1.0] {
+                let qw = mb.pos
+                    + vec2(
+                        jetty_quarter_x * mc - 1.5 * side * ms,
+                        jetty_quarter_x * ms + 1.5 * side * mc,
+                    );
+                let s = if (qw - mb.jetty_face).dot(across) >= 0.0 { 1.0 } else { -1.0 };
+                let a = w2s(mb.jetty_face + across * (1.3 * s));
+                let q = w2s(qw);
+                draw_line(q.x, q.y, a.x, a.y, (0.07 * scale).max(1.0), moor_line);
+            }
+
+            // Hull: same outline as the player's, quieter deck detail.
+            let fill = moored_fills[bi % moored_fills.len()];
+            let m0 = ml(HULL_PTS[0].0, HULL_PTS[0].1);
+            for i in 1..HULL_PTS.len() - 1 {
+                let m1 = ml(HULL_PTS[i].0, HULL_PTS[i].1);
+                let m2 = ml(HULL_PTS[i + 1].0, HULL_PTS[i + 1].1);
+                draw_triangle(m0, m1, m2, fill);
+            }
+            for (i, &(ax, ay)) in HULL_PTS.iter().enumerate() {
+                let a = ml(ax, ay);
+                let (bx2, by2) = HULL_PTS[(i + 1) % HULL_PTS.len()];
+                let b = ml(bx2, by2);
+                draw_line(a.x, a.y, b.x, b.y, (0.12 * scale).max(1.0), moored_line_col);
+            }
+            if bi % 4 == 3 {
+                // A motor cruiser among the sailboats: long cabin, no rig.
+                let cab = [(-3.4, 1.2), (1.6, 1.2), (1.6, -1.2), (-3.4, -1.2)];
+                let c0 = ml(cab[0].0, cab[0].1);
+                draw_triangle(c0, ml(cab[1].0, cab[1].1), ml(cab[2].0, cab[2].1), Color::from_rgba(198, 202, 206, 255));
+                draw_triangle(c0, ml(cab[2].0, cab[2].1), ml(cab[3].0, cab[3].1), Color::from_rgba(198, 202, 206, 255));
+                for i in 0..4 {
+                    let a = ml(cab[i].0, cab[i].1);
+                    let b = ml(cab[(i + 1) % 4].0, cab[(i + 1) % 4].1);
+                    draw_line(a.x, a.y, b.x, b.y, (0.08 * scale).max(1.0), moored_line_col);
+                }
+            } else {
+                let ch = [(-2.6, 1.0), (0.3, 1.0), (0.3, -1.0), (-2.6, -1.0)];
+                let c0 = ml(ch[0].0, ch[0].1);
+                draw_triangle(c0, ml(ch[1].0, ch[1].1), ml(ch[2].0, ch[2].1), Color::from_rgba(203, 208, 212, 255));
+                draw_triangle(c0, ml(ch[2].0, ch[2].1), ml(ch[3].0, ch[3].1), Color::from_rgba(203, 208, 212, 255));
+                for i in 0..4 {
+                    let a = ml(ch[i].0, ch[i].1);
+                    let b = ml(ch[(i + 1) % 4].0, ch[(i + 1) % 4].1);
+                    draw_line(a.x, a.y, b.x, b.y, (0.08 * scale).max(1.0), moored_line_col);
+                }
+                let mast = ml(0.6, 0.0);
+                let boom = ml(-2.0, 0.0);
+                draw_line(mast.x, mast.y, boom.x, boom.y, (0.08 * scale).max(1.0), moored_line_col);
+                draw_circle(mast.x, mast.y, (0.18 * scale).max(1.5), moored_line_col);
+            }
+        }
+
+        // --- Mooring poles (drawn over the lines belayed to them) ---------
+        let pole_fill = Color::from_rgba(92, 64, 40, 255);
+        let pole_rim = Color::from_rgba(50, 34, 20, 255);
+        for p in &poles {
+            if !visible(*p, 1.0) {
+                continue;
+            }
+            let sp = w2s(*p);
+            let r = (POLE_RADIUS * scale).max(2.0);
+            draw_circle(sp.x, sp.y, r + 1.0, pole_rim);
+            draw_circle(sp.x, sp.y, r, pole_fill);
         }
 
         // --- Boat --------------------------------------------------------

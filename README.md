@@ -1,7 +1,10 @@
 # Harbour Sim
 
 A harbour mooring simulator: a small sailboat under auxiliary engine in a
-harbour basin, with wind and current to fight. Engine and rudder are fully
+marina modeled on Hinsholmen (Långedrag, Gothenburg) — a gently curving
+channel lined with a dozen pontoon jetties of pole berths, half of them
+occupied, a rounded bay head at the top and an open run out to the sea at
+the bottom — with wind and current to fight. Engine and rudder are fully
 modeled — prop walk, prop wash over the rudder, rudder stall and all — so
 real close-quarters technique works: back and fill, kick the bow round with
 a burst of ahead power, feel the stern walk to port going astern. The plan
@@ -23,7 +26,8 @@ slider on the right edge is the helm (right = starboard). Both hold where
 you leave them, with a centre detent — drive with two thumbs. Drag the two
 compass dials (top corners) to set wind and current — drag direction is
 where the flow goes toward, distance is speed (centre = calm). The RESET
-button returns the boat to its mooring, engine to neutral, helm amidships.
+button returns the boat to its fairway start, engine to neutral, helm
+amidships.
 
 **Keyboard**:
 
@@ -36,7 +40,7 @@ button returns the boat to its mooring, engine to neutral, helm amidships.
 | ↑ / ↓ | Wind speed |
 | J / L | Rotate current direction |
 | I / K | Current speed |
-| R | Reset the boat to its mooring |
+| R | Reset the boat to its fairway start |
 | E | Keel design editor |
 
 ## Build & run

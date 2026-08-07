@@ -84,8 +84,9 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
   the whole deterministic half. **Nothing in it may depend on macroquad or
   any nondeterminism**; it uses `glam` (pinned to the version macroquad
   0.4.15 re-exports, so `Vec2` unifies across the boundary) + `rapier2d`.
-  - `sim-core/src/sim.rs` — `Sim` (Rapier world: quay + basin walls, the
-    boat), `Env` (wind/current), all physics constants, harbour geometry
+  - `sim-core/src/sim.rs` — `Sim` (Rapier world: the marina's boundary
+    polyline, jetties, mooring poles and moored fleet, plus the boat),
+    `Env` (wind/current), all physics constants, harbour geometry
     constants, unit tests.
   - `sim-core/src/keel.rs` — `KeelProfile` (piecewise-linear underwater
     lateral-area-per-length curve along the hull) and `KeelDerived` (area,
@@ -113,9 +114,22 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
     shared sailboat (see Roadmap); a design varies keel, rudder and
     weight on it.
 - `src/main.rs` — macroquad frontend: input, fixed-timestep loop with render
-  interpolation, top-down rendering (water/ripples, quay, breakwaters, boat),
-  HUD (wind/current dials, throttle/rudder sliders, SOG readout, key help),
-  keel design editor overlay (`E`).
+  interpolation, top-down rendering (water/ripples, the Hinsholmen scenery —
+  grass/tree road shore with quay apron NW, wooded rocky hill shore SE,
+  plank pontoons, mooring poles, moored boats with crossed stern lines out
+  to their pole pairs and breast lines to the jetty, rounded silt-ringed
+  bay head NE, open sea SW with a skerry chain at the world's edge — and
+  the player's boat), HUD
+  (wind/current dials, throttle/rudder sliders, SOG readout, key help),
+  keel design editor overlay (`E`). All static scenery (jetty list, poles,
+  moored fleet, both shore polylines, world bounds) is fetched from
+  sim-core ONCE before the loop; curved shores render via
+  `offset_polyline` + `draw_strip` (quad strips between polylines), and
+  everything repeated (boats, poles, trees, ripples) is visibility-culled
+  per frame against the camera circle — the marina is ~400 m long and
+  only a stretch is ever on screen. Scenery scatter (trees) uses the same
+  deterministic hash idiom as the ripples, minus the time term — cosmetic
+  only, like everything render-side.
 - `src/keel_editor.rs` — in-app editor for `BoatDesign`: drag a fixed-grid
   bar chart to paint the underwater area distribution, drag a displacement
   slider (4–14 t range bracketing the reference boats, 100 kg steps;
@@ -238,10 +252,65 @@ wind load, propulsion, and quay contact. Fixed timestep `PHYSICS_DT =
 an accumulator with render interpolation (`lerp` + shortest-path angle lerp)
 like Pegasus.
 
-- **Harbour**: a straight quay wall along `y = QUAY_Y` (water below), three
-  breakwater walls closing the basin (`BASIN_HALF_W`, `BASIN_BOTTOM_Y`).
-  All static segment colliders, inserted in a FIXED order (handle numbering
-  must be deterministic). Fender feel via friction 0.5 / restitution 0.1.
+- **Harbour** (2026-08-04, modeled on Hinsholmen marina, Långedrag,
+  Gothenburg — owner-supplied aerial photos; mirrored in both axes
+  2026-08-05 on owner request, so the channel's concave side faces UP
+  and the dock row sits on the lower/outer shore): the whole marina is
+  **GENERATED, not hand-placed** — a channel whose road (dock-carrying,
+  SE/outer) shore is chord-marched head→sea from `ROAD_HEAD_ROOT` at
+  `SHORE_BEARING_HEAD_DEG` (207°, SSW), bending
+  `SHORE_BEND_PER_STATION_DEG` per 80 m jetty station toward WSW (jetty
+  roots land exactly on the shore polyline's kinks by construction —
+  station spacing = two 20 m berths + a manoeuvring lane of THREE BOAT
+  LENGTHS (~37 m) between the opposing pole rows, owner spec
+  2026-08-04). Ten pontoon **jetties** on that shore (index 9, the
+  seaward-most/outermost, is `OUTER_JETTY_LEN` = 60 m vs the standard
+  34), plus two `HILL_JETTY_STATIONS` jetties on the hill (NW, inner)
+  shore TUCKED UP BY THE HEAD (stations 0.5/1.5) so the rest of the
+  inner shore stays open water; `CHANNEL_W` = 125 m across (widened from
+  110, owner request 2026-08-05: room on the inner side) — ~63 m of
+  fairway against the hill jetties, ~91 m along the open inner shore.
+  Every berth ("spot") is `BERTH_LEN` 20 m long × `POLE_SPACING`
+  5 m wide (owner spec 2026-08-04: the big-boat trot of the second
+  reference photo, ~50 ft class with long stern lines to the poles — NOT
+  the 30 ft spots of the first zoom; the sim boat berths with room to
+  spare). Rows of **mooring poles** flank every jetty (`POLE_ROW_OFFSET`
+  = `JETTY_HALF_W` + `BERTH_LEN` off the centreline, ball colliders of
+  `POLE_RADIUS`), and `moored_boats()` fills
+  ~55% of berths with STATIC hull colliders via a berth-identity hash
+  (deterministic — the same fleet every run; was ~80%, thinned 2026-08-04
+  so free berths are easy to find) — one end at the jetty, the other tied
+  between its pole pair, ~15% bow-out. The NE end is capped by a
+  **ROUNDED BAY HEAD** (`head_arc()`: a half-ellipse `HEAD_BULGE` = 70 m
+  beyond the shores' ends — big enough to turn in), and the SW end is
+  **OPEN TO THE SEA** (owner request 2026-08-05): past
+  `ENTRANCE_MARGIN` the two coasts diverge (`SEA_COAST` offsets) into a
+  ~335 m-wide patch of open water whose far edge — the world has to end
+  somewhere — is the boundary segment joining the coasts' ends, rendered
+  as a skerry chain. The whole boundary is ONE polyline collider: road
+  shore head→sea, skerry line, hill shore sea→head, head arc closing the
+  loop — no wall crosses the entrance. `jetties()`, `pole_positions()`,
+  `moored_boats()`, `road_shore()`, `hill_shore()`, `head_arc()`,
+  `marina_shore_len()`, `world_bounds()`, `start_pose()` are pure fp
+  functions of the constants — the SINGLE SOURCE OF TRUTH shared with
+  the renderer, so what's drawn IS what collides. Collider insertion
+  order is FIXED (boundary → jetties → poles → moored boats → boat;
+  handle numbering must be deterministic). Fender feel via friction 0.5
+  / restitution 0.1; poles are slipperier (0.3). **The boat spawns in
+  the FAIRWAY** between the head-end jetties (`start_pose()`: 58 m off
+  the road shore at station 1.6, bow pointing seaward down-channel).
+  **Gotcha (2026-08-04, re-learned at the 2026-08-05 mirror)**: the
+  spawn heading is orientation-dependent (~-121° now) — heading- and
+  direction-sensitive tests must derive from the pose, not hardcode:
+  they measure heading DELTAS, the axial-windage test derives the bow's
+  compass bearing from the pose, the lee-shore test derives its onshore
+  wind bearing as bow bearing + 90°, and the spin-coupling test projects
+  drift onto the boat's own starboard axis. `a_mooring_pole_stops_the_boat`
+  and `an_occupied_berth_is_blocked_by_the_moored_boat` build their
+  approach runs from the geometry functions (`set_pose` +
+  travel-distance bounds); when placing test boats near the marina,
+  approach berths along the jetty axis from the fairway or down the
+  ~37 m lanes between adjacent jetties' opposing pole rows.
 - **Boat**: one dynamic body, convex-hull collider of `HULL_PTS` (bow = +x
   local, ~12 m × 3.8 m). Mass = the active `BoatDesign`'s
   `displacement_kg` (2026-08-04, replacing the old `HULL_DENSITY = 200`
@@ -656,13 +725,14 @@ like Pegasus.
     numbers now live in docs/reference-boats.md's open-water table; the
     protocol lessons are what this note is for.)
 - **Open-water benchmarks & pins** (2026-08-07, sim.rs tests): the
-  shipped harbour is a closed 80 × 36 m basin, capping any benchmark run
-  at ~30 m of path — which is why the old handling table had "— ran out
-  of basin" cells and why coasting used to be "verified" by
-  re-integrating the tick() formulas OFFLINE. `Sim::new_open_water`
-  (`#[cfg(test)]`, same construction minus the four wall colliders — the
+  shipped harbour bounds or obstructs any long benchmark run (in the
+  pre-marina basin it was a hard ~30 m cap — the old handling table's
+  "— ran out of basin" cells — and coasting used to be "verified" by
+  re-integrating the tick() formulas OFFLINE; in today's marina a long
+  run must dodge berths, poles and shores instead). `Sim::new_open_water`
+  (`#[cfg(test)]`, same construction minus ALL harbour colliders — the
   shipped world and its fixed collider-insertion order are untouched)
-  removes the walls, so every benchmark now runs through the real
+  gives unbounded water, so every benchmark runs through the real
   `tick`. `measure_open_water_benchmarks` (`#[ignore]`d harness; run
   with `--ignored --nocapture`) regenerates the measured-performance
   table in docs/reference-boats.md; `open_water_benchmarks_stay_pinned`

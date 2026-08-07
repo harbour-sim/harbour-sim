@@ -1,5 +1,6 @@
-//! The deterministic harbour simulation: a boat floating in a harbour basin
-//! next to a fixed quay, pushed around by wind and current.
+//! The deterministic harbour simulation: a boat floating in a marina
+//! channel full of jetties, pole berths and moored boats, pushed around by
+//! wind and current.
 //!
 //! Top-down 2D view, world units are metres, y points "north" (up on
 //! screen), x east. There is no gravity — the vertical axis of the real
@@ -24,19 +25,351 @@ pub const PHYSICS_DT: f32 = 1.0 / 120.0;
 // ---------------------------------------------------------------------------
 // Harbour geometry (all metres, shared with the renderer)
 // ---------------------------------------------------------------------------
+//
+// Modeled on Hinsholmen marina (Långedrag, Gothenburg), mirrored in both
+// axes from the aerial reference photos (owner request 2026-08-05): the
+// channel now runs from a ROUNDED BAY HEAD in the NE down toward the SW,
+// curving so its concave (inner) side faces UP — and the seaward end is
+// OPEN: the shores diverge into a patch of open sea, closed only by a
+// distant skerry line, so the boat can leave the marina entirely. The
+// road shore with the long row of pontoon jetties lies on the outer
+// (lower/SE) side of the curve; the sparse hill shore with its two
+// jetties tucked up by the head is the inner side, deliberately left
+// with open water. Boats berth PERPENDICULAR to the jetties: one end at
+// the jetty face, the other tied between a PAIR of wooden mooring poles
+// standing one boat-length off. Everything is GENERATED from the
+// constants below by pure float math — the same numbers every call — so
+// the colliders the Sim builds and the scenery the renderer draws can
+// never disagree (`jetties()`, `pole_positions()`, `moored_boats()`,
+// `road_shore()`, `hill_shore()`, `head_arc()` are the shared sources
+// of truth).
 
-/// Water edge of the quay: a straight wall along y = QUAY_Y, water below
-/// (y < QUAY_Y), the quay deck above. The boat starts moored alongside.
-pub const QUAY_Y: f32 = 8.0;
-/// Quay extent in x (the wall collider spans the full width).
-pub const QUAY_HALF_W: f32 = 40.0;
-/// How far the quay deck extends inland (rendering only).
-pub const QUAY_DEPTH: f32 = 6.0;
+/// Shore tangent bearing at the HEAD end (compass degrees, pointing SSW
+/// down-channel toward the sea) and the extra bend added per jetty
+/// station — marching seaward the bearing swings toward WSW, which is
+/// what makes the channel's concave side face up (the mirrored curve of
+/// the photos).
+const SHORE_BEARING_HEAD_DEG: f32 = 207.0;
+const SHORE_BEND_PER_STATION_DEG: f32 = 4.4;
+/// Root of the head-most road jetty (station 0), placed so the marina
+/// roughly centres on the world origin.
+const ROAD_HEAD_ROOT: Vec2 = Vec2::new(280.0, 290.0);
+/// Jetty roots along the road shore sit this far apart: two 20 m berths
+/// (pole rows at 21.25 m off each centreline) plus a manoeuvring lane of
+/// THREE BOAT LENGTHS (~37 m) between the opposing pole rows (owner
+/// requirement, 2026-08-04 — the original 38 m spacing left a 10.5 m
+/// lane, too tight to work a 12 m boat into a berth). The bend per
+/// station above is scaled to the wider station so the channel's curve
+/// radius stays the photo's.
+const JETTY_SPACING: f32 = 80.0;
+const N_ROAD_JETTIES: usize = 10;
+/// Standard road-shore jetty; the SEAWARD-most (station 9, nearest the
+/// entrance — the outermost) is the long outer pontoon of the photos.
+const ROAD_JETTY_LEN: f32 = 34.0;
+const OUTER_JETTY_LEN: f32 = 60.0;
+/// The hill shore's two jetties, tucked up by the head (rooted opposite
+/// the gaps between road stations 0-1 and 1-2) so the rest of the inner
+/// shore stays open water.
+const HILL_JETTY_LEN: f32 = 28.0;
+const HILL_JETTY_STATIONS: [f32; 2] = [0.5, 1.5];
+/// Road shore → hill shore, straight across. Widened 110 → 125 (owner
+/// request 2026-08-05: leave room on the inner side): ~63 m of fairway
+/// against the hill jetties' tips, ~91 m along the open inner shore.
+const CHANNEL_W: f32 = 125.0;
+/// Shore past the head-most jetty before the rounded head begins, and
+/// past the seaward (outer) jetty before the coast opens out to sea.
+const HEAD_MARGIN: f32 = 50.0;
+const ENTRANCE_MARGIN: f32 = 24.0;
+/// The rounded bay head capping the channel's NE end: a half-ellipse
+/// bulging this far beyond the shores' ends (its lateral radius is
+/// CHANNEL_W / 2) — big enough to turn a boat in.
+const HEAD_BULGE: f32 = 70.0;
+/// Past the entrance the two coasts DIVERGE into open sea: each pulls
+/// away from the channel axis by the lateral offset (second element) at
+/// the given along-tangent distance (first element). The far end is
+/// closed by a skerry line — the world has to end somewhere — by which
+/// point the water is ~335 m across.
+const SEA_COAST: [(f32, f32); 3] = [(60.0, 18.0), (150.0, 55.0), (260.0, 105.0)];
 
-/// The harbour basin is closed: three more walls keep the boat in view.
-/// (Rendering treats them as low breakwaters.)
-pub const BASIN_HALF_W: f32 = 40.0;
-pub const BASIN_BOTTOM_Y: f32 = -28.0;
+/// 2.5 m wide pontoons.
+pub const JETTY_HALF_W: f32 = 1.25;
+/// Berth ("spot") size, owner spec 2026-08-04: 20 m long × 5 m wide —
+/// the big-boat trot of the reference photos (boats up to ~50 ft on
+/// long stern lines out to the poles), NOT the 30 ft spots of the first
+/// zoomed photo. The 11.9 m sim boat berths with room to spare.
+pub const BERTH_LEN: f32 = 20.0;
+/// Pole rows flank each jetty a full berth length off the face.
+pub const POLE_ROW_OFFSET: f32 = JETTY_HALF_W + BERTH_LEN;
+/// Along-jetty spacing between poles: one 5 m wide berth per gap.
+pub const POLE_SPACING: f32 = 5.0;
+/// First pole this far from the root (berths stop short of the shore),
+/// none closer than the tip clearance to the end.
+const POLE_ROOT_CLEARANCE: f32 = 4.5;
+const POLE_TIP_CLEARANCE: f32 = 0.5;
+/// A ~30 cm wooden pile.
+pub const POLE_RADIUS: f32 = 0.15;
+
+/// Point + seaward tangent of the ROAD shore at arc distance `s` from
+/// the head-most jetty root (negative = further up into the head).
+/// Chord-marched one jetty station at a time — a few degrees per 80 m
+/// chord reads as an arc, and jetty roots land exactly on the polyline's
+/// kinks, so the wall collider and the jetty roots agree by construction.
+fn road_shore_at(s: f32) -> (Vec2, Vec2) {
+    if s <= 0.0 {
+        let t = Env::compass_vec(SHORE_BEARING_HEAD_DEG);
+        return (ROAD_HEAD_ROOT + t * s, t);
+    }
+    let mut p = ROAD_HEAD_ROOT;
+    let mut bearing = SHORE_BEARING_HEAD_DEG;
+    let mut remaining = s;
+    while remaining > JETTY_SPACING {
+        p += Env::compass_vec(bearing) * JETTY_SPACING;
+        bearing += SHORE_BEND_PER_STATION_DEG;
+        remaining -= JETTY_SPACING;
+    }
+    let t = Env::compass_vec(bearing);
+    (p + t * remaining, t)
+}
+
+/// The into-the-water direction for a road-shore tangent (rotate 90°
+/// clockwise: marching seaward at SSW gives a WNW out — toward the hill
+/// shore on the curve's inner side).
+fn out_of(t: Vec2) -> Vec2 {
+    Vec2::new(t.y, -t.x)
+}
+
+/// One pontoon jetty: `root` on its shore, `dir` (unit) pointing out
+/// into the water, `len` metres long.
+#[derive(Clone, Copy, Debug)]
+pub struct Jetty {
+    pub root: Vec2,
+    pub dir: Vec2,
+    pub len: f32,
+}
+
+impl Jetty {
+    /// Unit vector across the jetty (`dir` rotated +90°); berth axes and
+    /// pole rows lie along ±side.
+    pub fn side(&self) -> Vec2 {
+        Vec2::new(-self.dir.y, self.dir.x)
+    }
+
+    /// Along-jetty distances of a flanking row's poles.
+    pub fn pole_stations(&self) -> Vec<f32> {
+        let n = ((self.len - POLE_ROOT_CLEARANCE - POLE_TIP_CLEARANCE) / POLE_SPACING) as usize
+            + 1;
+        (0..n).map(|k| POLE_ROOT_CLEARANCE + k as f32 * POLE_SPACING).collect()
+    }
+}
+
+/// All jetties, in the FIXED order colliders are inserted in: the road
+/// jetties head→sea (index 9 = the long outer one by the entrance),
+/// then the two hill ones up by the head.
+pub fn jetties() -> Vec<Jetty> {
+    let mut v = Vec::with_capacity(N_ROAD_JETTIES + HILL_JETTY_STATIONS.len());
+    for i in 0..N_ROAD_JETTIES {
+        let (root, t) = road_shore_at(i as f32 * JETTY_SPACING);
+        let len = if i == N_ROAD_JETTIES - 1 { OUTER_JETTY_LEN } else { ROAD_JETTY_LEN };
+        v.push(Jetty { root, dir: out_of(t), len });
+    }
+    for &station in &HILL_JETTY_STATIONS {
+        let (p, t) = road_shore_at(station * JETTY_SPACING);
+        let out = out_of(t);
+        v.push(Jetty { root: p + out * CHANNEL_W, dir: -out, len: HILL_JETTY_LEN });
+    }
+    v
+}
+
+/// Arc stations of the shore polylines' MARINA part: head margin, every
+/// jetty root, entrance margin. The sea-coast points come after these —
+/// see `marina_shore_len`.
+fn shore_stations() -> Vec<f32> {
+    let last = (N_ROAD_JETTIES - 1) as f32 * JETTY_SPACING;
+    let mut v = Vec::with_capacity(N_ROAD_JETTIES + 2);
+    v.push(-HEAD_MARGIN);
+    for i in 0..N_ROAD_JETTIES {
+        v.push(i as f32 * JETTY_SPACING);
+    }
+    v.push(last + ENTRANCE_MARGIN);
+    v
+}
+
+/// How many leading points of `road_shore()`/`hill_shore()` belong to
+/// the marina channel proper (head margin + jetty roots + entrance
+/// margin); the points after them are the diverging sea coast. The
+/// renderer needs the split to keep the quay apron off the wild coast.
+pub fn marina_shore_len() -> usize {
+    N_ROAD_JETTIES + 2
+}
+
+/// The road (SE, dock-carrying) shore polyline, head → sea, continuing
+/// past the entrance as the diverging sea coast — also the wall
+/// collider's shape.
+pub fn road_shore() -> Vec<Vec2> {
+    let mut v: Vec<Vec2> = shore_stations().iter().map(|&s| road_shore_at(s).0).collect();
+    let (end, t) = road_shore_at(*shore_stations().last().unwrap());
+    let out = out_of(t);
+    for (along, spread) in SEA_COAST {
+        v.push(end + t * along - out * spread);
+    }
+    v
+}
+
+/// The hill (NW, inner) shore polyline, head → sea: the road shore
+/// pushed straight across the channel, its sea coast diverging the
+/// other way.
+pub fn hill_shore() -> Vec<Vec2> {
+    let mut v: Vec<Vec2> = shore_stations()
+        .iter()
+        .map(|&s| {
+            let (p, t) = road_shore_at(s);
+            p + out_of(t) * CHANNEL_W
+        })
+        .collect();
+    let (end, t) = road_shore_at(*shore_stations().last().unwrap());
+    let out = out_of(t);
+    for (along, spread) in SEA_COAST {
+        v.push(end + out * CHANNEL_W + t * along + out * spread);
+    }
+    v
+}
+
+/// The rounded bay head: a half-ellipse from `road_shore()[0]` to
+/// `hill_shore()[0]`, bulging `HEAD_BULGE` beyond the chord between
+/// them. Part of the wall collider AND the renderer's water/land fill.
+pub fn head_arc() -> Vec<Vec2> {
+    let (road0, t) = road_shore_at(-HEAD_MARGIN);
+    let hill0 = road0 + out_of(t) * CHANNEL_W;
+    let center = (road0 + hill0) * 0.5;
+    let a = road0 - center; // lateral radius, CHANNEL_W / 2
+    let b = -t * HEAD_BULGE; // bulge beyond the chord
+    let n = 12;
+    (0..=n)
+        .map(|k| {
+            let th = std::f32::consts::PI * k as f32 / n as f32;
+            center + a * th.cos() + b * th.sin()
+        })
+        .collect()
+}
+
+/// Axis-aligned bounds of the whole world (both shorelines, the sea
+/// coast and the bay head) — the renderer's camera clamp.
+pub fn world_bounds() -> (Vec2, Vec2) {
+    let mut lo = Vec2::splat(f32::INFINITY);
+    let mut hi = Vec2::splat(f32::NEG_INFINITY);
+    for p in road_shore().into_iter().chain(hill_shore()).chain(head_arc()) {
+        lo = lo.min(p);
+        hi = hi.max(p);
+    }
+    (lo, hi)
+}
+
+/// Every mooring pole, in collider-insertion order (jetty order, -side
+/// row then +side row, root → tip). Shared with the renderer so drawn
+/// poles ARE the colliders.
+pub fn pole_positions() -> Vec<Vec2> {
+    let mut poles = Vec::new();
+    for j in jetties() {
+        for side_sign in [-1.0f32, 1.0] {
+            let row = j.side() * (side_sign * POLE_ROW_OFFSET);
+            for d in j.pole_stations() {
+                poles.push(j.root + j.dir * d + row);
+            }
+        }
+    }
+    poles
+}
+
+/// A boat parked in a berth (a static collider in the Sim). Everything
+/// the renderer needs to draw it and its mooring lines is precomputed
+/// here, so it never has to go searching for poles or jetty faces.
+#[derive(Clone, Copy, Debug)]
+pub struct MooredBoat {
+    pub pos: Vec2,
+    pub heading: f32,
+    /// Unit berth axis: from the jetty face toward the pole pair.
+    pub out: Vec2,
+    /// Where its inboard breast lines land on the jetty face.
+    pub jetty_face: Vec2,
+    /// The pole pair its outboard end is tied between.
+    pub poles: [Vec2; 2],
+    /// Most boats lie bow-to-jetty like the photos; a few moor bow-out.
+    pub bow_to_jetty: bool,
+}
+
+/// Which berths are taken — and how each occupant lies — comes from a
+/// tiny hash of the berth's identity: deterministic (the same fleet
+/// every run, an unchanging part of the world), no RNG state anywhere.
+///
+/// This must be a full avalanche mix ("lowbias32"), not a bare Knuth
+/// multiply: a single multiply maps CONSECUTIVE berth indices to low
+/// bytes a fixed stride apart, so the taken/free pattern repeated almost
+/// periodically along every row and the marina looked machine-filled
+/// (owner report, 2026-08-04). The xorshift rounds break that neighbour
+/// correlation.
+fn berth_hash(seed: u32) -> u32 {
+    let mut h = seed.wrapping_add(0x9E37_79B9);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7feb_352d);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x846c_a68b);
+    h ^= h >> 16;
+    h
+}
+
+/// The moored fleet, in collider-insertion order (same jetty/side/berth
+/// nesting as `pole_positions`). A bit over half the berths are taken
+/// (down from ~80% — owner request 2026-08-04: a marina you can actually
+/// find a spot in); the free gaps are the berthing targets.
+pub fn moored_boats() -> Vec<MooredBoat> {
+    let mut v = Vec::new();
+    for (ji, j) in jetties().iter().enumerate() {
+        let stations = j.pole_stations();
+        for (si, side_sign) in [-1.0f32, 1.0].into_iter().enumerate() {
+            let out = j.side() * side_sign;
+            for k in 0..stations.len().saturating_sub(1) {
+                let h = berth_hash((ji as u32) << 12 | (si as u32) << 8 | k as u32);
+                if (h & 0xff) >= 140 {
+                    continue; // a free berth (~45% of them)
+                }
+                let bow_to_jetty = ((h >> 8) & 0xff) >= 38; // ~15% bow-out
+                // A small deterministic lie per boat, so the trot doesn't
+                // look machine-stamped.
+                let slide = (((h >> 16) & 0xff) as f32 / 255.0 - 0.5) * 0.3;
+                let yaw = (((h >> 24) & 0xff) as f32 / 255.0 - 0.5) * 0.05;
+                let mid = (stations[k] + stations[k + 1]) * 0.5 + slide;
+                // The inboard tip rides a fender's 0.3 m off the face;
+                // bow tip is 6.0 m from the centre, stern tip 5.9.
+                let half_len = if bow_to_jetty { 6.0 } else { 5.9 };
+                let pos = j.root + j.dir * mid + out * (JETTY_HALF_W + 0.3 + half_len);
+                let bow_dir = if bow_to_jetty { -out } else { out };
+                let row = out * POLE_ROW_OFFSET;
+                v.push(MooredBoat {
+                    pos,
+                    heading: bow_dir.y.atan2(bow_dir.x) + yaw,
+                    out,
+                    jetty_face: j.root + j.dir * mid + out * JETTY_HALF_W,
+                    poles: [
+                        j.root + j.dir * stations[k] + row,
+                        j.root + j.dir * stations[k + 1] + row,
+                    ],
+                    bow_to_jetty,
+                });
+            }
+        }
+    }
+    v
+}
+
+/// Where a fresh boat spawns: lying in the fairway between the head-end
+/// jetties, bow pointing seaward down the channel (the whole run to the
+/// open water ahead of it). 58 m off the road shore keeps clear of both
+/// the road jetty tips (34 m) and the hill jetties' reach (97 m), with
+/// the dock row just inside a phone's close-up frame.
+pub fn start_pose() -> (Vec2, f32) {
+    let (p, t) = road_shore_at(1.6 * JETTY_SPACING);
+    (p + out_of(t) * 58.0, t.y.atan2(t.x))
+}
 
 // ---------------------------------------------------------------------------
 // Boat geometry & physical constants
@@ -556,11 +889,6 @@ fn k_lin_yaw(c_yaw_q: f32) -> f32 {
 /// the familiar behaviour of a boat lying still in a breeze.
 const WIND_CENTER_OFFSET: f32 = 0.9;
 
-/// Where the boat starts: lying alongside the quay, parallel, bow east,
-/// with a fender's worth of clearance.
-pub const START_POS: (f32, f32) = (0.0, QUAY_Y - 2.4);
-pub const START_HEADING: f32 = 0.0;
-
 // ---------------------------------------------------------------------------
 // Engine & propeller
 // ---------------------------------------------------------------------------
@@ -872,23 +1200,22 @@ impl Sim {
         Self::build(design, true)
     }
 
-    /// Test-only: the same boat in unbounded open water — no quay, no
-    /// breakwaters. The shipped harbour is a closed 80 × 36 m basin, which
-    /// bounds every benchmark run at ~30 m of path before the hull reaches
-    /// a wall — enough to hide whether a slow-turning boat would EVER
-    /// complete a turn, and too short for the 100 m+ coasting benchmark
-    /// (which used to be verified by re-integrating the tick() formulas
-    /// OFFLINE — a second copy of the surge math, free to drift from the
-    /// real one; retired now that this arena lets the benchmarks run
-    /// through the actual `tick`). Kept `#[cfg(test)]` so the shipped
-    /// world — and its fixed collider-insertion order (determinism rule) —
-    /// is untouched.
+    /// Test-only: the same boat in unbounded open water — no shores, no
+    /// jetties, no poles, no moored fleet. The shipped marina bounds (or
+    /// obstructs) long benchmark runs — enough to hide whether a
+    /// slow-turning boat would EVER complete a turn, and awkward for the
+    /// 100 m+ coasting benchmark (which used to be verified by
+    /// re-integrating the tick() formulas OFFLINE — a second copy of the
+    /// surge math, free to drift from the real one; retired now that this
+    /// arena lets the benchmarks run through the actual `tick`). Kept
+    /// `#[cfg(test)]` so the shipped world — and its fixed
+    /// collider-insertion order (determinism rule) — is untouched.
     #[cfg(test)]
     fn new_open_water(design: &BoatDesign) -> Sim {
         Self::build(design, false)
     }
 
-    fn build(design: &BoatDesign, harbour_walls: bool) -> Sim {
+    fn build(design: &BoatDesign, with_harbour: bool) -> Sim {
         let keel = design.keel.derive();
         let wetted_surface = wetted_surface_area(&design.keel, &design.rudder);
         let (wl_aft, wl_fwd) = waterline_extent(&design.keel);
@@ -898,49 +1225,91 @@ impl Sim {
         let mut bodies = RigidBodySet::new();
         let mut colliders = ColliderSet::new();
 
-        // Static harbour walls first, in a FIXED order (collider handle
+        // Static harbour geometry first, in a FIXED order (collider handle
         // numbering must be identical across runs for determinism — same
-        // rule as Pegasus). The quay wall is the interesting one; the other
-        // three close the basin.
-        let walls = [
-            // (a, b): quay edge, then west / south / east basin walls.
-            (
-                point![-QUAY_HALF_W, QUAY_Y],
-                point![QUAY_HALF_W, QUAY_Y],
-            ),
-            (
-                point![-BASIN_HALF_W, QUAY_Y],
-                point![-BASIN_HALF_W, BASIN_BOTTOM_Y],
-            ),
-            (
-                point![-BASIN_HALF_W, BASIN_BOTTOM_Y],
-                point![BASIN_HALF_W, BASIN_BOTTOM_Y],
-            ),
-            (
-                point![BASIN_HALF_W, BASIN_BOTTOM_Y],
-                point![BASIN_HALF_W, QUAY_Y],
-            ),
-        ];
-        if harbour_walls {
-            for (a, b) in walls {
+        // rule as Pegasus): the basin boundary, then jetties, then mooring
+        // poles, then the moored boats. The whole block is skipped for the
+        // test-only open-water arena (`with_harbour` = false).
+        //
+        // The boundary is ONE closed polyline: road shore head→sea
+        // (running out along its diverging sea coast), the skerry line
+        // across the open water (the segment joining the two coasts' far
+        // ends — the world's edge, rendered as a chain of rocky islets),
+        // hill shore back sea→head, and the rounded head arc closing the
+        // loop. No wall crosses the entrance itself: the marina is open
+        // to the sea.
+        let hull: Vec<Point<f32>> = HULL_PTS.iter().map(|&(x, y)| point![x, y]).collect();
+        if with_harbour {
+            let mut boundary: Vec<Point<f32>> =
+                road_shore().iter().map(|p| point![p.x, p.y]).collect();
+            let mut hill: Vec<Point<f32>> =
+                hill_shore().iter().map(|p| point![p.x, p.y]).collect();
+            hill.reverse();
+            boundary.extend(hill);
+            // Head arc runs road[0] → hill[0]; the loop needs hill[0] →
+            // road[0], so append its interior reversed and close on road[0].
+            let arc = head_arc();
+            for p in arc[1..arc.len() - 1].iter().rev() {
+                boundary.push(point![p.x, p.y]);
+            }
+            boundary.push(boundary[0]);
+            colliders.insert(
+                ColliderBuilder::polyline(boundary, None)
+                    // Rubbing-strake-on-rock feel: grippy, nearly dead.
+                    .friction(0.5)
+                    .restitution(0.1)
+                    .build(),
+            );
+
+            // Pontoon jetties: solid rotated slabs from root to tip.
+            for j in jetties() {
+                let mid = j.root + j.dir * (j.len * 0.5);
                 colliders.insert(
-                    ColliderBuilder::segment(a, b)
-                        // Rubber fender feel: grippy, nearly dead on impact.
+                    ColliderBuilder::cuboid(j.len * 0.5, JETTY_HALF_W)
+                        .translation(vector![mid.x, mid.y])
+                        .rotation(j.dir.y.atan2(j.dir.x))
                         .friction(0.5)
                         .restitution(0.1)
+                        .build(),
+                );
+            }
+
+            // Mooring poles: thin wooden piles a hull slides along rather
+            // than grips (they're what the stern lines will belay to,
+            // later).
+            for pole in pole_positions() {
+                colliders.insert(
+                    ColliderBuilder::ball(POLE_RADIUS)
+                        .translation(vector![pole.x, pole.y])
+                        .friction(0.3)
+                        .restitution(0.1)
+                        .build(),
+                );
+            }
+
+            // Moored boats: the same hull shape as the player's, parked as
+            // static colliders — an occupied berth is a real obstacle.
+            for mb in moored_boats() {
+                colliders.insert(
+                    ColliderBuilder::convex_hull(&hull)
+                        .expect("hull points form a convex polygon")
+                        .translation(vector![mb.pos.x, mb.pos.y])
+                        .rotation(mb.heading)
+                        .friction(0.4)
+                        .restitution(0.05)
                         .build(),
                 );
             }
         }
 
         // The boat: one dynamic body with the convex hull collider.
+        let (start, start_heading) = start_pose();
         let body = RigidBodyBuilder::dynamic()
-            .translation(vector![START_POS.0, START_POS.1])
-            .rotation(START_HEADING)
+            .translation(vector![start.x, start.y])
+            .rotation(start_heading)
             .ccd_enabled(true)
             .build();
         let boat = bodies.insert(body);
-        let hull: Vec<Point<f32>> = HULL_PTS.iter().map(|&(x, y)| point![x, y]).collect();
         colliders.insert_with_parent(
             ColliderBuilder::convex_hull(&hull)
                 .expect("hull points form a convex polygon")
@@ -1020,17 +1389,17 @@ impl Sim {
     }
 
     /// Test-only initial condition: place the boat somewhere other than
-    /// the default quay-side berth. Same before-the-first-tick rule as
-    /// `set_yaw_rate` — needed because the berth spawn sits 2.4 m off the
-    /// quay wall, which a turning-circle test would clip with its stern
-    /// swing (found the hard way: the impulse of the port quarter kissing
-    /// the quay reads exactly like a physics bug until you print the hull
+    /// the guest-quay spawn before the first tick. Same rule as
+    /// `set_yaw_rate` — needed because the spawn sits 2.4 m off the quay
+    /// wall, which a turning-circle test would clip with its stern swing
+    /// (found the hard way: the impulse of the port quarter kissing the
+    /// quay reads exactly like a physics bug until you print the hull
     /// corner positions).
     #[cfg(test)]
     fn set_pose(&mut self, x: f32, y: f32, heading: f32) {
         let rb = &mut self.bodies[self.boat];
         rb.set_translation(vector![x, y], true);
-        rb.set_rotation(nalgebra::UnitComplex::new(heading), true);
+        rb.set_rotation(Rotation::new(heading), true);
     }
 
     /// Test-only initial condition: send the boat along its own heading at
@@ -1564,10 +1933,9 @@ mod tests {
         // benchmark is ~2; drag-only it never got there — 75° after 34 m
         // and still going when it ran out of basin).
         let mut sim = Sim::new_with_design(&BoatDesign::oday_39());
-        // Mid-basin: the default berth spawn is 2.4 m off the quay, and a
-        // starboard turn's first move is the stern swinging to port — into
-        // the wall (see `set_pose`).
-        sim.set_pose(0.0, -10.0, 0.0);
+        // The fairway spawn (bow NE up the channel) has ~50 m of clear
+        // water toward the hill shore — a starboard turn's ~20 m radius
+        // arc sweeps into it without reaching anything.
         sim.set_forward_speed(1.29);
         let turn = InputState { throttle: 0.0, rudder: 1.0 };
         let mut dist = 0.0f32;
@@ -1654,7 +2022,7 @@ mod tests {
     #[test]
     fn calm_water_boat_stays_put() {
         let mut sim = Sim::new();
-        let start = sim.boat_pose().0;
+        let (start, h0) = sim.boat_pose();
         run(&mut sim, &Env::CALM, 20.0);
         let (pos, heading) = sim.boat_pose();
         assert!(
@@ -1662,7 +2030,7 @@ mod tests {
             "boat drifted {} m in dead calm",
             (pos - start).length()
         );
-        assert!(heading.abs() < 0.01);
+        assert!((heading - h0).abs() < 0.01);
     }
 
     #[test]
@@ -1731,8 +2099,7 @@ mod tests {
 
     #[test]
     fn wind_pushes_the_boat_downwind() {
-        // Northerly wind (from the quay side) blows the boat south, away
-        // from the quay.
+        // Northerly wind blows the boat south across the open fairway.
         let mut sim = Sim::new();
         let start = sim.boat_pose().0;
         let env = Env { wind_from_deg: 0.0, wind_speed: 10.0, ..Env::CALM };
@@ -1747,16 +2114,16 @@ mod tests {
 
     #[test]
     fn current_carries_the_boat_along() {
-        // An easterly-setting current carries the moored boat east — but
-        // slowly picking up way from a dead stop, not snapping to current
-        // speed. Same physics, same direction of surprise, as the coasting
-        // fix: the ITTC friction FORCE is genuinely weak at low RELATIVE
-        // speed (the u² factor, not Cf, which slowly rises as Re falls),
-        // and the default 8.5 t hull has a lot of inertia for a gentle
-        // 0.8 m/s (1.6 kn) current to work against.
-        // 60 s only gets it to ~36% of current speed and ~10 m of drift —
-        // real, not a bug (this replaces a 30 s/5 m threshold that was
-        // calibrated to the old, too-strong bluff-body drag).
+        // An easterly-setting current carries the boat east through the
+        // fairway — but slowly picking up way from a dead stop, not
+        // snapping to current speed. Same physics, same direction of
+        // surprise, as the coasting fix: the ITTC friction FORCE is
+        // genuinely weak at low RELATIVE speed (the u² factor, not Cf,
+        // which slowly rises as Re falls), and the default 8.5 t hull has
+        // a lot of inertia for a gentle 0.8 m/s (1.6 kn) current to work
+        // against. 60 s only gets it to ~36% of current speed and ~10 m
+        // of drift — real, not a bug (this replaces a 30 s/5 m threshold
+        // that was calibrated to the old, too-strong bluff-body drag).
         let mut sim = Sim::new();
         let start = sim.boat_pose().0;
         let env = Env { current_to_deg: 90.0, current_speed: 0.8, ..Env::CALM };
@@ -1770,23 +2137,33 @@ mod tests {
     }
 
     #[test]
-    fn the_quay_stops_an_onshore_wind() {
-        // Southerly wind presses the boat onto the quay: it must come to
-        // rest against the wall, not pass through or bounce away.
+    fn a_lee_shore_stops_the_wind_drift() {
+        // Wind square onto the road shore blows the boat from the fairway
+        // down onto the marina: it must fetch up on something solid (a
+        // pole row, a jetty, a moored boat, the shore itself) and come to
+        // rest there — not ghost through the geometry or bounce back out.
+        // The spawn's bow lies along the shore tangent and the road shore
+        // is on its -out side, so wind FROM the +out bearing (bow bearing
+        // + 90°) is dead onshore — derived from the pose, not hardcoded,
+        // so it survives reorientations of the marina.
         let mut sim = Sim::new();
-        let env = Env { wind_from_deg: 180.0, wind_speed: 12.0, ..Env::CALM };
-        run(&mut sim, &env, 40.0);
+        let (start, h0) = sim.boat_pose();
+        let onshore_from = (90.0 - h0.to_degrees() + 90.0).rem_euclid(360.0);
+        let env = Env { wind_from_deg: onshore_from, wind_speed: 12.0, ..Env::CALM };
+        run(&mut sim, &env, 90.0);
         let (pos, _) = sim.boat_pose();
-        let half_beam = HULL_PTS.iter().map(|p| p.1).fold(0.0f32, f32::max);
+        let drift = (pos - start).length();
+        assert!(drift > 5.0, "expected a real shoreward drift, got {drift} m");
         assert!(
-            pos.y < QUAY_Y - half_beam * 0.8,
-            "hull centre {} implies the hull penetrated the quay at y = {}",
-            pos.y,
-            QUAY_Y
+            drift < 72.0,
+            "boat ended {drift} m from the start — through the marina and the shore?"
         );
-        assert!(pos.y > QUAY_Y - half_beam - 1.0, "boat never reached the quay: y = {}", pos.y);
         let (v, _) = sim.boat_vel();
-        assert!(v.length() < 0.2, "boat still moving {} m/s against the wall", v.length());
+        assert!(
+            v.length() < 0.5,
+            "boat still moving {} m/s against the lee obstruction",
+            v.length()
+        );
     }
 
     #[test]
@@ -1796,20 +2173,23 @@ mod tests {
         // and the stern (big area, sweeping to port) out-drags the bow
         // (small area, sweeping to starboard) — net side force to
         // starboard, which is what puts the effective centre of rotation
-        // aft of the centre of mass. At heading 0 (bow = +x east, port =
-        // +y), clockwise = negative yaw rate and starboard = -y. Checked
+        // aft of the centre of mass. Measured along the boat's OWN
+        // starboard axis (the spawn heading is whatever the marina's
+        // orientation makes it, so world axes prove nothing). Checked
         // over a fraction of a second so the heading (and with it the
         // force direction) hasn't swung far from its initial orientation.
         let mut sim = Sim::new();
+        let h0 = sim.boat_pose().1;
+        let stbd = Vec2::new(h0.sin(), -h0.cos()); // fwd rotated -90°
         sim.set_yaw_rate(-1.0);
         for _ in 0..12 {
             sim.tick(&Env::CALM, &InputState::NEUTRAL);
         }
         let (v, _) = sim.boat_vel();
+        let drift = v.dot(stbd);
         assert!(
-            v.y < -0.02,
-            "expected a clear starboard (-y) drift from the spin, got vy = {}",
-            v.y
+            drift > 0.02,
+            "expected a clear starboard drift from the spin, got {drift} m/s"
         );
 
         // Control: a fore-aft symmetric profile has no such coupling — the
@@ -1832,12 +2212,52 @@ mod tests {
         // drift than the aft-biased hull" — the keel's own asymmetry
         // stacks on top of the same baseline rudder contribution both
         // sims share.
+        let sym_drift = vs.dot(stbd);
         assert!(
-            vs.y < 0.0 && vs.y.abs() < v.y.abs(),
-            "a symmetric keel should still drift less than the aft-biased default \
-             (rudder-only coupling, no keel swept_moment on top): got vs.y = {} vs default vy = {}",
-            vs.y,
-            v.y
+            sym_drift > 0.0 && sym_drift < drift,
+            "a symmetric keel should still drift to starboard, but less than the \
+             aft-biased default (rudder-only coupling, no keel swept_moment on top): \
+             got {sym_drift} vs default {drift} m/s"
+        );
+    }
+
+    #[test]
+    fn a_mooring_pole_stops_the_boat() {
+        // Motor in from the fairway straight along a pole row, aimed at
+        // its outermost pile: the bow must fetch up on it a few metres in
+        // — well short of a free run of the same duration — instead of
+        // ghosting through a thin ball collider.
+        let mut sim = Sim::new();
+        let j = jetties()[4];
+        let d_tip = *j.pole_stations().last().unwrap();
+        let pole = j.root + j.dir * d_tip - j.side() * POLE_ROW_OFFSET;
+        let start = pole + j.dir * 12.0; // out in the fairway, aimed inward
+        let heading = (-j.dir).y.atan2((-j.dir).x);
+        sim.set_pose(start.x, start.y, heading);
+        run_input(&mut sim, &Env::CALM, &FULL_AHEAD, 6.0);
+        let travel = (sim.boat_pose().0 - start).length();
+        assert!(
+            travel < 9.5,
+            "expected to fetch up on the pole ~5.9 m in, travelled {travel} m"
+        );
+    }
+
+    #[test]
+    fn an_occupied_berth_is_blocked_by_the_moored_boat() {
+        // Aim from open water straight down the first moored boat's berth
+        // axis (it lies on the outer jetty's SW side, so the approach is
+        // clear): its parked hull is a static collider — it neither
+        // yields nor moves, and the incoming boat fetches up on its end.
+        let mut sim = Sim::new();
+        let mb = moored_boats()[0];
+        let start = mb.pos + mb.out * 18.0;
+        let heading = (-mb.out).y.atan2((-mb.out).x);
+        sim.set_pose(start.x, start.y, heading);
+        run_input(&mut sim, &Env::CALM, &FULL_AHEAD, 6.0);
+        let travel = (sim.boat_pose().0 - start).length();
+        assert!(
+            travel < 9.5,
+            "expected to fetch up on the moored boat ~6.3 m in, travelled {travel} m"
         );
     }
 
@@ -1846,16 +2266,17 @@ mod tests {
         // The sprayhood deflects a headwind (fine bow) but presents its
         // open, concave side to a following wind (which scoops into it,
         // same idea as a wide stern) — axial windage is NOT symmetric
-        // fore/aft the way the water-drag terms are. Boat starts at
-        // heading 0 (bow = +x), so wind_from_deg = 90 (from due east,
-        // blowing west, opposing the bow) is a pure headwind, and
-        // wind_from_deg = 270 (from due west, blowing east, with the bow)
-        // is a pure following wind — both purely axial, no lateral
-        // component, so this isolates CD_AIR_BOW vs CD_AIR_STERN.
+        // fore/aft the way the water-drag terms are. Wind dead on the bow
+        // (from the bow's own compass bearing, derived from the spawn
+        // heading) is a pure headwind; from dead astern a pure following
+        // wind — both purely axial, no lateral component, so this
+        // isolates CD_AIR_BOW vs CD_AIR_STERN.
         let mut headwind = Sim::new();
         let mut following = Sim::new();
-        let headwind_env = Env { wind_from_deg: 90.0, wind_speed: 10.0, ..Env::CALM };
-        let following_env = Env { wind_from_deg: 270.0, wind_speed: 10.0, ..Env::CALM };
+        let bow_bearing = 90.0 - headwind.boat_pose().1.to_degrees();
+        let headwind_env = Env { wind_from_deg: bow_bearing, wind_speed: 10.0, ..Env::CALM };
+        let following_env =
+            Env { wind_from_deg: bow_bearing + 180.0, wind_speed: 10.0, ..Env::CALM };
         run(&mut headwind, &headwind_env, 2.0);
         run(&mut following, &following_env, 2.0);
         let head_speed = headwind.boat_vel().0.length();
@@ -1874,10 +2295,11 @@ mod tests {
         // back near this hull's intended ~6.2 kn ahead speed (see
         // T_BOLLARD_AHEAD's comment) now that wave-making resistance caps
         // it below hull speed again, without that number being tuned to hit
-        // this test. The basin is too small for a long straight run to
-        // settle there, so bracket instead: released below the equilibrium
-        // the boat must still be gaining, released above it it must be
-        // losing.
+        // this test. Too far from equilibrium for a short run to settle,
+        // so bracket instead: released below the equilibrium the boat must
+        // still be gaining, released above it it must be losing. The spawn
+        // lies in the open fairway with a long clear run up the channel,
+        // so a straight blast from it stays in open water.
         let below = {
             let mut sim = Sim::new();
             sim.set_forward_speed(2.5);
@@ -1923,7 +2345,9 @@ mod tests {
         // A prop pitched for ahead delivers less astern (ASTERN_RATIO) —
         // axial drag itself is symmetric now (ITTC skin friction depends on
         // wetted area and speed, not which end leads), so this test is
-        // purely about the thrust asymmetry.
+        // purely about the thrust asymmetry. The fairway spawn has clear
+        // water both up and down the channel, so 8 s of way in either
+        // direction stays in the open.
         let mut ahead = Sim::new();
         run_input(&mut ahead, &Env::CALM, &FULL_AHEAD, 8.0);
         let ahead_speed = ahead.boat_vel().0.length();
@@ -1940,25 +2364,27 @@ mod tests {
     #[test]
     fn a_burst_astern_walks_the_stern_to_port() {
         // Right-handed prop: going astern the walk force pushes the stern
-        // to port. At heading 0 (bow east, port = +y) that is a +y force at
-        // the stern => a clockwise (negative) yaw: the bow swings to
-        // starboard, the classic "backs to port".
+        // to port => a clockwise yaw (the heading DECREASES from wherever
+        // it started): the bow swings to starboard, the classic "backs to
+        // port". Measured as a delta from the spawn heading.
         let mut astern = Sim::new();
+        let h0 = astern.boat_pose().1;
         run_input(&mut astern, &Env::CALM, &FULL_ASTERN, 6.0);
-        let (_, h_astern) = astern.boat_pose();
+        let h_astern = astern.boat_pose().1 - h0;
         assert!(
             h_astern < -0.02,
-            "expected the bow to swing starboard (negative heading) going astern, got {h_astern}"
+            "expected the bow to swing starboard (negative heading delta) going astern, \
+             got {h_astern}"
         );
 
         // Control: ahead the walk reverses sign and the wash keeps it weak
         // — a smaller swing the other way.
         let mut ahead = Sim::new();
         run_input(&mut ahead, &Env::CALM, &FULL_AHEAD, 6.0);
-        let (_, h_ahead) = ahead.boat_pose();
+        let h_ahead = ahead.boat_pose().1 - h0;
         assert!(
             h_ahead > 0.0,
-            "expected a slight port swing (positive heading) going ahead, got {h_ahead}"
+            "expected a slight port swing (positive heading delta) going ahead, got {h_ahead}"
         );
         assert!(
             h_astern.abs() > h_ahead.abs(),
@@ -1969,15 +2395,16 @@ mod tests {
     #[test]
     fn rudder_turns_the_boat_when_making_way() {
         // Helm to starboard (positive input) with way on => clockwise turn
-        // (negative heading at start orientation); mirrored to port. Short
-        // runs from an injected speed, engine off, so this isolates the
-        // foil from wash and walk.
+        // (negative heading delta); mirrored to port. Short runs from an
+        // injected speed, engine off, so this isolates the foil from wash
+        // and walk.
         let turn = |rudder: f32| {
             let mut sim = Sim::new();
+            let h0 = sim.boat_pose().1;
             sim.set_forward_speed(2.5);
             let input = InputState { throttle: 0.0, rudder };
             run_input(&mut sim, &Env::CALM, &input, 1.5);
-            sim.boat_pose().1
+            sim.boat_pose().1 - h0
         };
         let stbd = turn(1.0);
         let port = turn(-1.0);
@@ -2152,10 +2579,11 @@ mod tests {
         // work. Same injected speed magnitude both ways, engine off.
         let heading_after = |u: f32| {
             let mut sim = Sim::new();
+            let h0 = sim.boat_pose().1;
             sim.set_forward_speed(u);
             let input = InputState { throttle: 0.0, rudder: 1.0 };
             run_input(&mut sim, &Env::CALM, &input, 1.5);
-            sim.boat_pose().1
+            sim.boat_pose().1 - h0
         };
         let ahead = heading_after(1.5);
         let astern = heading_after(-1.5);
