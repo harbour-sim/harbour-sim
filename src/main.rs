@@ -22,15 +22,22 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 mod keel_editor;
 
-// Zoom bounds for the fill-screen camera: never show more than
+// DEFAULT zoom bounds for the fill-screen camera: never show more than
 // VIEW_MAX_W × VIEW_MAX_H metres, never fewer than VIEW_MIN_W metres across.
 // The camera fills the window (cropping the other axis) and follows the
 // boat, clamped to the world rect — that's what makes a portrait phone show
-// a sensible close-up. The marina itself is ~400 m long, so even at max
-// zoom-out only a stretch of it is in frame and the camera pans with you.
+// a sensible close-up.
 const VIEW_MAX_W: f32 = 150.0;
 const VIEW_MAX_H: f32 = 85.0;
 const VIEW_MIN_W: f32 = 30.0;
+
+// USER zoom on top of that (pinch on touch; scroll wheel or +/- keys on
+// desktop — the two UIs stay on par, see CLAUDE.md): a multiplier on the
+// default scale, clamped so the visible width stays between these. The
+// wide end shows a ~450 m sweep of the ~800 m marina at once; the narrow
+// end is a close-up for threading a berth.
+const ZOOM_OUT_MAX_W: f32 = 450.0;
+const ZOOM_IN_MIN_W: f32 = 24.0;
 
 // Environment knob rates (per second of key held) and ranges. The touch
 // dials share the same WIND_MAX / CURRENT_MAX: dial rim = max.
@@ -245,6 +252,11 @@ async fn main() {
     let mut throttle_claim: Option<u64> = None;
     let mut rudder_claim: Option<u64> = None;
     let mut mouse_claim: Option<u8> = None; // 0 = wind, 1 = current, 2 = throttle, 3 = rudder
+    // User camera zoom (see ZOOM_* above) and the live pinch, if any:
+    // the two finger ids (sorted) + their separation last frame. Zoom is
+    // a camera preference — it survives resets and respawns.
+    let mut zoom = 1.0f32;
+    let mut pinch: Option<(u64, u64, f32)> = None;
 
     loop {
         let dt = get_frame_time().min(0.05);
@@ -379,6 +391,34 @@ async fn main() {
             }
             prev_touch_ids = cur_ids;
 
+            // --- Pinch to zoom: exactly two fingers that are NOT holding a
+            // HUD control. Tracked by the sorted id pair so a third finger
+            // landing on a slider (or one of the pair being recycled) ends
+            // the gesture instead of jumping the zoom.
+            let free: Vec<(u64, Vec2)> = ts
+                .iter()
+                .filter(|t| {
+                    wind_claim != Some(t.id)
+                        && current_claim != Some(t.id)
+                        && throttle_claim != Some(t.id)
+                        && rudder_claim != Some(t.id)
+                })
+                .map(|t| (t.id, t.position / dpi))
+                .collect();
+            if let [(ida, pa), (idb, pb)] = free[..] {
+                let key = (ida.min(idb), ida.max(idb));
+                let d = (pa - pb).length();
+                if let Some((a, b, d0)) = pinch
+                    && (a, b) == key
+                    && d0 > 1.0
+                {
+                    zoom *= d / d0;
+                }
+                pinch = Some((key.0, key.1, d));
+            } else {
+                pinch = None;
+            }
+
             // --- Mouse input: same dials, same gesture ---------------------
             let mp: Vec2 = mouse_position().into();
             if is_mouse_button_pressed(MouseButton::Left) {
@@ -464,6 +504,23 @@ async fn main() {
             env.wind_from_deg = env.wind_from_deg.rem_euclid(360.0);
             env.current_to_deg = env.current_to_deg.rem_euclid(360.0);
 
+            // --- Zoom, desktop side: scroll wheel and +/- keys (the touch
+            // twin is the pinch above). Wheel deltas differ wildly between
+            // native (±1 per notch) and web (deltaY pixels, ~±100 per
+            // notch), so small values are treated as notches and large
+            // ones as pixels, both bounded per event.
+            let (_, wheel_y) = mouse_wheel();
+            if wheel_y != 0.0 {
+                let step = if wheel_y.abs() >= 40.0 { wheel_y / 240.0 } else { wheel_y * 0.25 };
+                zoom *= 2.0f32.powf(step.clamp(-0.6, 0.6));
+            }
+            if is_key_down(KeyCode::Equal) || is_key_down(KeyCode::KpAdd) {
+                zoom *= 2.0f32.powf(dt);
+            }
+            if is_key_down(KeyCode::Minus) || is_key_down(KeyCode::KpSubtract) {
+                zoom *= 2.0f32.powf(-dt);
+            }
+
             if do_reset {
                 // Fresh Sim per run — never reuse one (determinism rule).
                 (sim, prev_pos, prev_heading, cur_pos, cur_heading) = respawn(&design);
@@ -494,7 +551,15 @@ async fn main() {
         let heading = lerp_angle(prev_heading, cur_heading, alpha);
 
         // --- Camera: fill the screen, follow the boat, clamp to world ----
-        let scale = (sw / VIEW_MAX_W).max(sh / VIEW_MAX_H).min(sw / VIEW_MIN_W);
+        // The user zoom multiplies the default fill-screen scale; it is
+        // re-clamped every frame against the CURRENT window size so a
+        // resize can't strand it outside its bounds, and the clamp always
+        // admits 1.0 (the default) even on extreme aspect ratios.
+        let base_scale = (sw / VIEW_MAX_W).max(sh / VIEW_MAX_H).min(sw / VIEW_MIN_W);
+        let zoom_lo = (sw / ZOOM_OUT_MAX_W) / base_scale;
+        let zoom_hi = (sw / ZOOM_IN_MIN_W) / base_scale;
+        zoom = zoom.clamp(zoom_lo.min(1.0), zoom_hi.max(1.0));
+        let scale = base_scale * zoom;
         let (wl, wr) = (bmin.x - 6.0, bmax.x + 6.0);
         let (wb, wt) = (bmin.y - 6.0, bmax.y + 6.0);
         let vis_hw = sw * 0.5 / scale;
@@ -1062,10 +1127,11 @@ async fn main() {
         // which owns the bottom-left corner itself (30 px + gaps; the
         // indent is harmless dead space in native builds, which have no
         // HTML layer).
-        let mut help: Vec<&str> = vec!["left slider = engine, right = rudder; dials set wind & current"];
+        let mut help: Vec<&str> =
+            vec!["left slider = engine, right = rudder; dials set wind & current; pinch = zoom"];
         if sw >= 700.0 {
             help.push("keys: W/S throttle, A/D rudder, Space stop engine, arrows wind");
-            help.push("I/K+J/L = current, R = reset, E = keel editor");
+            help.push("I/K+J/L = current, R = reset, E = keel editor, wheel or +/- = zoom");
         }
         let help_x = sa_l + margin + 40.0;
         // On narrow screens the hint line runs under the KEEL/RESET buttons

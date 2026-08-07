@@ -25,9 +25,11 @@ telegraph (up = ahead, down = astern, centre = neutral); the horizontal
 slider on the right edge is the helm (right = starboard). Both hold where
 you leave them, with a centre detent — drive with two thumbs. Drag the two
 compass dials (top corners) to set wind and current — drag direction is
-where the flow goes toward, distance is speed (centre = calm). The RESET
-button returns the boat to its fairway start, engine to neutral, helm
-amidships.
+where the flow goes toward, distance is speed (centre = calm). Pinch
+anywhere on the water to zoom — from a berth-threading close-up out to a
+~450 m sweep of the marina (scroll wheel does the same with a mouse). The
+RESET button returns the boat to its fairway start, engine to neutral,
+helm amidships.
 
 **Keyboard**:
 
@@ -40,6 +42,7 @@ amidships.
 | ↑ / ↓ | Wind speed |
 | J / L | Rotate current direction |
 | I / K | Current speed |
+| + / - | Zoom in / out (also mouse wheel) |
 | R | Reset the boat to its fairway start |
 | E | Keel design editor |
 

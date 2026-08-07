@@ -875,12 +875,25 @@ like Pegasus.
   position is divided by `screen_dpi_scale()` before use (the Pegasus
   gotcha). HUD sizes are written directly in css px, clamped
   (`(min_dim * k).clamp(lo, hi)`) — no more `ui` multiplier.
-- **Camera fills the screen and follows the boat**: `scale =
-  max(sw/VIEW_MAX_W, sh/VIEW_MAX_H).min(sw/VIEW_MIN_W)` (never more than
-  88×46 m visible, never fewer than 30 m across), camera centred on the
-  interpolated boat pose and clamped to the world rect. This is what makes
-  portrait phones show a close-up instead of letterboxing the whole basin.
-  `w2s` closure converts world → screen px (y inverted).
+- **Camera fills the screen and follows the boat**: `base_scale =
+  max(sw/VIEW_MAX_W, sh/VIEW_MAX_H).min(sw/VIEW_MIN_W)` (defaults:
+  never more than 150×85 m visible, never fewer than 30 m across),
+  camera centred on the interpolated boat pose and clamped to the world
+  rect. This is what makes portrait phones show a close-up instead of
+  letterboxing the whole marina. `w2s` closure converts world → screen
+  px (y inverted). **User zoom** (2026-08-05) multiplies `base_scale`:
+  pinch on touch, scroll wheel or +/- keys on desktop (parity rule),
+  clamped every frame so the visible width stays in
+  `[ZOOM_IN_MIN_W = 24, ZOOM_OUT_MAX_W = 450]` m — re-clamped against
+  the CURRENT window size (resize can't strand it) with 1.0 always
+  admitted. Pinch = exactly two touches NOT claimed by any HUD control,
+  tracked by sorted id pair (a control-claimed finger never pinches; a
+  recycled or third finger ends the gesture instead of jumping the
+  zoom); zooming is about the follow-point, no panning. **Wheel-delta
+  gotcha**: native reports ±1 per notch, web reports deltaY PIXELS
+  (~±100 per notch) — deltas ≥40 are treated as pixels (/240), smaller
+  ones as notches (×0.25), both bounded per event. Zoom is a camera
+  preference: it survives R-reset and editor Apply.
 - **Touch controls**: the two HUD compass indicators are draggable **dials**
   (`Dial` struct) — drag direction from the dial centre = the flow's TOWARD
   direction (wind label still displays the mariners' FROM convention:
@@ -922,7 +935,8 @@ like Pegasus.
   boil forward along the quarters astern; the rudder blade itself is drawn
   BEFORE the hull fill (root under the counter), swinging by the same
   blade-angle formula sim-core uses.
-- Controls: touch/mouse = drag the dials/sliders + RESET/KEEL buttons;
+- Controls: touch/mouse = drag the dials/sliders + RESET/KEEL buttons,
+  pinch = zoom, scroll wheel / +/- keys = zoom (desktop twin);
   keyboard = **the boat has the primary keys** (agreed 2026-08-03: driving
   is the main activity): W/S throttle up/down, A/D helm port/starboard
   (continuous `is_key_down`×dt like the env keys), Space = engine to
