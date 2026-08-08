@@ -114,16 +114,27 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
     shared sailboat (see Roadmap); a design varies keel, rudder and
     weight on it.
 - `src/main.rs` — macroquad frontend: input, fixed-timestep loop with render
-  interpolation, top-down rendering (water/ripples, the Hinsholmen scenery —
+  interpolation, the camera (fill/follow/zoom/pan), HUD
+  (wind/current dials, throttle/rudder sliders, SOG readout, key help),
+  keel design editor overlay (`E`). The top-down world drawing itself
+  lives in `src/render2d.rs` (extracted 2026-08-08 so the same renderer
+  can serve both the full screen and a future viewport inset).
+- `src/render2d.rs` — the top-down 2D world renderer: water/ripples, the
+  Hinsholmen scenery —
   grass/tree road shore with quay apron NW, wooded rocky hill shore SE,
   plank pontoons, mooring poles, moored boats with crossed stern lines out
   to their pole pairs and breast lines to the jetty, rounded silt-ringed
   bay head NE, open sea SW with a skerry chain at the world's edge — and
-  the player's boat), HUD
-  (wind/current dials, throttle/rudder sliders, SOG readout, key help),
-  keel design editor overlay (`E`). All static scenery (jetty list, poles,
-  moored fleet, both shore polylines, world bounds) is fetched from
-  sim-core ONCE before the loop; curved shores render via
+  the player's boat. `Scenery::build()` fetches all static geometry
+  (jetty list, poles, moored fleet, both shore polylines, world bounds)
+  from sim-core ONCE at startup — sim-core stays the single source of
+  truth: what's drawn IS what collides. `WorldFrame` carries the per-frame
+  inputs (interpolated pose, blade angle, spooled engine, env, design,
+  render clock); `draw_world(w, h, scale, cam, …)` draws in
+  VIEWPORT-LOCAL css px (0..w × 0..h — full-screen callers pass the
+  screen size and get the pre-extraction output byte-for-byte, and it
+  opens with a full-viewport deep-water rect so an inset gets its own
+  backdrop). Curved shores render via
   `offset_polyline` + `draw_strip` (quad strips between polylines), and
   everything repeated (boats, poles, trees, ripples) is visibility-culled
   per frame against the camera circle — the marina is ~400 m long and
