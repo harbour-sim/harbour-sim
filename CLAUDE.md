@@ -141,6 +141,37 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
   only a stretch is ever on screen. Scenery scatter (trees) uses the same
   deterministic hash idiom as the ripples, minus the time term — cosmetic
   only, like everything render-side.
+- `src/render3d.rs` — the 3D chase-cam renderer (2026-08-08): a
+  perspective view of the SAME world, built from the same `Scenery` as
+  render2d — sim-core stays the single source of truth, and every hull's
+  waterline footprint is exactly `HULL_PTS`, so visuals still match
+  collision at the only plane the physics knows. All VERTICAL dimensions
+  (freeboard/sheer, coachroof, mast, pontoon freeboard, pole tops, land
+  heights) are COSMETIC frontend consts in its `dims` module — sim-core
+  is strictly 2D and deliberately gains no heights. Coordinate mapping
+  stated once in `w3`: world (x=east, y=north) → render (x, up, -y),
+  right-handed y-up; `Camera3D.fovy` is RADIANS in macroquad 0.4.15
+  (`45f32.to_radians()`), and `Camera3D` enables depth testing (verified
+  against the vendored macroquad source + a headless-Chromium smoke
+  test). macroquad has no lighting, so per-face shading against a fixed
+  fake sun is baked into vertex colors (`shade`); a single `draw_mesh`
+  is silently CLAMPED to 10 000 vertices / 5 000 indices (quad_gl
+  draw-call buffers), so `MeshBook` chunks the static world (shores as
+  waterline walls + land ribbons, jetty boxes, pole prisms, the moored
+  fleet as extruded hulls — no rigs, a forest of masts would bury the
+  skyline) into as many meshes as needed, built ONCE at startup. The
+  player's boat is rebuilt through the live pose each frame (`draw_mesh`
+  has no transform parameter — rewriting ~100 vertices/frame beats the
+  unsafe `push_model_matrix` route). Ripples/wash/rudder-chord geometry
+  is SHARED with render2d (`for_each_ripple`, `for_each_wash_streak`,
+  `rudder_chord` — world-space callbacks each renderer projects itself)
+  so the two views can never drift apart; translucent water decals ride
+  `DECAL_LIFT` (2 cm) above the waterplane against z-fighting. Chase
+  camera: behind/above the boat (`CHASE_*` consts), heading followed
+  through a first-order yaw lag (`lerp_angle`, τ 0.45 s), SNAPPED on
+  every respawn (`snap_yaw`) so R doesn't swoop the view. Deferred
+  knowingly: trees/rocks/skerries in 3D, mooring-line catenary, camera
+  collision with scenery, wave motion.
 - `src/keel_editor.rs` — in-app editor for `BoatDesign`: drag a fixed-grid
   bar chart to paint the underwater area distribution, drag a displacement
   slider (4–14 t range bracketing the reference boats, 100 kg steps;
@@ -916,9 +947,22 @@ like Pegasus.
   each frame, so shoving against the edge racks up no invisible travel,
   and a zero offset can never turn nonzero on its own (the boat is
   always inside the world). Pinch/wheel zoom leaves the offset alone.
-  A CENTER button (twin of the C key) appears left of KEEL ONLY while
+  A CENTER button (twin of the C key) appears left of VIEW ONLY while
   the offset is >0.5 m; C, CENTER, R-reset and editor Apply all zero it
   (zoom persists throughout).
+- **View modes** (2026-08-08): `ViewMode { TopDown, Chase }` cycled by
+  the **V key** and the **VIEW button** (left of KEEL; labelled with the
+  view a press switches TO — "3D"/"2D" — mobile-parity rule: V would
+  otherwise have no touch equivalent). TopDown is everything above;
+  Chase is the 3D perspective in `src/render3d.rs`. The HUD is drawn
+  identically in every mode (Chase calls `set_default_camera()` before
+  the HUD block). Zoom/pan/CENTER are TOP-DOWN-ONLY: in Chase those
+  gestures are ignored (`top_down` gating in the input block) rather
+  than silently panning a camera you can't see — free fingers do
+  nothing there, wheel/+-/C included, and the CENTER button hides. The
+  chase yaw snaps on every respawn path (R, editor Apply) via
+  `Renderer3D::snap_yaw`. View mode is a plain local: survives resets,
+  resets to TopDown on reload.
 - **Touch controls**: the two HUD compass indicators are draggable **dials**
   (`Dial` struct) — drag direction from the dial centre = the flow's TOWARD
   direction (wind label still displays the mariners' FROM convention:
@@ -960,10 +1004,10 @@ like Pegasus.
   boil forward along the quarters astern; the rudder blade itself is drawn
   BEFORE the hull fill (root under the counter), swinging by the same
   blade-angle formula sim-core uses.
-- Controls: touch/mouse = drag the dials/sliders + RESET/KEEL buttons
+- Controls: touch/mouse = drag the dials/sliders + RESET/KEEL/VIEW buttons
   (+ CENTER while panned), pinch = zoom, one-finger/mouse drag on the
   water = pan, scroll wheel / +/- keys = zoom and C = centre (desktop
-  twins);
+  twins; zoom/pan/centre in the top-down view only), V = cycle view mode;
   keyboard = **the boat has the primary keys** (agreed 2026-08-03: driving
   is the main activity): W/S throttle up/down, A/D helm port/starboard
   (continuous `is_key_down`×dt like the env keys), Space = engine to

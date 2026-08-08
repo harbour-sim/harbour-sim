@@ -115,6 +115,74 @@ pub struct WorldFrame<'a> {
     pub design: &'a BoatDesign,
 }
 
+/// The drifting ripple field, as world-space segments — SHARED between the
+/// top-down and 3D renderers so the two views show the same water (and a
+/// future tweak can't update one and miss the other). Callback style so
+/// each caller applies its own culling and projection.
+pub fn for_each_ripple(sc: &Scenery, env: &Env, time: f32, mut f: impl FnMut(Vec2, Vec2)) {
+    let drift = env.current_vel() + env.wind_vel() * 0.02;
+    let (bw, bh) = (sc.bmax.x - sc.bmin.x, sc.bmax.y - sc.bmin.y);
+    for i in 0u32..220 {
+        let hsh = i.wrapping_mul(2654435761);
+        let fx = (hsh & 0xffff) as f32 / 65535.0;
+        let fy = ((hsh >> 16) & 0xffff) as f32 / 65535.0;
+        let x = (fx * bw + drift.x * time).rem_euclid(bw) + sc.bmin.x;
+        let y = (fy * bh + drift.y * time).rem_euclid(bh) + sc.bmin.y;
+        f(vec2(x, y), vec2(x + 1.4, y));
+    }
+}
+
+/// The colour every ripple streak is drawn in.
+pub const RIPPLE_COLOR: Color = Color::new(120.0 / 255.0, 170.0 / 255.0, 190.0 / 255.0, 26.0 / 255.0);
+
+/// The prop-wash foam streaks, as world-space segments + per-streak colour
+/// — shared between the renderers like the ripples. Streaks are driven by
+/// the SPOOLED engine (they fade with the lag, not the lever): ahead the
+/// slipstream leaves the stern along the deflected blade; astern it boils
+/// forward along both quarters.
+pub fn for_each_wash_streak(fr: &WorldFrame, mut f: impl FnMut(Vec2, Vec2, Color)) {
+    if fr.engine.abs() <= 0.05 {
+        return;
+    }
+    let (c, s) = (fr.heading.cos(), fr.heading.sin());
+    let bw = |p: Vec2| -> Vec2 { fr.pos + vec2(p.x * c - p.y * s, p.x * s + p.y * c) };
+    let (engine, blade) = (fr.engine, fr.blade);
+    for i in 0u32..8 {
+        let hsh = i.wrapping_mul(2654435761);
+        let fy = ((hsh & 0xffff) as f32 / 65535.0) - 0.5;
+        let phase = ((hsh >> 16) & 0xffff) as f32 / 65535.0;
+        let ph = (fr.time * 1.8 + phase).fract();
+        let alpha = engine.abs().min(1.0) * (1.0 - ph) * 0.5;
+        let foam = Color::new(0.75, 0.88, 0.92, alpha);
+        let (a, b) = if engine > 0.0 {
+            let dir = vec2(-blade.cos(), blade.sin());
+            let start = vec2(-6.0, fy * 1.1);
+            let p = start + dir * (ph * (1.5 + 2.2 * engine));
+            (p, p + dir * 0.7)
+        } else {
+            let side_y = if i % 2 == 0 { 1.0 } else { -1.0 };
+            let start = vec2(-5.2, side_y * (1.4 + 0.6 * fy.abs()));
+            let p = start + vec2(ph * (2.0 - 2.5 * engine), 0.0);
+            (p, p + vec2(0.6, 0.0))
+        };
+        f(bw(a), bw(b), foam);
+    }
+}
+
+/// The rudder chord in world space (stock at the active design's blade
+/// position, trailing edge swung by `fr.blade`) — shared so both views
+/// draw the same blade the physics uses.
+pub fn rudder_chord(fr: &WorldFrame) -> (Vec2, Vec2) {
+    let (c, s) = (fr.heading.cos(), fr.heading.sin());
+    let bw = |p: Vec2| -> Vec2 { fr.pos + vec2(p.x * c - p.y * s, p.x * s + p.y * c) };
+    let stock_x = fr.design.rudder.x + fr.design.rudder.chord / 2.0;
+    let te = vec2(
+        stock_x - fr.design.rudder.chord * fr.blade.cos(),
+        fr.design.rudder.chord * fr.blade.sin(),
+    );
+    (bw(vec2(stock_x, 0.0)), bw(te))
+}
+
 /// Draw the whole top-down world into a `w × h` css-px viewport with the
 /// given px-per-metre `scale`, camera-centred on `cam` (world metres).
 pub fn draw_world(w: f32, h: f32, scale: f32, cam: Vec2, sc: &Scenery, fr: &WorldFrame) {
@@ -143,22 +211,14 @@ pub fn draw_world(w: f32, h: f32, scale: f32, cam: Vec2, sc: &Scenery, fr: &Worl
     // Cosmetic ripples: short streaks drifting with the current (and a
     // touch of wind), wrapped over the world box. Purely render-side —
     // the land fills drawn next cover the strays that land ashore.
-    let t = fr.time;
-    let drift = fr.env.current_vel() + fr.env.wind_vel() * 0.02;
-    let (bw, bh) = (sc.bmax.x - sc.bmin.x, sc.bmax.y - sc.bmin.y);
-    for i in 0u32..220 {
-        let hsh = i.wrapping_mul(2654435761);
-        let fx = (hsh & 0xffff) as f32 / 65535.0;
-        let fy = ((hsh >> 16) & 0xffff) as f32 / 65535.0;
-        let x = (fx * bw + drift.x * t).rem_euclid(bw) + sc.bmin.x;
-        let y = (fy * bh + drift.y * t).rem_euclid(bh) + sc.bmin.y;
-        if !visible(vec2(x, y), 2.0) {
-            continue;
+    // (Geometry shared with the 3D view — see `for_each_ripple`.)
+    for_each_ripple(sc, fr.env, fr.time, |a, b| {
+        if !visible(a, 2.0) {
+            return;
         }
-        let a = w2s(vec2(x, y));
-        let b = w2s(vec2(x + 1.4, y));
-        draw_line(a.x, a.y, b.x, b.y, 1.5, Color::from_rgba(120, 170, 190, 26));
-    }
+        let (a, b) = (w2s(a), w2s(b));
+        draw_line(a.x, a.y, b.x, b.y, 1.5, RIPPLE_COLOR);
+    });
 
     // --- Shore (Hinsholmen look: road side NW, wooded hill SE) --------
     // Deterministic scatter helper for trees: same hash idiom as the
@@ -395,50 +455,22 @@ pub fn draw_world(w: f32, h: f32, scale: f32, cam: Vec2, sc: &Scenery, fr: &Worl
     let hull_fill = Color::from_rgba(230, 226, 212, 255);
     let hull_line = Color::from_rgba(40, 42, 48, 255);
 
-    // Cosmetic prop wash: foam streaks driven by the SPOOLED engine
-    // (sim.engine(), so they fade in/out with the lag, not the lever).
-    // Render-only — reads sim state, feeds nothing back (get_time is
-    // allowed here like the ripples). Ahead the slipstream leaves the
-    // stern along the deflected blade; astern it boils forward along
-    // both quarters — the two directions you'd see from a quay.
-    let engine = fr.engine;
-    let blade = fr.blade;
-    if engine.abs() > 0.05 {
-        for i in 0u32..8 {
-            let hsh = i.wrapping_mul(2654435761);
-            let fy = ((hsh & 0xffff) as f32 / 65535.0) - 0.5;
-            let phase = ((hsh >> 16) & 0xffff) as f32 / 65535.0;
-            let ph = (t * 1.8 + phase).fract();
-            let alpha = engine.abs().min(1.0) * (1.0 - ph) * 0.5;
-            let foam = Color::new(0.75, 0.88, 0.92, alpha);
-            let (a, b) = if engine > 0.0 {
-                let dir = vec2(-blade.cos(), blade.sin());
-                let start = vec2(-6.0, fy * 1.1);
-                let p = start + dir * (ph * (1.5 + 2.2 * engine));
-                (bl(p.x, p.y), bl(p.x + dir.x * 0.7, p.y + dir.y * 0.7))
-            } else {
-                let side_y = if i % 2 == 0 { 1.0 } else { -1.0 };
-                let start = vec2(-5.2, side_y * (1.4 + 0.6 * fy.abs()));
-                let p = start + vec2(ph * (2.0 - 2.5 * engine), 0.0);
-                (bl(p.x, p.y), bl(p.x + 0.6, p.y))
-            };
-            draw_line(a.x, a.y, b.x, b.y, (0.14 * scale).max(1.0), foam);
-        }
-    }
+    // Cosmetic prop wash (geometry shared with the 3D view — see
+    // `for_each_wash_streak`).
+    for_each_wash_streak(fr, |a, b, foam| {
+        let (a, b) = (w2s(a), w2s(b));
+        draw_line(a.x, a.y, b.x, b.y, (0.14 * scale).max(1.0), foam);
+    });
 
     // Rudder blade: stock at the ACTIVE DESIGN's blade position (each
     // preset carries its real boat's rudder — see `RudderDesign` in
     // boat.rs; same values the physics uses), drawn BEFORE the hull
     // fill so the root reads as under the counter and only the swung
     // part shows past it. Stock at the blade's leading edge, the
-    // drawn line is the chord.
-    let stock_x = fr.design.rudder.x + fr.design.rudder.chord / 2.0;
-    let te = vec2(
-        stock_x - fr.design.rudder.chord * blade.cos(),
-        fr.design.rudder.chord * blade.sin(),
-    );
-    let rp = bl(stock_x, 0.0);
-    let tep = bl(te.x, te.y);
+    // drawn line is the chord (shared geometry: `rudder_chord`).
+    let (stock, te) = rudder_chord(fr);
+    let rp = w2s(stock);
+    let tep = w2s(te);
     draw_line(rp.x, rp.y, tep.x, tep.y, (0.16 * scale).max(1.5), hull_line);
 
     let p0 = bl(HULL_PTS[0].0, HULL_PTS[0].1);

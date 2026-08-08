@@ -16,10 +16,12 @@ use harbour_sim_core::sim::{Env, InputState, PHYSICS_DT, Sim};
 use keel_editor::{EditorAction, EditorLayout, KeelEditor};
 use macroquad::prelude::*;
 use render2d::{Scenery, WorldFrame};
+use render3d::Renderer3D;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 mod keel_editor;
 mod render2d;
+mod render3d;
 
 // DEFAULT zoom bounds for the fill-screen camera: never show more than
 // VIEW_MAX_W × VIEW_MAX_H metres, never fewer than VIEW_MIN_W metres across.
@@ -92,8 +94,28 @@ fn respawn(design: &BoatDesign) -> (Sim, Vec2, f32, Vec2, f32) {
     (sim, pos, heading, pos, heading)
 }
 
-/// Shortest-path angle interpolation (for the render lerp across a tick).
-fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
+/// Which world view is on screen. Cycled by the V key / VIEW button; the
+/// HUD is identical in every mode.
+#[derive(Clone, Copy, PartialEq)]
+enum ViewMode {
+    /// The classic top-down view (with zoom/pan — see the camera block).
+    TopDown,
+    /// The 3D chase camera (see render3d.rs). No zoom/pan gestures here.
+    Chase,
+}
+
+impl ViewMode {
+    fn next(self) -> ViewMode {
+        match self {
+            ViewMode::TopDown => ViewMode::Chase,
+            ViewMode::Chase => ViewMode::TopDown,
+        }
+    }
+}
+
+/// Shortest-path angle interpolation (for the render lerp across a tick,
+/// and the chase camera's yaw lag in render3d).
+pub(crate) fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
     let mut d = (b - a) % std::f32::consts::TAU;
     if d > std::f32::consts::PI {
         d -= std::f32::consts::TAU;
@@ -179,6 +201,8 @@ async fn main() {
     // collides.
     let scenery = Scenery::build();
     let (bmin, bmax) = (scenery.bmin, scenery.bmax);
+    let mut r3d = Renderer3D::new(&scenery);
+    let mut view = ViewMode::TopDown;
     let mut env = Env {
         wind_from_deg: 315.0,
         wind_speed: 6.0,
@@ -192,6 +216,7 @@ async fn main() {
     let mut accum = 0.0f32;
     let (mut prev_pos, mut prev_heading) = sim.boat_pose();
     let (mut cur_pos, mut cur_heading) = (prev_pos, prev_heading);
+    r3d.snap_yaw(cur_heading);
 
     // Touch/mouse claims for the two dials + two sliders. "Fresh touch"
     // detection is by id-not-seen-last-frame, NOT by TouchPhase::Started —
@@ -276,12 +301,22 @@ async fn main() {
             keel_w,
             keel_h,
         );
-        // CENTER button, left of KEEL — the touch/mouse twin of the C key.
+        // VIEW button, left of KEEL — the touch/mouse twin of the V key
+        // (cycles the view mode; without it there'd be no way to reach the
+        // 3D view on a touch-only device).
+        let view_w = fs * 4.6;
+        let view_rect = Rect::new(
+            keel_rect.x - margin - view_w,
+            sh - sa_b - margin - keel_h,
+            view_w,
+            keel_h,
+        );
+        // CENTER button, left of VIEW — the touch/mouse twin of the C key.
         // Only shown (and only hittable) while the camera is panned away
         // from the boat, so the button row stays uncluttered otherwise.
         let center_w = fs * 5.2;
         let center_rect = Rect::new(
-            keel_rect.x - margin - center_w,
+            view_rect.x - margin - center_w,
             sh - sa_b - margin - keel_h,
             center_w,
             keel_h,
@@ -304,7 +339,12 @@ async fn main() {
         if !editor.active {
             let mut do_reset = is_key_pressed(KeyCode::R);
             let mut do_open_editor = false;
-            let mut do_center = is_key_pressed(KeyCode::C);
+            // Zoom/pan (and the CENTER twin) belong to the top-down camera
+            // only; in the chase view those gestures are ignored rather
+            // than silently panning a camera you can't see.
+            let top_down = view == ViewMode::TopDown;
+            let mut do_center = top_down && is_key_pressed(KeyCode::C);
+            let mut do_toggle_view = is_key_pressed(KeyCode::V);
 
             // --- Touch input: dial drags + reset/keel taps -----------------
             let ts = touches();
@@ -338,7 +378,9 @@ async fn main() {
                         do_reset = true;
                     } else if keel_rect.contains(p) {
                         do_open_editor = true;
-                    } else if cam_offset.length() > 0.5 && center_rect.contains(p) {
+                    } else if view_rect.contains(p) {
+                        do_toggle_view = true;
+                    } else if top_down && cam_offset.length() > 0.5 && center_rect.contains(p) {
                         do_center = true;
                     }
                 }
@@ -388,7 +430,7 @@ async fn main() {
                 .map(|t| (t.id, t.position / dpi))
                 .collect();
             match free[..] {
-                [(id, p)] => {
+                [(id, p)] if top_down => {
                     if let Some((pid, prev)) = pan_touch
                         && pid == id
                     {
@@ -399,7 +441,7 @@ async fn main() {
                     pan_touch = Some((id, p));
                     pinch = None;
                 }
-                [(ida, pa), (idb, pb)] => {
+                [(ida, pa), (idb, pb)] if top_down => {
                     let key = (ida.min(idb), ida.max(idb));
                     let d = (pa - pb).length();
                     if let Some((a, b, d0)) = pinch
@@ -432,9 +474,11 @@ async fn main() {
                     do_reset = true;
                 } else if keel_rect.contains(mp) {
                     do_open_editor = true;
-                } else if cam_offset.length() > 0.5 && center_rect.contains(mp) {
+                } else if view_rect.contains(mp) {
+                    do_toggle_view = true;
+                } else if top_down && cam_offset.length() > 0.5 && center_rect.contains(mp) {
                     do_center = true;
-                } else {
+                } else if top_down {
                     // Anywhere on the water: drag to pan (claim 4).
                     mouse_claim = Some(4);
                     pan_mouse_prev = mp;
@@ -520,17 +564,20 @@ async fn main() {
             // notch), so small values are treated as notches and large
             // ones as pixels, both bounded per event.
             let (_, wheel_y) = mouse_wheel();
-            if wheel_y != 0.0 {
+            if wheel_y != 0.0 && top_down {
                 let step = if wheel_y.abs() >= 40.0 { wheel_y / 240.0 } else { wheel_y * 0.25 };
                 zoom *= 2.0f32.powf(step.clamp(-0.6, 0.6));
             }
-            if is_key_down(KeyCode::Equal) || is_key_down(KeyCode::KpAdd) {
+            if top_down && (is_key_down(KeyCode::Equal) || is_key_down(KeyCode::KpAdd)) {
                 zoom *= 2.0f32.powf(dt);
             }
-            if is_key_down(KeyCode::Minus) || is_key_down(KeyCode::KpSubtract) {
+            if top_down && (is_key_down(KeyCode::Minus) || is_key_down(KeyCode::KpSubtract)) {
                 zoom *= 2.0f32.powf(-dt);
             }
 
+            if do_toggle_view {
+                view = view.next();
+            }
             if do_center {
                 cam_offset = Vec2::ZERO;
             }
@@ -541,8 +588,10 @@ async fn main() {
                 // Helm and engine come back neutral with the fresh boat;
                 // the environment deliberately persists (same as always).
                 input = InputState::NEUTRAL;
-                // A fresh boat gets the camera back too (zoom persists).
+                // A fresh boat gets the camera back too (zoom persists),
+                // and the chase yaw snaps rather than swooping over.
                 cam_offset = Vec2::ZERO;
+                r3d.snap_yaw(cur_heading);
             }
             if do_open_editor {
                 editor.load_design(&design);
@@ -602,8 +651,7 @@ async fn main() {
         };
         last_scale = scale;
 
-        // --- World (top-down renderer, see render2d.rs) -------------------
-        clear_background(Color::from_rgba(12, 38, 54, 255));
+        // --- World (top-down render2d.rs / chase render3d.rs) -------------
         let frame = WorldFrame {
             pos,
             heading,
@@ -615,7 +663,20 @@ async fn main() {
             env: &env,
             design: &design,
         };
-        render2d::draw_world(sw, sh, scale, vec2(cam_x, cam_y), &scenery, &frame);
+        match view {
+            ViewMode::TopDown => {
+                clear_background(Color::from_rgba(12, 38, 54, 255));
+                render2d::draw_world(sw, sh, scale, vec2(cam_x, cam_y), &scenery, &frame);
+            }
+            ViewMode::Chase => {
+                // Overcast-Nordic sky; the waterplane meets it at the
+                // horizon.
+                clear_background(Color::from_rgba(96, 118, 138, 255));
+                r3d.draw(&scenery, &frame, dt);
+                // Back to the screen-space camera for the HUD below.
+                set_default_camera();
+            }
+        }
         // --- HUD ---------------------------------------------------------
         let text = Color::from_rgba(205, 227, 240, 255);
         let dim = Color::from_rgba(130, 160, 178, 255);
@@ -798,9 +859,33 @@ async fn main() {
             text,
         );
 
-        // Centre-on-boat button (left of KEEL) — only while the camera is
-        // panned off the boat; the touch/mouse twin of the C key.
-        if cam_offset.length() > 0.5 {
+        // View-mode button (left of KEEL) — the touch/mouse twin of the V
+        // key, labelled with the view a press switches TO.
+        draw_rectangle(
+            view_rect.x,
+            view_rect.y,
+            view_rect.w,
+            view_rect.h,
+            Color::from_rgba(10, 20, 30, 170),
+        );
+        draw_rectangle_lines(view_rect.x, view_rect.y, view_rect.w, view_rect.h, 2.0, dim);
+        let view_label = match view {
+            ViewMode::TopDown => "3D",
+            ViewMode::Chase => "2D",
+        };
+        let vl = measure_text(view_label, None, fs as u16, 1.0);
+        draw_text(
+            view_label,
+            view_rect.x + (view_rect.w - vl.width) * 0.5,
+            view_rect.y + view_rect.h * 0.5 + fs * 0.35,
+            fs,
+            text,
+        );
+
+        // Centre-on-boat button (left of VIEW) — only in the top-down view,
+        // and only while the camera is panned off the boat; the touch/mouse
+        // twin of the C key.
+        if view == ViewMode::TopDown && cam_offset.length() > 0.5 {
             draw_rectangle(
                 center_rect.x,
                 center_rect.y,
@@ -837,12 +922,16 @@ async fn main() {
         ];
         if sw >= 700.0 {
             help.push("keys: W/S throttle, A/D rudder, Space stop engine, arrows wind");
-            help.push("I/K+J/L = current, R = reset, E = keel editor, wheel/+- = zoom, C = centre");
+            help.push("I/K+J/L = current, R = reset, E = keel editor, wheel/+- = zoom, C = centre, V = view");
         }
         let help_x = sa_l + margin + 40.0;
         // On narrow screens the hint line runs under the buttons (they
         // share the bottom edge) — lift the block above them then.
-        let buttons_left = if cam_offset.length() > 0.5 { center_rect.x } else { keel_rect.x };
+        let buttons_left = if view == ViewMode::TopDown && cam_offset.length() > 0.5 {
+            center_rect.x
+        } else {
+            view_rect.x
+        };
         let help_w = help
             .iter()
             .map(|l| measure_text(l, None, (fs * 0.8) as u16, 1.0).width)
@@ -881,8 +970,10 @@ async fn main() {
                     design = editor.design();
                     (sim, prev_pos, prev_heading, cur_pos, cur_heading) = respawn(&design);
                     accum = 0.0;
-                    // Respawn = camera back on the boat (zoom persists).
+                    // Respawn = camera back on the boat (zoom persists),
+                    // chase yaw snapped like the R reset.
                     cam_offset = Vec2::ZERO;
+                    r3d.snap_yaw(cur_heading);
                     editor.active = false;
                 }
                 EditorAction::Cancel => {
