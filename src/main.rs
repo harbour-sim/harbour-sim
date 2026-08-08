@@ -102,13 +102,18 @@ enum ViewMode {
     TopDown,
     /// The 3D chase camera (see render3d.rs). No zoom/pan gestures here.
     Chase,
+    /// Chase full-screen + a fixed top-down inset (top-centre) — the 3D
+    /// immersion with the berthing-distance view kept in the corner of
+    /// your eye. No zoom/pan either; the inset follows the boat.
+    Both,
 }
 
 impl ViewMode {
     fn next(self) -> ViewMode {
         match self {
             ViewMode::TopDown => ViewMode::Chase,
-            ViewMode::Chase => ViewMode::TopDown,
+            ViewMode::Chase => ViewMode::Both,
+            ViewMode::Both => ViewMode::TopDown,
         }
     }
 }
@@ -668,13 +673,68 @@ async fn main() {
                 clear_background(Color::from_rgba(12, 38, 54, 255));
                 render2d::draw_world(sw, sh, scale, vec2(cam_x, cam_y), &scenery, &frame);
             }
-            ViewMode::Chase => {
+            ViewMode::Chase | ViewMode::Both => {
                 // Overcast-Nordic sky; the waterplane meets it at the
                 // horizon.
                 clear_background(Color::from_rgba(96, 118, 138, 255));
                 r3d.draw(&scenery, &frame, dt);
                 // Back to the screen-space camera for the HUD below.
                 set_default_camera();
+
+                if view == ViewMode::Both {
+                    // Top-down inset, top-centre under the SOG line (the
+                    // only reliably free HUD region: dials own the top
+                    // corners, sliders the mid-edges, buttons the bottom).
+                    // A Camera2D whose WORLD space is inset-local css px:
+                    // the same draw_world code runs unchanged, and the GPU
+                    // clips everything outside the viewport (macroquad
+                    // viewports are PHYSICAL px, bottom-left origin).
+                    let side = (min_dim * 0.30).clamp(110.0, 220.0);
+                    let ix = sw * 0.5 - side * 0.5;
+                    let iy = sa_t + margin + fs * 2.0;
+                    let iscale =
+                        (side / VIEW_MAX_W).max(side / VIEW_MAX_H).min(side / VIEW_MIN_W);
+                    let vis_h = side * 0.5 / iscale;
+                    let icam = vec2(
+                        if vis_h * 2.0 >= wr - wl {
+                            (wl + wr) * 0.5
+                        } else {
+                            pos.x.clamp(wl + vis_h, wr - vis_h)
+                        },
+                        if vis_h * 2.0 >= wt - wb {
+                            (wb + wt) * 0.5
+                        } else {
+                            pos.y.clamp(wb + vis_h, wt - vis_h)
+                        },
+                    );
+                    set_camera(&Camera2D {
+                        target: vec2(side * 0.5, side * 0.5),
+                        // +y zoom = css-px y-down here: macroquad's screen
+                        // path already flips y once (`invert_y` in its
+                        // Camera2D matrix), unlike `from_display_rect`.
+                        zoom: vec2(2.0 / side, 2.0 / side),
+                        offset: vec2(0.0, 0.0),
+                        rotation: 0.0,
+                        render_target: None,
+                        viewport: Some((
+                            (ix * dpi) as i32,
+                            ((sh - iy - side) * dpi) as i32,
+                            (side * dpi) as i32,
+                            (side * dpi) as i32,
+                        )),
+                    });
+                    render2d::draw_world(side, side, iscale, icam, &scenery, &frame);
+                    set_default_camera();
+                    // A thin frame so the inset reads as an instrument.
+                    draw_rectangle_lines(
+                        ix,
+                        iy,
+                        side,
+                        side,
+                        1.5,
+                        Color::from_rgba(130, 160, 178, 255),
+                    );
+                }
             }
         }
         // --- HUD ---------------------------------------------------------
@@ -871,7 +931,8 @@ async fn main() {
         draw_rectangle_lines(view_rect.x, view_rect.y, view_rect.w, view_rect.h, 2.0, dim);
         let view_label = match view {
             ViewMode::TopDown => "3D",
-            ViewMode::Chase => "2D",
+            ViewMode::Chase => "3D+2D",
+            ViewMode::Both => "2D",
         };
         let vl = measure_text(view_label, None, fs as u16, 1.0);
         draw_text(

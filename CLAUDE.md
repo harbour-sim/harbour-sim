@@ -950,19 +950,35 @@ like Pegasus.
   A CENTER button (twin of the C key) appears left of VIEW ONLY while
   the offset is >0.5 m; C, CENTER, R-reset and editor Apply all zero it
   (zoom persists throughout).
-- **View modes** (2026-08-08): `ViewMode { TopDown, Chase }` cycled by
-  the **V key** and the **VIEW button** (left of KEEL; labelled with the
-  view a press switches TO — "3D"/"2D" — mobile-parity rule: V would
-  otherwise have no touch equivalent). TopDown is everything above;
-  Chase is the 3D perspective in `src/render3d.rs`. The HUD is drawn
-  identically in every mode (Chase calls `set_default_camera()` before
-  the HUD block). Zoom/pan/CENTER are TOP-DOWN-ONLY: in Chase those
-  gestures are ignored (`top_down` gating in the input block) rather
-  than silently panning a camera you can't see — free fingers do
-  nothing there, wheel/+-/C included, and the CENTER button hides. The
-  chase yaw snaps on every respawn path (R, editor Apply) via
-  `Renderer3D::snap_yaw`. View mode is a plain local: survives resets,
-  resets to TopDown on reload.
+- **View modes** (2026-08-08): `ViewMode { TopDown, Chase, Both }`
+  cycled in that order by the **V key** and the **VIEW button** (left of
+  KEEL; labelled with the view a press switches TO — "3D" / "3D+2D" /
+  "2D" — mobile-parity rule: V would otherwise have no touch
+  equivalent). TopDown is everything above; Chase is the 3D perspective
+  in `src/render3d.rs`; Both = Chase full-screen + a top-down INSET,
+  top-centre under the SOG line (the only reliably free HUD region —
+  dials own the top corners, sliders the mid-edges, buttons the
+  bottom), square `(min_dim·0.30).clamp(110, 220)` css px, following
+  the boat at the default fill-scale for its own size (no zoom/pan).
+  The inset is the SAME `draw_world` under a `Camera2D` whose WORLD
+  space is inset-local css px (`target` = centre, `zoom = +2/side` on
+  BOTH axes — **gotcha**: macroquad's screen path already y-flips once
+  (`invert_y` in Camera2D::matrix), so unlike `from_display_rect` the
+  y zoom must be POSITIVE for y-down local px, and a render-target
+  camera would flip again) with `viewport` clipping to the inset rect —
+  **viewport coords are PHYSICAL px with a BOTTOM-LEFT origin**
+  (miniquad `apply_viewport`): multiply css px by `screen_dpi_scale()`
+  and flip y via `(sh - iy - side) * dpi`. The HUD is drawn identically
+  in every mode (the 3D modes call `set_default_camera()` before it).
+  Zoom/pan/CENTER are TOP-DOWN-ONLY: in the 3D modes those gestures are
+  ignored (`top_down` gating in the input block) rather than silently
+  panning a camera you can't see — free fingers do nothing there,
+  wheel/+-/C included, and the CENTER button hides. The chase yaw snaps
+  on every respawn path (R, editor Apply) via `Renderer3D::snap_yaw`,
+  and the chase camera backs off (`boost` in render3d.rs) as the aspect
+  ratio drops below ~1.15 — perspective FOV is VERTICAL, so a portrait
+  phone would otherwise fill its narrow width with the boat. View mode
+  is a plain local: survives resets, resets to TopDown on reload.
 - **Touch controls**: the two HUD compass indicators are draggable **dials**
   (`Dial` struct) — drag direction from the dial centre = the flow's TOWARD
   direction (wind label still displays the mariners' FROM convention:

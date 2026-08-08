@@ -352,9 +352,14 @@ impl Renderer3D {
         let k = 1.0 - (-dt / CHASE_YAW_TAU).exp();
         self.cam_yaw = crate::lerp_angle(self.cam_yaw, fr.heading, k);
 
+        // Perspective FOV is vertical, so a portrait phone would otherwise
+        // fill its narrow width with the boat: back the camera off (and
+        // lift it a little) as the aspect ratio drops below ~1.15.
+        let aspect = screen_width() / screen_height();
+        let boost = (1.15 / aspect).clamp(1.0, 1.9);
         let back = dir3(self.cam_yaw);
         set_camera(&Camera3D {
-            position: w3(fr.pos, CHASE_HEIGHT) - back * CHASE_DIST,
+            position: w3(fr.pos, CHASE_HEIGHT * boost.sqrt()) - back * CHASE_DIST * boost,
             target: w3(fr.pos, CHASE_AIM_UP) + back * CHASE_LOOKAHEAD,
             up: Vec3::Y,
             fovy: 45f32.to_radians(),
