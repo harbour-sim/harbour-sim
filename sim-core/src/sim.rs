@@ -1195,7 +1195,8 @@ impl Sim {
 
     /// A boat built from a full `BoatDesign`: underwater lateral-area
     /// distribution (=> centre of lateral resistance, yaw damping) AND
-    /// displacement. Used by the keel editor's Apply.
+    /// displacement. Used by the R-reset key (via `respawn`) and initial
+    /// construction; the keel editor's Apply uses `new_continuing` instead.
     pub fn new_with_design(design: &BoatDesign) -> Sim {
         Self::build(design, true)
     }
