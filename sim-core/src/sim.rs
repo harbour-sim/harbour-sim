@@ -1200,6 +1200,28 @@ impl Sim {
         Self::build(design, true)
     }
 
+    /// A fresh `Sim` with a new design, but CONTINUING at the old sim's
+    /// pose, velocity, and engine spool — used by the keel editor's Apply
+    /// so the user sees the hydrodynamic effect of a keel change in place,
+    /// instead of being teleported back to the berth. Still a fresh `Sim`
+    /// (determinism rule: never mutate coefficients in place), just one
+    /// whose initial conditions are transplanted from the predecessor.
+    pub fn new_continuing(&self, design: &BoatDesign) -> Sim {
+        let (pos, heading) = self.boat_pose();
+        let (vel, angvel) = self.boat_vel();
+        let engine = self.engine;
+        let mut sim = Self::build(design, true);
+        {
+            let rb = &mut sim.bodies[sim.boat];
+            rb.set_translation(vector![pos.x, pos.y], true);
+            rb.set_rotation(nalgebra::UnitComplex::new(heading), true);
+            rb.set_linvel(vector![vel.x, vel.y], true);
+            rb.set_angvel(angvel, true);
+        }
+        sim.engine = engine;
+        sim
+    }
+
     /// Test-only: the same boat in unbounded open water — no shores, no
     /// jetties, no poles, no moored fleet. The shipped marina bounds (or
     /// obstructs) long benchmark runs — enough to hide whether a

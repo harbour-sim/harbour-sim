@@ -963,7 +963,10 @@ like Pegasus.
   never an in-place teleport; env is kept but **helm/engine reset to
   `InputState::NEUTRAL`** — a fresh boat doesn't inherit a live
   telegraph), E keel design editor (freezes physics — all input and the
-  physics tick, not just rendering — while open; see `src/keel_editor.rs`).
+  physics tick, not just rendering — while open; Apply builds a fresh
+  `Sim` via `Sim::new_continuing` which keeps position, heading,
+  velocity, engine spool, and helm/engine input — the user sees the
+  hydrodynamic effect of a keel change in place; see `src/keel_editor.rs`).
   The KEEL button exists because E has no touch equivalent otherwise —
   without it there'd be no way to reach the editor on a touch-only device.
   Once open, the editor itself takes touch input too (`KeelEditor::update`'s
