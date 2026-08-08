@@ -286,6 +286,17 @@ async fn main() {
                 editor.load_design(&design);
             }
             editor.active = !editor.active;
+            // The HUD touch/mouse state (prev_touch_ids and all claims)
+            // freezes while the editor is open because the input block is
+            // skipped. Clear it on every transition so the first frame
+            // after the editor closes doesn't treat held touches as fresh
+            // and false-grab dials/sliders.
+            prev_touch_ids.clear();
+            wind_claim = None;
+            current_claim = None;
+            throttle_claim = None;
+            rudder_claim = None;
+            mouse_claim = None;
         }
 
         // --- HUD layout (css px) -----------------------------------------
@@ -594,6 +605,13 @@ async fn main() {
             if do_open_editor {
                 editor.load_design(&design);
                 editor.active = true;
+                // Drop stale claims — these fingers are opening the
+                // editor, not driving dials/sliders.
+                wind_claim = None;
+                current_claim = None;
+                throttle_claim = None;
+                rudder_claim = None;
+                mouse_claim = None;
             }
 
             // --- Fixed-timestep physics with render interpolation. ---------
@@ -1281,9 +1299,22 @@ async fn main() {
                     // Respawn = camera back on the boat (zoom persists).
                     cam_offset = Vec2::ZERO;
                     editor.active = false;
+                    // Same claim reset as the E-key path — see comment there.
+                    prev_touch_ids.clear();
+                    wind_claim = None;
+                    current_claim = None;
+                    throttle_claim = None;
+                    rudder_claim = None;
+                    mouse_claim = None;
                 }
                 EditorAction::Cancel => {
                     editor.active = false;
+                    prev_touch_ids.clear();
+                    wind_claim = None;
+                    current_claim = None;
+                    throttle_claim = None;
+                    rudder_claim = None;
+                    mouse_claim = None;
                 }
                 EditorAction::None => {}
             }
