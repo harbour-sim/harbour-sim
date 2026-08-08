@@ -148,8 +148,8 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
   `waterline_extent_reads_each_presets_real_lwl`, and the readout
   describes the curve as edited, which is what Apply hands the
   physics), Apply
-  respawns the boat via
-  `Sim::new_with_design`. The slider has its own mouse/touch claim
+  rebuilds the sim in place via
+  `Sim::new_continuing` (keeping pose, velocity, and engine spool). The slider has its own mouse/touch claim
   (`mouse_on_weight`/`weight_touch`, same one-claim-per-control +
   recycled-id rules as the HUD dials) so a drag that starts on the track
   can't start painting bars when it sweeps across the curve canvas.
@@ -787,7 +787,10 @@ like Pegasus.
   same damping matrix). `Sim::new()` uses the Hallberg-Rassy 38 preset
   (`BoatDesign::hallberg_rassy_38()` — see `boat.rs` and
   `docs/reference-boats.md`); `Sim::new_with_design(&BoatDesign)` takes
-  any design (curve + displacement — used by the keel editor's Apply);
+  any design (curve + displacement — used by the R-reset key and initial
+  construction); `Sim::new_continuing` does the same but transplants
+  pose, velocity, and engine spool from the predecessor (used by the
+  keel editor's Apply);
   `Sim::new_with_keel(&profile)` is the custom-curve-default-weight
   convenience the keel-coupling tests use.
   **The presets were renamed after real boats and re-drawn against their
