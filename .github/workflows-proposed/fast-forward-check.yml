@@ -2,6 +2,7 @@ name: Fast forward check
 on:
   pull_request:
     types: [opened, reopened, synchronize]
+    branches: [main]
 jobs:
   check-fast-forward:
     runs-on: ubuntu-latest
@@ -11,9 +12,14 @@ jobs:
       issues: write
     steps:
       - name: Check whether fast forwarding is possible
-        uses: sequoia-pgp/fast-forward@v1
+        # Pinned to the v1.0.0 commit (the v1 tag is a mutable branch, not
+        # an immutable ref) rather than @v1, since this step runs with a
+        # repo-scoped token.
+        uses: sequoia-pgp/fast-forward@ea7628bedcb0b0b96e94383ada458d812fca4979 # v1.0.0
         with:
           merge: false
           # on-error keeps PR threads clean: a comment appears only when the
-          # branch can NOT be fast-forwarded (i.e. a rebase on main is due).
+          # action's result is non-zero — that's not only "a rebase on main
+          # is due", it also covers the action's own infrastructure errors
+          # (fetch/clone/API failures), which read the same in the comment.
           comment: on-error

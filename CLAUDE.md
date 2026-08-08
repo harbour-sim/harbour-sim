@@ -83,10 +83,22 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
 Two workflows wrap the marketplace **Fast Forward Merge** action so PRs can
 land on `main` with `git merge --ff-only` semantics (linear history, commit
 shas preserved — matches the curate-then-rebase-merge rule under Git
-workflow): `fast-forward-check.yml` runs on PR open/reopen/synchronize with
-`merge: false` and comments **only when the branch can't be fast-forwarded**
-(`comment: on-error` — a rebase on `main` is due); `fast-forward.yml` runs on
-an `issue_comment` containing `/fast-forward` on a PR and does the merge.
+workflow): `fast-forward-check.yml` runs on PR open/reopen/synchronize
+targeting `main` with `merge: false` and comments when the action's result is
+non-zero (`comment: on-error` — usually because a rebase on `main` is due,
+but also the action's own infrastructure errors, e.g. a failed fetch/clone,
+read the same in the comment); `fast-forward.yml` runs on an `issue_comment`
+containing `/fast-forward` on a still-**open** PR (`github.event.issue.state
+== 'open'`, a best-effort filter against commenting on an already-closed
+PR — not a substitute for the action's own authorization check, see below)
+and does the merge. Both pin `sequoia-pgp/fast-forward` to its `v1.0.0`
+commit sha rather than `@v1`, since **`v1` is a mutable branch, not an
+immutable tag** (`git ls-remote` confirms it — only `v1.0.0` is a real tag),
+and the merge step hands the action a repo-write token. The action's own
+README states it checks that the commenter is authorized to push before
+merging, which is why this doesn't also split the workflow into a
+GITHUB_TOKEN preflight job before the token-bearing step — that would
+duplicate a check the action already makes, for a project this size.
 Gotchas: `issue_comment` workflows execute the file from the DEFAULT branch,
 so the `/fast-forward` trigger only works once the workflow is on `main`
 (same class of gotcha as `workflow_run` above). And the merge push is subject
@@ -94,9 +106,11 @@ to the recursion guard already documented for Publish Pages — a push made
 with `GITHUB_TOKEN` doesn't trigger `push` workflows, so a fast-forward merge
 would NOT fire `deploy.yml`. `fast-forward.yml` therefore passes
 `secrets.FAST_FORWARD_PAT || secrets.GITHUB_TOKEN` as `github_token`: add a
-`FAST_FORWARD_PAT` repo secret (PAT with `contents: write`) to make merges
-deploy; without it merges land but the site must be republished via
-`publish-pages.yml`'s `workflow_dispatch` or an empty push.
+`FAST_FORWARD_PAT` repo secret — a fine-grained PAT scoped to this repo with
+`Contents: write` and `Pull requests: write` (the latter covers the action's
+own PR comment), whose owner also satisfies `main`'s branch protection rules
+— to make merges deploy; without it merges land but the site must be
+republished via `publish-pages.yml`'s `workflow_dispatch` or an empty push.
 
 ## Project structure
 - `sim-core/` — the **`harbour-sim-core` library crate** (workspace member):

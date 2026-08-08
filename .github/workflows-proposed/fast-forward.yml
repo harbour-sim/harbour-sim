@@ -4,7 +4,7 @@ on:
     types: [created, edited]
 jobs:
   fast-forward:
-    if: ${{ contains(github.event.comment.body, '/fast-forward') && github.event.issue.pull_request }}
+    if: ${{ contains(github.event.comment.body, '/fast-forward') && github.event.issue.pull_request && github.event.issue.state == 'open' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -12,13 +12,22 @@ jobs:
       issues: write
     steps:
       - name: Fast forward the target branch
-        uses: sequoia-pgp/fast-forward@v1
+        # Pinned to the v1.0.0 commit (the v1 tag is a mutable branch, not
+        # an immutable ref) rather than @v1, since this step is handed a
+        # repo-write token. The action itself checks that the commenter is
+        # authorized to push before merging (upstream README) — the state
+        # check above is only a best-effort filter against commenting on an
+        # already-closed PR, not a substitute for that.
+        uses: sequoia-pgp/fast-forward@ea7628bedcb0b0b96e94383ada458d812fca4979 # v1.0.0
         with:
           merge: true
           comment: always
           # Pushes made with the default GITHUB_TOKEN don't trigger `push`
           # workflows (recursion guard), so a fast-forward merge to main
-          # would NOT fire deploy.yml. Add a FAST_FORWARD_PAT repo secret
-          # (a PAT with contents: write) to make merges deploy the site;
-          # until then the fallback token merges without deploying.
+          # would NOT fire deploy.yml. Add a FAST_FORWARD_PAT repo secret to
+          # make merges deploy the site — a fine-grained PAT scoped to this
+          # repo with Contents: write and Pull requests: write (covers the
+          # comment step too), whose owner also satisfies main's branch
+          # protection rules; until it's added, the fallback token merges
+          # without deploying.
           github_token: ${{ secrets.FAST_FORWARD_PAT || secrets.GITHUB_TOKEN }}
