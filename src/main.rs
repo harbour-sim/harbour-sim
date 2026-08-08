@@ -1300,6 +1300,7 @@ async fn main() {
                     accum = 0.0;
                     // Respawn = camera back on the boat (zoom persists).
                     cam_offset = Vec2::ZERO;
+                    input = InputState::NEUTRAL;
                     editor.active = false;
                     // Same claim reset as the E-key path — see comment there.
                     prev_touch_ids = touches().iter().map(|t| t.id).collect();
