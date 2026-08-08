@@ -1,0 +1,19 @@
+name: Fast forward check
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+jobs:
+  check-fast-forward:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Check whether fast forwarding is possible
+        uses: sequoia-pgp/fast-forward@v1
+        with:
+          merge: false
+          # on-error keeps PR threads clean: a comment appears only when the
+          # branch can NOT be fast-forwarded (i.e. a rebase on main is due).
+          comment: on-error

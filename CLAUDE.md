@@ -79,6 +79,25 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
 
 `ci.yml` runs on PRs: wasm `cargo check`, clippy `-D warnings`, tests.
 
+### Fast-forward merges (sequoia-pgp/fast-forward)
+Two workflows wrap the marketplace **Fast Forward Merge** action so PRs can
+land on `main` with `git merge --ff-only` semantics (linear history, commit
+shas preserved — matches the curate-then-rebase-merge rule under Git
+workflow): `fast-forward-check.yml` runs on PR open/reopen/synchronize with
+`merge: false` and comments **only when the branch can't be fast-forwarded**
+(`comment: on-error` — a rebase on `main` is due); `fast-forward.yml` runs on
+an `issue_comment` containing `/fast-forward` on a PR and does the merge.
+Gotchas: `issue_comment` workflows execute the file from the DEFAULT branch,
+so the `/fast-forward` trigger only works once the workflow is on `main`
+(same class of gotcha as `workflow_run` above). And the merge push is subject
+to the recursion guard already documented for Publish Pages — a push made
+with `GITHUB_TOKEN` doesn't trigger `push` workflows, so a fast-forward merge
+would NOT fire `deploy.yml`. `fast-forward.yml` therefore passes
+`secrets.FAST_FORWARD_PAT || secrets.GITHUB_TOKEN` as `github_token`: add a
+`FAST_FORWARD_PAT` repo secret (PAT with `contents: write`) to make merges
+deploy; without it merges land but the site must be republished via
+`publish-pages.yml`'s `workflow_dispatch` or an empty push.
+
 ## Project structure
 - `sim-core/` — the **`harbour-sim-core` library crate** (workspace member):
   the whole deterministic half. **Nothing in it may depend on macroquad or
