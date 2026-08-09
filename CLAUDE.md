@@ -114,22 +114,84 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
     shared sailboat (see Roadmap); a design varies keel, rudder and
     weight on it.
 - `src/main.rs` — macroquad frontend: input, fixed-timestep loop with render
-  interpolation, top-down rendering (water/ripples, the Hinsholmen scenery —
+  interpolation, the camera (fill/follow/zoom/pan), HUD
+  (wind/current dials, throttle/rudder sliders, SOG readout, key help),
+  keel design editor overlay (`E`). The top-down world drawing itself
+  lives in `src/render2d.rs` (extracted 2026-08-08 so the same renderer
+  can serve both the full screen and a future viewport inset).
+- `src/render2d.rs` — the top-down 2D world renderer: water/ripples, the
+  Hinsholmen scenery —
   grass/tree road shore with quay apron NW, wooded rocky hill shore SE,
   plank pontoons, mooring poles, moored boats with crossed stern lines out
   to their pole pairs and breast lines to the jetty, rounded silt-ringed
   bay head NE, open sea SW with a skerry chain at the world's edge — and
-  the player's boat), HUD
-  (wind/current dials, throttle/rudder sliders, SOG readout, key help),
-  keel design editor overlay (`E`). All static scenery (jetty list, poles,
-  moored fleet, both shore polylines, world bounds) is fetched from
-  sim-core ONCE before the loop; curved shores render via
+  the player's boat. `Scenery::build()` fetches all static geometry
+  (jetty list, poles, moored fleet, both shore polylines, world bounds)
+  from sim-core ONCE at startup — sim-core stays the single source of
+  truth: what's drawn IS what collides. `WorldFrame` carries the per-frame
+  inputs (interpolated pose, blade angle, spooled engine, env, design,
+  render clock); `draw_world(w, h, scale, cam, …)` draws in
+  VIEWPORT-LOCAL css px (0..w × 0..h — full-screen callers pass the
+  screen size and get the pre-extraction output byte-for-byte, and it
+  opens with a full-viewport deep-water rect so an inset gets its own
+  backdrop). Curved shores render via
   `offset_polyline` + `draw_strip` (quad strips between polylines), and
   everything repeated (boats, poles, trees, ripples) is visibility-culled
   per frame against the camera circle — the marina is ~400 m long and
   only a stretch is ever on screen. Scenery scatter (trees) uses the same
   deterministic hash idiom as the ripples, minus the time term — cosmetic
   only, like everything render-side.
+- `src/render3d.rs` — the 3D chase-cam renderer (2026-08-08): a
+  perspective view of the SAME world, built from the same `Scenery` as
+  render2d — sim-core stays the single source of truth, and every hull's
+  waterline footprint is exactly `HULL_PTS`, so visuals still match
+  collision at the only plane the physics knows. All VERTICAL dimensions
+  (freeboard/sheer, coachroof, mast, pontoon freeboard, pole tops, land
+  heights) are COSMETIC frontend consts in its `dims` module — sim-core
+  is strictly 2D and deliberately gains no heights. Coordinate mapping
+  stated once in `w3`: world (x=east, y=north) → render (x, up, -y),
+  right-handed y-up; `Camera3D.fovy` is RADIANS in macroquad 0.4.15
+  (`45f32.to_radians()`), and `Camera3D` enables depth testing (verified
+  against the vendored macroquad source + a headless-Chromium smoke
+  test). macroquad has no lighting, so per-face shading against a fixed
+  fake sun is baked into vertex colors (`shade`); a single `draw_mesh`
+  is silently CLAMPED to 10 000 vertices / 5 000 indices (quad_gl
+  draw-call buffers), so `MeshBook` chunks the static world (shores as
+  waterline walls + land ribbons, jetty boxes, pole prisms, the moored
+  fleet as extruded hulls — no rigs, a forest of masts would bury the
+  skyline) into as many meshes as needed, built ONCE at startup. The
+  player's boat is rebuilt through the live pose each frame (`draw_mesh`
+  has no transform parameter — rewriting ~100 vertices/frame beats the
+  unsafe `push_model_matrix` route). Ripples/wash/rudder-chord geometry
+  is SHARED with render2d (`for_each_ripple`, `for_each_wash_streak`,
+  `rudder_chord` — world-space callbacks each renderer projects itself)
+  so the two views can never drift apart; translucent water decals ride
+  `DECAL_LIFT` (2 cm) above the waterplane against z-fighting.
+  **Chase camera** (`CHASE_*` consts; reworked 2026-08-09 after the
+  first pass read as "stiff" — owner report): the smoothed state is the
+  camera's PLANAR POSITION, not its yaw. The first version lagged the
+  yaw and derived the position from it, which welds the camera to a
+  rigid 22 m arm: every small helm correction swung the whole world,
+  and a straight run was dead still. Easing the POSITION toward the
+  ideal chase point (`CHASE_POS_TAU` 0.7 s) instead means a helm wiggle
+  barely disturbs the camera, a sustained turn settles into a natural
+  trailing quarter view (the hull visibly rotates IN FRAME rather than
+  the world swinging around it), and accelerations make the camera hang
+  back and catch up. Three supporting cues, all standard practice and
+  all cosmetic: the eased position is clamped into `CHASE_DIST_BAND`
+  (0.6–1.5× ideal, so a crash-stop can't lose the boat); the aim point
+  leads along the boat's actual TRACK via a render-side smoothed
+  velocity estimate (`CHASE_VEL_LOOKAHEAD`, capped by `CHASE_VEL_MAX`
+  against respawn jumps); and a wind-scaled ambient bob/sway plus a
+  slowly-eased speed-coupled FOV (`CHASE_FOV_*`, 45°+5° by 3 m/s, τ
+  1.2 s so it reads as gathering way, not as throttle) keep a straight
+  run feeling like motion. `snap_to(pos, heading)` re-seats the whole
+  rig on every respawn so R / editor Apply don't swoop across the
+  marina. NOT done: camera roll into the turn — the hull itself doesn't
+  heel (sim-core is 2D), so a rolling camera over a flat-lying boat
+  reads as a bug rather than as banking. Deferred knowingly:
+  trees/rocks/skerries in 3D, mooring-line catenary, camera collision
+  with scenery, wave motion.
 - `src/keel_editor.rs` — in-app editor for `BoatDesign`: drag a fixed-grid
   bar chart to paint the underwater area distribution, drag a displacement
   slider (4–14 t range bracketing the reference boats, 100 kg steps;
@@ -905,9 +967,61 @@ like Pegasus.
   each frame, so shoving against the edge racks up no invisible travel,
   and a zero offset can never turn nonzero on its own (the boat is
   always inside the world). Pinch/wheel zoom leaves the offset alone.
-  A CENTER button (twin of the C key) appears left of KEEL ONLY while
+  A CENTER button (twin of the C key) appears left of VIEW ONLY while
   the offset is >0.5 m; C, CENTER, R-reset and editor Apply all zero it
   (zoom persists throughout).
+- **View modes** (2026-08-08; Cockpit added 2026-08-09): `ViewMode {
+  TopDown, Chase, Both, Cockpit }` cycled in that order by the **V key**
+  and the **VIEW button** (left of KEEL; labelled with the view a press
+  switches TO — "3D" / "3D+2D" / "HELM" / "2D" — mobile-parity rule: V
+  would otherwise have no touch equivalent). TopDown is everything
+  above; Chase is the 3D perspective in `src/render3d.rs`; Cockpit is
+  the same scene from a first-person rig at the STARBOARD helm
+  (`COCKPIT_*` consts: eye off-centre because from the centreline the
+  sprayhood fills the frame — the same reason a real helmsman stands
+  where they see past it; rigid with the hull, damped bob, wider base
+  FOV, sprayhood + foredeck lines drawn ONLY in this view as the
+  near-field anchors, sub-pixel noise from outside). Cockpit
+  **free-look** (2026-08-09): the free-drag gesture (one finger / mouse
+  claim 4 — the same gesture that pans the top-down view) rotates the
+  gaze in BOTH axes, FPS-style: the VIEW follows the finger (drag right
+  → look right, drag down → look down) — deliberately the OPPOSITE of
+  the top-down pan's grab-the-world convention; that consistency was
+  tried first and felt backwards for a first-person gaze (owner call,
+  2026-08-09). Sensitivity is
+  screen-relative (a full-width swipe ≈ 200° of yaw on any device). Yaw
+  is BOAT-RELATIVE (a held look-astern stays astern through a turn) and
+  clamps at ±180° — looking dead astern is the point, it's how you back
+  into a berth; pitch clamps in `COCKPIT_LOOK_PITCH_RANGE`. C/CENTER
+  mean "eyes forward" here (the CENTER button appears while the gaze is
+  off-axis, mirroring its panned-camera role — `Renderer3D::look_active`
+  drives it), and every respawn resets the gaze via `snap_to`. Both =
+  Chase full-screen + a top-down INSET,
+  top-centre under the SOG line (the only reliably free HUD region —
+  dials own the top corners, sliders the mid-edges, buttons the
+  bottom), square `(min_dim·0.30).clamp(110, 220)` css px, following
+  the boat at the default fill-scale for its own size (no zoom/pan).
+  The inset is the SAME `draw_world` under a `Camera2D` whose WORLD
+  space is inset-local css px (`target` = centre, `zoom = +2/side` on
+  BOTH axes — **gotcha**: macroquad's screen path already y-flips once
+  (`invert_y` in Camera2D::matrix), so unlike `from_display_rect` the
+  y zoom must be POSITIVE for y-down local px, and a render-target
+  camera would flip again) with `viewport` clipping to the inset rect —
+  **viewport coords are PHYSICAL px with a BOTTOM-LEFT origin**
+  (miniquad `apply_viewport`): multiply css px by `screen_dpi_scale()`
+  and flip y via `(sh - iy - side) * dpi`. The HUD is drawn identically
+  in every mode (the 3D modes call `set_default_camera()` before it).
+  Zoom/pan are TOP-DOWN-ONLY: in Chase/Both those gestures are ignored
+  (`top_down` gating in the input block) rather than silently panning a
+  camera you can't see — free fingers do nothing there, wheel/+-
+  included — while Cockpit reuses the free-drag as free-look and
+  C/CENTER as eyes-forward (see above). The chase camera
+  re-seats on every respawn path (R, editor Apply) via
+  `Renderer3D::snap_to`,
+  and the chase camera backs off (`boost` in render3d.rs) as the aspect
+  ratio drops below ~1.15 — perspective FOV is VERTICAL, so a portrait
+  phone would otherwise fill its narrow width with the boat. View mode
+  is a plain local: survives resets, resets to TopDown on reload.
 - **Touch controls**: the two HUD compass indicators are draggable **dials**
   (`Dial` struct) — drag direction from the dial centre = the flow's TOWARD
   direction (wind label still displays the mariners' FROM convention:
@@ -949,10 +1063,11 @@ like Pegasus.
   boil forward along the quarters astern; the rudder blade itself is drawn
   BEFORE the hull fill (root under the counter), swinging by the same
   blade-angle formula sim-core uses.
-- Controls: touch/mouse = drag the dials/sliders + RESET/KEEL buttons
+- Controls: touch/mouse = drag the dials/sliders + RESET/KEEL/VIEW buttons
   (+ CENTER while panned), pinch = zoom, one-finger/mouse drag on the
-  water = pan, scroll wheel / +/- keys = zoom and C = centre (desktop
-  twins);
+  water = pan (top-down) or look around (helm view), scroll wheel / +/-
+  keys = zoom and C = centre / eyes-forward (desktop twins; zoom/pan in
+  the top-down view only), V = cycle view mode;
   keyboard = **the boat has the primary keys** (agreed 2026-08-03: driving
   is the main activity): W/S throttle up/down, A/D helm port/starboard
   (continuous `is_key_down`×dt like the env keys), Space = engine to

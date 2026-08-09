@@ -12,15 +12,16 @@
 //! written directly in css px.
 
 use harbour_sim_core::boat::BoatDesign;
-use harbour_sim_core::sim::{
-    Env, HULL_PTS, InputState, JETTY_HALF_W, PHYSICS_DT, POLE_RADIUS, Sim, head_arc, hill_shore,
-    jetties, marina_shore_len, moored_boats, pole_positions, road_shore, world_bounds,
-};
+use harbour_sim_core::sim::{Env, InputState, PHYSICS_DT, Sim};
 use keel_editor::{EditorAction, EditorLayout, KeelEditor};
 use macroquad::prelude::*;
+use render2d::{Scenery, WorldFrame};
+use render3d::Renderer3D;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 mod keel_editor;
+mod render2d;
+mod render3d;
 
 // DEFAULT zoom bounds for the fill-screen camera: never show more than
 // VIEW_MAX_W × VIEW_MAX_H metres, never fewer than VIEW_MIN_W metres across.
@@ -93,6 +94,34 @@ fn respawn(design: &BoatDesign) -> (Sim, Vec2, f32, Vec2, f32) {
     (sim, pos, heading, pos, heading)
 }
 
+/// Which world view is on screen. Cycled by the V key / VIEW button; the
+/// HUD is identical in every mode.
+#[derive(Clone, Copy, PartialEq)]
+enum ViewMode {
+    /// The classic top-down view (with zoom/pan — see the camera block).
+    TopDown,
+    /// The 3D chase camera (see render3d.rs). No zoom/pan gestures here.
+    Chase,
+    /// Chase full-screen + a fixed top-down inset (top-centre) — the 3D
+    /// immersion with the berthing-distance view kept in the corner of
+    /// your eye. No zoom/pan either; the inset follows the boat.
+    Both,
+    /// First-person at the helm, rigid with the hull (see render3d.rs).
+    /// The hardest view to moor from — and the most like the real thing.
+    Cockpit,
+}
+
+impl ViewMode {
+    fn next(self) -> ViewMode {
+        match self {
+            ViewMode::TopDown => ViewMode::Chase,
+            ViewMode::Chase => ViewMode::Both,
+            ViewMode::Both => ViewMode::Cockpit,
+            ViewMode::Cockpit => ViewMode::TopDown,
+        }
+    }
+}
+
 /// Shortest-path angle interpolation (for the render lerp across a tick).
 fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
     let mut d = (b - a) % std::f32::consts::TAU;
@@ -103,33 +132,6 @@ fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
         d += std::f32::consts::TAU;
     }
     a + d * t
-}
-
-/// Offset a polyline to the LEFT of its direction of travel by `d`
-/// (per-vertex averaged segment normals — plenty for the shore's gentle
-/// bends). The road shore runs SW→NE, so left = inland NW; the hill
-/// shore's inland side is its right (pass a negative `d`).
-fn offset_polyline(pts: &[Vec2], d: f32) -> Vec<Vec2> {
-    let n = pts.len();
-    (0..n)
-        .map(|i| {
-            let din = if i > 0 { (pts[i] - pts[i - 1]).normalize_or_zero() } else { Vec2::ZERO };
-            let dout =
-                if i + 1 < n { (pts[i + 1] - pts[i]).normalize_or_zero() } else { Vec2::ZERO };
-            let t = (din + dout).normalize_or_zero();
-            pts[i] + vec2(-t.y, t.x) * d
-        })
-        .collect()
-}
-
-/// Fill the ribbon between two equal-length polylines (a quad strip).
-fn draw_strip(a: &[Vec2], b: &[Vec2], w2s: impl Fn(Vec2) -> Vec2, col: Color) {
-    for i in 0..a.len().min(b.len()).saturating_sub(1) {
-        let (p0, p1) = (w2s(a[i]), w2s(a[i + 1]));
-        let (q0, q1) = (w2s(b[i]), w2s(b[i + 1]));
-        draw_triangle(p0, p1, q1, col);
-        draw_triangle(p0, q1, q0, col);
-    }
 }
 
 /// A draggable compass dial (screen-space geometry, css px).
@@ -202,30 +204,13 @@ async fn main() {
     let mut sim = Sim::new_with_design(&design);
     let mut editor = KeelEditor::new(&design);
 
-    // --- Static scenery, computed once. sim-core is the single source of
-    // truth for all of it: what's drawn IS what collides.
-    let jetty_list = jetties();
-    let poles = pole_positions();
-    let moored = moored_boats();
-    let road = road_shore();
-    let hill = hill_shore();
-    let head = head_arc();
-    let n_marina = marina_shore_len();
-    let (bmin, bmax) = world_bounds();
-    // Land fills reach far enough inland to cover the whole view whenever
-    // the camera sits against the world clamp.
-    let road_land = offset_polyline(&road, 260.0);
-    let road_apron = offset_polyline(&road, 1.8);
-    let hill_rock = offset_polyline(&hill, -2.0);
-    let hill_land = offset_polyline(&hill, -260.0);
-    // The rounded bay head's land rings: scaled copies of the arc about
-    // its chord centre (a silt-green waterline band, then grass beyond).
-    let head_center = (road[0] + hill[0]) * 0.5;
-    let head_ring = |k: f32| -> Vec<Vec2> {
-        head.iter().map(|&p| head_center + (p - head_center) * k).collect()
-    };
-    let head_silt = head_ring(1.18);
-    let head_land = head_ring(5.0);
+    // --- Static scenery, computed once (see render2d::Scenery) — sim-core
+    // is the single source of truth for all of it: what's drawn IS what
+    // collides.
+    let scenery = Scenery::build();
+    let (bmin, bmax) = (scenery.bmin, scenery.bmax);
+    let mut r3d = Renderer3D::new(&scenery);
+    let mut view = ViewMode::TopDown;
     let mut env = Env {
         wind_from_deg: 315.0,
         wind_speed: 6.0,
@@ -239,6 +224,7 @@ async fn main() {
     let mut accum = 0.0f32;
     let (mut prev_pos, mut prev_heading) = sim.boat_pose();
     let (mut cur_pos, mut cur_heading) = (prev_pos, prev_heading);
+    r3d.snap_to(cur_pos, cur_heading);
 
     // Touch/mouse claims for the two dials + two sliders. "Fresh touch"
     // detection is by id-not-seen-last-frame, NOT by TouchPhase::Started —
@@ -336,12 +322,22 @@ async fn main() {
             keel_w,
             keel_h,
         );
-        // CENTER button, left of KEEL — the touch/mouse twin of the C key.
+        // VIEW button, left of KEEL — the touch/mouse twin of the V key
+        // (cycles the view mode; without it there'd be no way to reach the
+        // 3D view on a touch-only device).
+        let view_w = fs * 4.6;
+        let view_rect = Rect::new(
+            keel_rect.x - margin - view_w,
+            sh - sa_b - margin - keel_h,
+            view_w,
+            keel_h,
+        );
+        // CENTER button, left of VIEW — the touch/mouse twin of the C key.
         // Only shown (and only hittable) while the camera is panned away
         // from the boat, so the button row stays uncluttered otherwise.
         let center_w = fs * 5.2;
         let center_rect = Rect::new(
-            keel_rect.x - margin - center_w,
+            view_rect.x - margin - center_w,
             sh - sa_b - margin - keel_h,
             center_w,
             keel_h,
@@ -364,7 +360,25 @@ async fn main() {
         if !editor.active {
             let mut do_reset = is_key_pressed(KeyCode::R);
             let mut do_open_editor = false;
-            let mut do_center = is_key_pressed(KeyCode::C);
+            // Zoom/pan (and the CENTER twin) belong to the top-down camera
+            // only; in the chase view those gestures are ignored rather
+            // than silently panning a camera you can't see. The COCKPIT
+            // view reuses the same free-drag gesture as free-look (and
+            // C/CENTER as "eyes forward").
+            let top_down = view == ViewMode::TopDown;
+            let in_cockpit = view == ViewMode::Cockpit;
+            let mut do_center = (top_down || in_cockpit) && is_key_pressed(KeyCode::C);
+            let mut do_toggle_view = is_key_pressed(KeyCode::V);
+            // Drag-to-look sensitivity: a full-width swipe sweeps ~200° of
+            // yaw whatever the screen size (phones get the same reach per
+            // swipe as a desktop drag), pitch proportionally.
+            let look_sens = 3.5 / sw;
+            // FPS-style: the VIEW follows the finger (drag right → look
+            // right = clockwise = negative yaw; drag down → look down) —
+            // the opposite of the top-down pan's grab-the-world convention;
+            // tried that first, owner preferred this (2026-08-09).
+            let center_visible = (top_down && cam_offset.length() > 0.5)
+                || (in_cockpit && r3d.look_active());
 
             // --- Touch input: dial drags + reset/keel taps -----------------
             let ts = touches();
@@ -398,7 +412,9 @@ async fn main() {
                         do_reset = true;
                     } else if keel_rect.contains(p) {
                         do_open_editor = true;
-                    } else if cam_offset.length() > 0.5 && center_rect.contains(p) {
+                    } else if view_rect.contains(p) {
+                        do_toggle_view = true;
+                    } else if center_visible && center_rect.contains(p) {
                         do_center = true;
                     }
                 }
@@ -448,7 +464,7 @@ async fn main() {
                 .map(|t| (t.id, t.position / dpi))
                 .collect();
             match free[..] {
-                [(id, p)] => {
+                [(id, p)] if top_down => {
                     if let Some((pid, prev)) = pan_touch
                         && pid == id
                     {
@@ -459,7 +475,17 @@ async fn main() {
                     pan_touch = Some((id, p));
                     pinch = None;
                 }
-                [(ida, pa), (idb, pb)] => {
+                [(id, p)] if in_cockpit => {
+                    if let Some((pid, prev)) = pan_touch
+                        && pid == id
+                    {
+                        let d = p - prev;
+                        r3d.add_look(-d.x * look_sens, -d.y * look_sens);
+                    }
+                    pan_touch = Some((id, p));
+                    pinch = None;
+                }
+                [(ida, pa), (idb, pb)] if top_down => {
                     let key = (ida.min(idb), ida.max(idb));
                     let d = (pa - pb).length();
                     if let Some((a, b, d0)) = pinch
@@ -492,10 +518,13 @@ async fn main() {
                     do_reset = true;
                 } else if keel_rect.contains(mp) {
                     do_open_editor = true;
-                } else if cam_offset.length() > 0.5 && center_rect.contains(mp) {
+                } else if view_rect.contains(mp) {
+                    do_toggle_view = true;
+                } else if center_visible && center_rect.contains(mp) {
                     do_center = true;
-                } else {
-                    // Anywhere on the water: drag to pan (claim 4).
+                } else if top_down || in_cockpit {
+                    // Anywhere on the water: drag to pan — or, at the
+                    // helm, drag to look around (claim 4 either way).
                     mouse_claim = Some(4);
                     pan_mouse_prev = mp;
                 }
@@ -514,10 +543,15 @@ async fn main() {
                     }
                     Some(2) => input.throttle = throttle_slider.value(mp),
                     Some(3) => input.rudder = rudder_slider.value(mp),
-                    Some(4) => {
+                    Some(4) if top_down => {
                         let d = mp - pan_mouse_prev;
                         cam_offset.x -= d.x / last_scale;
                         cam_offset.y += d.y / last_scale; // screen y is inverted
+                        pan_mouse_prev = mp;
+                    }
+                    Some(4) if in_cockpit => {
+                        let d = mp - pan_mouse_prev;
+                        r3d.add_look(-d.x * look_sens, -d.y * look_sens);
                         pan_mouse_prev = mp;
                     }
                     _ => {}
@@ -580,19 +614,26 @@ async fn main() {
             // notch), so small values are treated as notches and large
             // ones as pixels, both bounded per event.
             let (_, wheel_y) = mouse_wheel();
-            if wheel_y != 0.0 {
+            if wheel_y != 0.0 && top_down {
                 let step = if wheel_y.abs() >= 40.0 { wheel_y / 240.0 } else { wheel_y * 0.25 };
                 zoom *= 2.0f32.powf(step.clamp(-0.6, 0.6));
             }
-            if is_key_down(KeyCode::Equal) || is_key_down(KeyCode::KpAdd) {
+            if top_down && (is_key_down(KeyCode::Equal) || is_key_down(KeyCode::KpAdd)) {
                 zoom *= 2.0f32.powf(dt);
             }
-            if is_key_down(KeyCode::Minus) || is_key_down(KeyCode::KpSubtract) {
+            if top_down && (is_key_down(KeyCode::Minus) || is_key_down(KeyCode::KpSubtract)) {
                 zoom *= 2.0f32.powf(-dt);
             }
 
+            if do_toggle_view {
+                view = view.next();
+            }
             if do_center {
-                cam_offset = Vec2::ZERO;
+                if in_cockpit {
+                    r3d.reset_look(); // eyes forward
+                } else {
+                    cam_offset = Vec2::ZERO;
+                }
             }
             if do_reset {
                 // Fresh Sim per run — never reuse one (determinism rule).
@@ -601,8 +642,10 @@ async fn main() {
                 // Helm and engine come back neutral with the fresh boat;
                 // the environment deliberately persists (same as always).
                 input = InputState::NEUTRAL;
-                // A fresh boat gets the camera back too (zoom persists).
+                // A fresh boat gets the camera back too (zoom persists),
+                // and the chase camera snaps rather than swooping over.
                 cam_offset = Vec2::ZERO;
+                r3d.snap_to(cur_pos, cur_heading);
             }
             if do_open_editor {
                 editor.load_design(&design);
@@ -668,371 +711,88 @@ async fn main() {
             follow.y.clamp(wb + vis_hh, wt - vis_hh)
         };
         last_scale = scale;
-        let w2s = |p: Vec2| -> Vec2 {
-            vec2(sw * 0.5 + (p.x - cam_x) * scale, sh * 0.5 - (p.y - cam_y) * scale)
+
+        // --- World (top-down render2d.rs / chase render3d.rs) -------------
+        let frame = WorldFrame {
+            pos,
+            heading,
+            // Blade angle for the rudder visual and the wash direction (same
+            // formula as sim-core: positive = trailing edge to port).
+            blade: -input.rudder * 35f32.to_radians(),
+            engine: sim.engine(),
+            time: get_time() as f32,
+            env: &env,
+            design: &design,
         };
-        // Cheap visibility cull for the marina's many static props.
-        let vis_r = vec2(vis_hw, vis_hh).length();
-        let visible = |p: Vec2, r: f32| (p - vec2(cam_x, cam_y)).length() < vis_r + r;
+        match view {
+            ViewMode::TopDown => {
+                clear_background(Color::from_rgba(12, 38, 54, 255));
+                render2d::draw_world(sw, sh, scale, vec2(cam_x, cam_y), &scenery, &frame);
+            }
+            ViewMode::Chase | ViewMode::Both | ViewMode::Cockpit => {
+                // Overcast-Nordic sky; the waterplane meets it at the
+                // horizon.
+                clear_background(Color::from_rgba(96, 118, 138, 255));
+                r3d.draw(&scenery, &frame, dt, view == ViewMode::Cockpit);
+                // Back to the screen-space camera for the HUD below.
+                set_default_camera();
 
-        // --- Water -------------------------------------------------------
-        clear_background(Color::from_rgba(12, 38, 54, 255));
-        let water = Color::from_rgba(16, 48, 66, 255);
-        // One strip covers the channel AND the widening sea past the
-        // entrance (the shore polylines continue out along the sea coast);
-        // a fan over the head arc fills the rounded bay head.
-        draw_strip(&road, &hill, w2s, water);
-        for i in 1..head.len() - 1 {
-            draw_triangle(w2s(head[0]), w2s(head[i]), w2s(head[i + 1]), water);
-        }
-
-        // Cosmetic ripples: short streaks drifting with the current (and a
-        // touch of wind), wrapped over the world box. Purely render-side —
-        // the land fills drawn next cover the strays that land ashore.
-        let t = get_time() as f32;
-        let drift = env.current_vel() + env.wind_vel() * 0.02;
-        let (bw, bh) = (bmax.x - bmin.x, bmax.y - bmin.y);
-        for i in 0u32..220 {
-            let h = i.wrapping_mul(2654435761);
-            let fx = (h & 0xffff) as f32 / 65535.0;
-            let fy = ((h >> 16) & 0xffff) as f32 / 65535.0;
-            let x = (fx * bw + drift.x * t).rem_euclid(bw) + bmin.x;
-            let y = (fy * bh + drift.y * t).rem_euclid(bh) + bmin.y;
-            if !visible(vec2(x, y), 2.0) {
-                continue;
-            }
-            let a = w2s(vec2(x, y));
-            let b = w2s(vec2(x + 1.4, y));
-            draw_line(a.x, a.y, b.x, b.y, 1.5, Color::from_rgba(120, 170, 190, 26));
-        }
-
-        // --- Shore (Hinsholmen look: road side NW, wooded hill SE) --------
-        // Deterministic scatter helper for trees: same hash idiom as the
-        // ripples, but static (no time term) — pure scenery.
-        let hash01 = |i: u32, salt: u32| -> (f32, f32, f32) {
-            let h = i.wrapping_add(salt).wrapping_mul(2654435761);
-            (
-                (h & 0xffff) as f32 / 65535.0,
-                ((h >> 16) & 0x7fff) as f32 / 32767.0,
-                ((h >> 8) & 0xff) as f32 / 255.0,
-            )
-        };
-        let grass = Color::from_rgba(58, 88, 52, 255);
-        let tree_a = Color::from_rgba(40, 70, 40, 255);
-        let tree_b = Color::from_rgba(48, 80, 44, 255);
-        let rock = Color::from_rgba(98, 100, 96, 255);
-        let forest = Color::from_rgba(36, 60, 40, 255);
-        // Road (dock-carrying) shore: grass from the waterline inland,
-        // with the concrete quay apron drawn over it along the MARINA
-        // stretch only — past the entrance the coast runs wild.
-        draw_strip(&road, &road_land, w2s, grass);
-        draw_strip(
-            &road[..n_marina],
-            &road_apron[..n_marina],
-            w2s,
-            Color::from_rgba(126, 128, 126, 255),
-        );
-        for i in 0..road.len() - 1 {
-            let (sa, sb) = (road[i], road[i + 1]);
-            let seg = sb - sa;
-            let n = vec2(-seg.y, seg.x).normalize_or_zero(); // inland
-            for k in 0u32..6 {
-                let (f, d, r) = hash01(i as u32 * 8 + k, 11);
-                let p = sa + seg * f + n * (4.0 + d * 22.0);
-                if !visible(p, 3.0) {
-                    continue;
-                }
-                let sp = w2s(p);
-                let col = if (i + k as usize).is_multiple_of(2) { tree_a } else { tree_b };
-                draw_circle(sp.x, sp.y, (0.8 + r * 1.0) * scale, col);
-            }
-        }
-        // Hill (SE) shore: a rocky waterline, forest behind.
-        draw_strip(&hill_rock, &hill, w2s, rock);
-        draw_strip(&hill_land, &hill_rock, w2s, forest);
-        for i in 0..hill.len() - 1 {
-            let (sa, sb) = (hill[i], hill[i + 1]);
-            let seg = sb - sa;
-            let n = vec2(seg.y, -seg.x).normalize_or_zero(); // inland (SE)
-            for k in 0u32..8 {
-                let (f, d, r) = hash01(i as u32 * 8 + k, 97);
-                let p = sa + seg * f + n * (2.5 + d * 26.0);
-                if !visible(p, 3.0) {
-                    continue;
-                }
-                let sp = w2s(p);
-                let col = if (i + k as usize).is_multiple_of(2) { tree_a } else { tree_b };
-                draw_circle(sp.x, sp.y, (0.9 + r * 1.2) * scale, col);
-            }
-        }
-        // The rounded bay head: a silted-green shallow band right at the
-        // waterline, grass beyond (the land rings are scaled copies of
-        // the same arc the wall collider uses).
-        draw_strip(&head, &head_silt, w2s, Color::from_rgba(74, 96, 74, 255));
-        draw_strip(&head_silt, &head_land, w2s, grass);
-        // The skerry line closing the open sea (the boundary polyline's
-        // segment between the two coasts' far ends): a chain of rocky
-        // islets along the world's edge.
-        {
-            let (a, b) = (road[road.len() - 1], hill[hill.len() - 1]);
-            for i in 0u32..14 {
-                let (f, d, r) = hash01(i, 53);
-                let p = a + (b - a) * ((i as f32 + 0.5 + (f - 0.5) * 0.6) / 14.0)
-                    + (b - a).normalize_or_zero().perp() * ((d - 0.5) * 6.0);
-                if !visible(p, 8.0) {
-                    continue;
-                }
-                let sp = w2s(p);
-                draw_circle(sp.x, sp.y, (2.0 + r * 3.5) * scale, rock);
-            }
-        }
-
-        // --- Pontoon jetties ----------------------------------------------
-        let deck = Color::from_rgba(168, 162, 148, 255);
-        let deck_seam = Color::from_rgba(146, 140, 126, 255);
-        let deck_edge = Color::from_rgba(110, 104, 92, 255);
-        for j in &jetty_list {
-            let mid = j.root + j.dir * (j.len * 0.5);
-            if !visible(mid, j.len * 0.5 + 6.0) {
-                continue;
-            }
-            let side = j.side();
-            let (r0, r1) = (j.root + side * JETTY_HALF_W, j.root - side * JETTY_HALF_W);
-            let (t0, t1) =
-                (r0 + j.dir * j.len, r1 + j.dir * j.len);
-            let (sr0, sr1, st0, st1) = (w2s(r0), w2s(r1), w2s(t0), w2s(t1));
-            draw_triangle(sr0, sr1, st1, deck);
-            draw_triangle(sr0, st1, st0, deck);
-            // Transverse deck seams every couple of metres.
-            let mut d = 2.0;
-            while d < j.len {
-                let l = w2s(r0 + j.dir * d);
-                let r = w2s(r1 + j.dir * d);
-                draw_line(l.x, l.y, r.x, r.y, 1.0, deck_seam);
-                d += 2.0;
-            }
-            draw_line(sr0.x, sr0.y, st0.x, st0.y, 1.5, deck_edge);
-            draw_line(sr1.x, sr1.y, st1.x, st1.y, 1.5, deck_edge);
-            draw_line(st0.x, st0.y, st1.x, st1.y, 1.5, deck_edge);
-        }
-
-        // --- Moored boats (static in sim-core) + their mooring lines ------
-        let moor_line = Color::from_rgba(200, 198, 190, 200);
-        let moored_line_col = Color::from_rgba(46, 48, 54, 255);
-        let moored_fills = [
-            Color::from_rgba(226, 222, 208, 255),
-            Color::from_rgba(212, 216, 220, 255),
-            Color::from_rgba(230, 224, 212, 255),
-            Color::from_rgba(206, 200, 188, 255),
-        ];
-        for (bi, mb) in moored.iter().enumerate() {
-            if !visible(mb.pos, 16.0) {
-                continue;
-            }
-            let (mc, ms) = (mb.heading.cos(), mb.heading.sin());
-            let ml = |lx: f32, ly: f32| -> Vec2 {
-                w2s(mb.pos + vec2(lx * mc - ly * ms, lx * ms + ly * mc))
-            };
-            let fwd = vec2(mc, ms);
-            let port = vec2(-ms, mc);
-
-            // Crossed lines from the outboard end's quarters to its pole
-            // pair — the classic Swedish pole berth from the photos.
-            let (end_x, quarter_x) = if mb.bow_to_jetty { (-5.9, -5.6) } else { (6.0, 4.2) };
-            let end_c = mb.pos + fwd * end_x;
-            for p in mb.poles {
-                let side_sign = if (p - end_c).dot(port) >= 0.0 { 1.0 } else { -1.0 };
-                let q = ml(quarter_x, -1.5 * side_sign);
-                let pw = w2s(p);
-                draw_line(q.x, q.y, pw.x, pw.y, (0.07 * scale).max(1.0), moor_line);
-            }
-            // Short breast lines from the jetty end's quarters to the face.
-            let jetty_quarter_x = if mb.bow_to_jetty { 4.2 } else { -5.6 };
-            let across = vec2(-mb.out.y, mb.out.x);
-            for side in [1.0f32, -1.0] {
-                let qw = mb.pos
-                    + vec2(
-                        jetty_quarter_x * mc - 1.5 * side * ms,
-                        jetty_quarter_x * ms + 1.5 * side * mc,
+                if view == ViewMode::Both {
+                    // Top-down inset, top-centre under the SOG line (the
+                    // only reliably free HUD region: dials own the top
+                    // corners, sliders the mid-edges, buttons the bottom).
+                    // A Camera2D whose WORLD space is inset-local css px:
+                    // the same draw_world code runs unchanged, and the GPU
+                    // clips everything outside the viewport (macroquad
+                    // viewports are PHYSICAL px, bottom-left origin).
+                    let side = (min_dim * 0.30).clamp(110.0, 220.0);
+                    let ix = sw * 0.5 - side * 0.5;
+                    let iy = sa_t + margin + fs * 2.0;
+                    let iscale =
+                        (side / VIEW_MAX_W).max(side / VIEW_MAX_H).min(side / VIEW_MIN_W);
+                    let vis_h = side * 0.5 / iscale;
+                    let icam = vec2(
+                        if vis_h * 2.0 >= wr - wl {
+                            (wl + wr) * 0.5
+                        } else {
+                            pos.x.clamp(wl + vis_h, wr - vis_h)
+                        },
+                        if vis_h * 2.0 >= wt - wb {
+                            (wb + wt) * 0.5
+                        } else {
+                            pos.y.clamp(wb + vis_h, wt - vis_h)
+                        },
                     );
-                let s = if (qw - mb.jetty_face).dot(across) >= 0.0 { 1.0 } else { -1.0 };
-                let a = w2s(mb.jetty_face + across * (1.3 * s));
-                let q = w2s(qw);
-                draw_line(q.x, q.y, a.x, a.y, (0.07 * scale).max(1.0), moor_line);
-            }
-
-            // Hull: same outline as the player's, quieter deck detail.
-            let fill = moored_fills[bi % moored_fills.len()];
-            let m0 = ml(HULL_PTS[0].0, HULL_PTS[0].1);
-            for i in 1..HULL_PTS.len() - 1 {
-                let m1 = ml(HULL_PTS[i].0, HULL_PTS[i].1);
-                let m2 = ml(HULL_PTS[i + 1].0, HULL_PTS[i + 1].1);
-                draw_triangle(m0, m1, m2, fill);
-            }
-            for (i, &(ax, ay)) in HULL_PTS.iter().enumerate() {
-                let a = ml(ax, ay);
-                let (bx2, by2) = HULL_PTS[(i + 1) % HULL_PTS.len()];
-                let b = ml(bx2, by2);
-                draw_line(a.x, a.y, b.x, b.y, (0.12 * scale).max(1.0), moored_line_col);
-            }
-            if bi % 4 == 3 {
-                // A motor cruiser among the sailboats: long cabin, no rig.
-                let cab = [(-3.4, 1.2), (1.6, 1.2), (1.6, -1.2), (-3.4, -1.2)];
-                let c0 = ml(cab[0].0, cab[0].1);
-                draw_triangle(c0, ml(cab[1].0, cab[1].1), ml(cab[2].0, cab[2].1), Color::from_rgba(198, 202, 206, 255));
-                draw_triangle(c0, ml(cab[2].0, cab[2].1), ml(cab[3].0, cab[3].1), Color::from_rgba(198, 202, 206, 255));
-                for i in 0..4 {
-                    let a = ml(cab[i].0, cab[i].1);
-                    let b = ml(cab[(i + 1) % 4].0, cab[(i + 1) % 4].1);
-                    draw_line(a.x, a.y, b.x, b.y, (0.08 * scale).max(1.0), moored_line_col);
+                    set_camera(&Camera2D {
+                        target: vec2(side * 0.5, side * 0.5),
+                        // +y zoom = css-px y-down here: macroquad's screen
+                        // path already flips y once (`invert_y` in its
+                        // Camera2D matrix), unlike `from_display_rect`.
+                        zoom: vec2(2.0 / side, 2.0 / side),
+                        offset: vec2(0.0, 0.0),
+                        rotation: 0.0,
+                        render_target: None,
+                        viewport: Some((
+                            (ix * dpi) as i32,
+                            ((sh - iy - side) * dpi) as i32,
+                            (side * dpi) as i32,
+                            (side * dpi) as i32,
+                        )),
+                    });
+                    render2d::draw_world(side, side, iscale, icam, &scenery, &frame);
+                    set_default_camera();
+                    // A thin frame so the inset reads as an instrument.
+                    draw_rectangle_lines(
+                        ix,
+                        iy,
+                        side,
+                        side,
+                        1.5,
+                        Color::from_rgba(130, 160, 178, 255),
+                    );
                 }
-            } else {
-                let ch = [(-2.6, 1.0), (0.3, 1.0), (0.3, -1.0), (-2.6, -1.0)];
-                let c0 = ml(ch[0].0, ch[0].1);
-                draw_triangle(c0, ml(ch[1].0, ch[1].1), ml(ch[2].0, ch[2].1), Color::from_rgba(203, 208, 212, 255));
-                draw_triangle(c0, ml(ch[2].0, ch[2].1), ml(ch[3].0, ch[3].1), Color::from_rgba(203, 208, 212, 255));
-                for i in 0..4 {
-                    let a = ml(ch[i].0, ch[i].1);
-                    let b = ml(ch[(i + 1) % 4].0, ch[(i + 1) % 4].1);
-                    draw_line(a.x, a.y, b.x, b.y, (0.08 * scale).max(1.0), moored_line_col);
-                }
-                let mast = ml(0.6, 0.0);
-                let boom = ml(-2.0, 0.0);
-                draw_line(mast.x, mast.y, boom.x, boom.y, (0.08 * scale).max(1.0), moored_line_col);
-                draw_circle(mast.x, mast.y, (0.18 * scale).max(1.5), moored_line_col);
             }
         }
-
-        // --- Mooring poles (drawn over the lines belayed to them) ---------
-        let pole_fill = Color::from_rgba(92, 64, 40, 255);
-        let pole_rim = Color::from_rgba(50, 34, 20, 255);
-        for p in &poles {
-            if !visible(*p, 1.0) {
-                continue;
-            }
-            let sp = w2s(*p);
-            let r = (POLE_RADIUS * scale).max(2.0);
-            draw_circle(sp.x, sp.y, r + 1.0, pole_rim);
-            draw_circle(sp.x, sp.y, r, pole_fill);
-        }
-
-        // --- Boat --------------------------------------------------------
-        let (c, s) = (heading.cos(), heading.sin());
-        let bl = |lx: f32, ly: f32| -> Vec2 { w2s(pos + vec2(lx * c - ly * s, lx * s + ly * c)) };
-        let hull_fill = Color::from_rgba(230, 226, 212, 255);
-        let hull_line = Color::from_rgba(40, 42, 48, 255);
-
-        // Blade angle for the rudder visual and the wash direction (same
-        // formula as sim-core: positive = trailing edge to port).
-        let blade = -input.rudder * 35f32.to_radians();
-
-        // Cosmetic prop wash: foam streaks driven by the SPOOLED engine
-        // (sim.engine(), so they fade in/out with the lag, not the lever).
-        // Render-only — reads sim state, feeds nothing back (get_time is
-        // allowed here like the ripples). Ahead the slipstream leaves the
-        // stern along the deflected blade; astern it boils forward along
-        // both quarters — the two directions you'd see from a quay.
-        let engine = sim.engine();
-        if engine.abs() > 0.05 {
-            for i in 0u32..8 {
-                let h = i.wrapping_mul(2654435761);
-                let fy = ((h & 0xffff) as f32 / 65535.0) - 0.5;
-                let phase = ((h >> 16) & 0xffff) as f32 / 65535.0;
-                let ph = (t * 1.8 + phase).fract();
-                let alpha = engine.abs().min(1.0) * (1.0 - ph) * 0.5;
-                let foam = Color::new(0.75, 0.88, 0.92, alpha);
-                let (a, b) = if engine > 0.0 {
-                    let dir = vec2(-blade.cos(), blade.sin());
-                    let start = vec2(-6.0, fy * 1.1);
-                    let p = start + dir * (ph * (1.5 + 2.2 * engine));
-                    (bl(p.x, p.y), bl(p.x + dir.x * 0.7, p.y + dir.y * 0.7))
-                } else {
-                    let side_y = if i % 2 == 0 { 1.0 } else { -1.0 };
-                    let start = vec2(-5.2, side_y * (1.4 + 0.6 * fy.abs()));
-                    let p = start + vec2(ph * (2.0 - 2.5 * engine), 0.0);
-                    (bl(p.x, p.y), bl(p.x + 0.6, p.y))
-                };
-                draw_line(a.x, a.y, b.x, b.y, (0.14 * scale).max(1.0), foam);
-            }
-        }
-
-        // Rudder blade: stock at the ACTIVE DESIGN's blade position (each
-        // preset carries its real boat's rudder — see `RudderDesign` in
-        // boat.rs; same values the physics uses), drawn BEFORE the hull
-        // fill so the root reads as under the counter and only the swung
-        // part shows past it. Stock at the blade's leading edge, the
-        // drawn line is the chord.
-        let stock_x = design.rudder.x + design.rudder.chord / 2.0;
-        let te = vec2(
-            stock_x - design.rudder.chord * blade.cos(),
-            design.rudder.chord * blade.sin(),
-        );
-        let rp = bl(stock_x, 0.0);
-        let tep = bl(te.x, te.y);
-        draw_line(rp.x, rp.y, tep.x, tep.y, (0.16 * scale).max(1.5), hull_line);
-
-        let p0 = bl(HULL_PTS[0].0, HULL_PTS[0].1);
-        for i in 1..HULL_PTS.len() - 1 {
-            let p1 = bl(HULL_PTS[i].0, HULL_PTS[i].1);
-            let p2 = bl(HULL_PTS[i + 1].0, HULL_PTS[i + 1].1);
-            draw_triangle(p0, p1, p2, hull_fill);
-        }
-        for (i, &(ax, ay)) in HULL_PTS.iter().enumerate() {
-            let a = bl(ax, ay);
-            let (bx2, by2) = HULL_PTS[(i + 1) % HULL_PTS.len()];
-            let b = bl(bx2, by2);
-            draw_line(a.x, a.y, b.x, b.y, (0.18 * scale).max(1.0), hull_line);
-        }
-        // Deck details for the current (and, for now, only) modeled ship
-        // type — a small cruising sailboat: foredeck lines, coachroof,
-        // cockpit, sprayhood, mast + boom (rendered even with the sail
-        // furled/down — see Simulation model in CLAUDE.md; the rig is
-        // cosmetic, not a physics input). A future second ship type would
-        // get its own rendering branch alongside this one.
-        let d1 = bl(3.2, 0.0);
-        let d2a = bl(4.2, 1.2);
-        let d2b = bl(4.2, -1.2);
-        draw_line(d2a.x, d2a.y, d1.x, d1.y, (0.12 * scale).max(1.0), hull_line);
-        draw_line(d2b.x, d2b.y, d1.x, d1.y, (0.12 * scale).max(1.0), hull_line);
-
-        // Coachroof (cabin trunk): lower and narrower than full beam — side
-        // decks stay clear either side for walking forward.
-        let ch = [(-2.6, 1.0), (0.3, 1.0), (0.3, -1.0), (-2.6, -1.0)];
-        let ch0 = bl(ch[0].0, ch[0].1);
-        draw_triangle(ch0, bl(ch[1].0, ch[1].1), bl(ch[2].0, ch[2].1), Color::from_rgba(205, 210, 214, 255));
-        draw_triangle(ch0, bl(ch[2].0, ch[2].1), bl(ch[3].0, ch[3].1), Color::from_rgba(205, 210, 214, 255));
-        for i in 0..4 {
-            let a = bl(ch[i].0, ch[i].1);
-            let b = bl(ch[(i + 1) % 4].0, ch[(i + 1) % 4].1);
-            draw_line(a.x, a.y, b.x, b.y, (0.1 * scale).max(1.0), hull_line);
-        }
-
-        // Cockpit: open well aft of the coachroof, outline only (nothing to
-        // fill — it's a recess, not a structure).
-        let cp = [(-2.6, 0.9), (-4.3, 0.9), (-4.3, -0.9), (-2.6, -0.9)];
-        for i in 0..4 {
-            let a = bl(cp[i].0, cp[i].1);
-            let b = bl(cp[(i + 1) % 4].0, cp[(i + 1) % 4].1);
-            draw_line(a.x, a.y, b.x, b.y, (0.1 * scale).max(1.0), hull_line);
-        }
-
-        // Sprayhood: a small hood over the companionway at the coachroof's
-        // aft edge, raked to a point forward — this is the actual source
-        // of the bow/stern windage asymmetry in sim-core: a headwind meets
-        // this point and deflects, a following wind finds the open aft
-        // mouth instead and scoops into it.
-        let sh_front = bl(-2.2, 0.0);
-        let sh_l = bl(-3.0, 0.8);
-        let sh_r = bl(-3.0, -0.8);
-        draw_triangle(sh_front, sh_l, sh_r, Color::from_rgba(70, 110, 130, 255));
-
-        // Mast (stepped forward of the coachroof) + boom laid along the
-        // centreline — both present even with the sail furled/down.
-        let mast = bl(0.6, 0.0);
-        let boom_end = bl(-2.0, 0.0);
-        draw_line(mast.x, mast.y, boom_end.x, boom_end.y, (0.08 * scale).max(1.0), hull_line);
-        draw_circle(mast.x, mast.y, (0.18 * scale).max(1.5), hull_line);
-
         // --- HUD ---------------------------------------------------------
         let text = Color::from_rgba(205, 227, 240, 255);
         let dim = Color::from_rgba(130, 160, 178, 255);
@@ -1215,9 +975,37 @@ async fn main() {
             text,
         );
 
-        // Centre-on-boat button (left of KEEL) — only while the camera is
-        // panned off the boat; the touch/mouse twin of the C key.
-        if cam_offset.length() > 0.5 {
+        // View-mode button (left of KEEL) — the touch/mouse twin of the V
+        // key, labelled with the view a press switches TO.
+        draw_rectangle(
+            view_rect.x,
+            view_rect.y,
+            view_rect.w,
+            view_rect.h,
+            Color::from_rgba(10, 20, 30, 170),
+        );
+        draw_rectangle_lines(view_rect.x, view_rect.y, view_rect.w, view_rect.h, 2.0, dim);
+        let view_label = match view {
+            ViewMode::TopDown => "3D",
+            ViewMode::Chase => "3D+2D",
+            ViewMode::Both => "HELM",
+            ViewMode::Cockpit => "2D",
+        };
+        let vl = measure_text(view_label, None, fs as u16, 1.0);
+        draw_text(
+            view_label,
+            view_rect.x + (view_rect.w - vl.width) * 0.5,
+            view_rect.y + view_rect.h * 0.5 + fs * 0.35,
+            fs,
+            text,
+        );
+
+        // Centre button (left of VIEW) — the touch/mouse twin of the C key.
+        // Only while it has something to undo: a panned-off camera in the
+        // top-down view, or an off-axis gaze at the helm.
+        let show_center = (view == ViewMode::TopDown && cam_offset.length() > 0.5)
+            || (view == ViewMode::Cockpit && r3d.look_active());
+        if show_center {
             draw_rectangle(
                 center_rect.x,
                 center_rect.y,
@@ -1254,12 +1042,12 @@ async fn main() {
         ];
         if sw >= 700.0 {
             help.push("keys: W/S throttle, A/D rudder, Space stop engine, arrows wind");
-            help.push("I/K+J/L = current, R = reset, E = keel editor, wheel/+- = zoom, C = centre");
+            help.push("I/K+J/L = current, R = reset, E = keel editor, wheel/+- = zoom, C = centre, V = view");
         }
         let help_x = sa_l + margin + 40.0;
         // On narrow screens the hint line runs under the buttons (they
         // share the bottom edge) — lift the block above them then.
-        let buttons_left = if cam_offset.length() > 0.5 { center_rect.x } else { keel_rect.x };
+        let buttons_left = if show_center { center_rect.x } else { view_rect.x };
         let help_w = help
             .iter()
             .map(|l| measure_text(l, None, (fs * 0.8) as u16, 1.0).width)
@@ -1298,8 +1086,10 @@ async fn main() {
                     design = editor.design();
                     (sim, prev_pos, prev_heading, cur_pos, cur_heading) = respawn(&design);
                     accum = 0.0;
-                    // Respawn = camera back on the boat (zoom persists).
+                    // Respawn = camera back on the boat (zoom persists),
+                    // chase camera snapped like the R reset.
                     cam_offset = Vec2::ZERO;
+                    r3d.snap_to(cur_pos, cur_heading);
                     editor.active = false;
                     // Same claim reset as the E-key path — see comment there.
                     prev_touch_ids = touches().iter().map(|t| t.id).collect();
