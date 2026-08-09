@@ -288,10 +288,12 @@ async fn main() {
             editor.active = !editor.active;
             // The HUD touch/mouse state (prev_touch_ids and all claims)
             // freezes while the editor is open because the input block is
-            // skipped. Clear it on every transition so the first frame
-            // after the editor closes doesn't treat held touches as fresh
-            // and false-grab dials/sliders.
-            prev_touch_ids.clear();
+            // skipped. Snapshot the current touches so the first frame
+            // after the editor closes sees every held finger as "already
+            // known" and doesn't false-grab dials/sliders. Claims are
+            // cleared unconditionally — a finger that was dragging a
+            // slider before the editor opened is not continuing that drag.
+            prev_touch_ids = touches().iter().map(|t| t.id).collect();
             wind_claim = None;
             current_claim = None;
             throttle_claim = None;
@@ -1300,7 +1302,7 @@ async fn main() {
                     cam_offset = Vec2::ZERO;
                     editor.active = false;
                     // Same claim reset as the E-key path — see comment there.
-                    prev_touch_ids.clear();
+                    prev_touch_ids = touches().iter().map(|t| t.id).collect();
                     wind_claim = None;
                     current_claim = None;
                     throttle_claim = None;
@@ -1309,7 +1311,7 @@ async fn main() {
                 }
                 EditorAction::Cancel => {
                     editor.active = false;
-                    prev_touch_ids.clear();
+                    prev_touch_ids = touches().iter().map(|t| t.id).collect();
                     wind_claim = None;
                     current_claim = None;
                     throttle_claim = None;
