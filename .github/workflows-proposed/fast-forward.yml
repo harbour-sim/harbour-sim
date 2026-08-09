@@ -22,12 +22,8 @@ jobs:
         with:
           merge: true
           comment: always
-          # Pushes made with the default GITHUB_TOKEN don't trigger `push`
-          # workflows (recursion guard), so a fast-forward merge to main
-          # would NOT fire deploy.yml. Add a FAST_FORWARD_PAT repo secret to
-          # make merges deploy the site — a fine-grained PAT scoped to this
-          # repo with Contents: write and Pull requests: write (covers the
-          # comment step too), whose owner also satisfies main's branch
-          # protection rules; until it's added, the fallback token merges
-          # without deploying.
-          github_token: ${{ secrets.FAST_FORWARD_PAT || secrets.GITHUB_TOKEN }}
+          # Deliberately the default GITHUB_TOKEN, no PAT needed: this push
+          # won't trigger deploy.yml's `on: push`, but deploy.yml also
+          # listens for this workflow's own completion via `workflow_run`
+          # (see that file) — which isn't blocked by the recursion guard —
+          # so the site still deploys after a successful merge here.

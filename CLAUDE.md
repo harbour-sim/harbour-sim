@@ -41,15 +41,18 @@ are relative, which is what makes subdirectory serving work). Four workflows,
 sharing two composite actions (`.github/actions/build-site` = wasm build +
 icons + revision injection; `.github/actions/sync-pages-branch` = commit into
 `gh-pages` with a push-retry loop for concurrent deploys):
-- `deploy.yml` (**Main deploy**, push to `main`): build → sync branch root
-  (live `pr-*/` previews are kept). **Deploys the main TIP at run time,
-  not the pushed sha** (gotcha, seen live 2026-08-03): push runs can start
-  out of order — the run for an older commit sat queued ~11 min, started
-  21 s after the newer commit's run, cancelled it via
-  `cancel-in-progress`, and synced the OLD build over the site root (the
-  About-page merge vanished from the live site). Checking out
-  `origin/main` at run start makes straggler runs redeploy current
-  content instead, so run ordering can't regress the site.
+- `deploy.yml` (**Main deploy**, push to `main`, also `workflow_run` on
+  **Fast forward** completing — see Fast-forward merges below for why):
+  build → sync branch root (live `pr-*/` previews are kept). **Deploys the
+  main TIP at run time, not the pushed sha** (gotcha, seen live
+  2026-08-03): push runs can start out of order — the run for an older
+  commit sat queued ~11 min, started 21 s after the newer commit's run,
+  cancelled it via `cancel-in-progress`, and synced the OLD build over the
+  site root (the About-page merge vanished from the live site). Checking
+  out `origin/main` at run start makes straggler runs redeploy current
+  content instead, so run ordering can't regress the site — the same
+  property that lets a `workflow_run`-triggered build deploy correctly
+  without caring what triggered it.
 - `preview-deploy.yml` (**Preview deploy**, PR opened/synchronize/reopened):
   build (revision label `<head-sha>-pr-<n>`) → sync `pr-<n>/` → sticky PR
   comment (`<!-- preview-env -->` marker) with the preview URL. Skipped for
@@ -99,18 +102,28 @@ README states it checks that the commenter is authorized to push before
 merging, which is why this doesn't also split the workflow into a
 GITHUB_TOKEN preflight job before the token-bearing step — that would
 duplicate a check the action already makes, for a project this size.
-Gotchas: `issue_comment` workflows execute the file from the DEFAULT branch,
+Gotcha: `issue_comment` workflows execute the file from the DEFAULT branch,
 so the `/fast-forward` trigger only works once the workflow is on `main`
-(same class of gotcha as `workflow_run` above). And the merge push is subject
-to the recursion guard already documented for Publish Pages — a push made
-with `GITHUB_TOKEN` doesn't trigger `push` workflows, so a fast-forward merge
-would NOT fire `deploy.yml`. `fast-forward.yml` therefore passes
-`secrets.FAST_FORWARD_PAT || secrets.GITHUB_TOKEN` as `github_token`: add a
-`FAST_FORWARD_PAT` repo secret — a fine-grained PAT scoped to this repo with
-`Contents: write` and `Pull requests: write` (the latter covers the action's
-own PR comment), whose owner also satisfies `main`'s branch protection rules
-— to make merges deploy; without it merges land but the site must be
-republished via `publish-pages.yml`'s `workflow_dispatch` or an empty push.
+(same class of gotcha as `workflow_run` above, under Publish Pages).
+
+**Deploying after a fast-forward merge, without a PAT.** The merge push in
+`fast-forward.yml` uses the plain default `GITHUB_TOKEN` (no secret to
+provision or rotate) — deliberately, even though such pushes are subject to
+the recursion guard already documented for Publish Pages (`GITHUB_TOKEN`
+pushes don't trigger `push` workflows), which would otherwise mean a
+fast-forward merge never fires `deploy.yml`. The fix reuses the exact
+mechanism Publish Pages already depends on for the same reason: `deploy.yml`
+also triggers on `workflow_run` for **Fast forward** completing (gated
+`github.event.workflow_run.conclusion == 'success'`) instead of relying on
+the push event. `workflow_run` fires on the upstream workflow's own
+completion, not on what its `GITHUB_TOKEN` did internally, and
+`fast-forward.yml`'s trigger — a human's PR comment — was never
+`GITHUB_TOKEN`-authored to begin with, so the chain isn't blocked. An
+earlier version of this design used a `FAST_FORWARD_PAT` secret instead (PAT
+pushes aren't subject to the recursion guard either) — dropped because it
+tied deploys to a specific person's account (rotation, offboarding, must
+itself satisfy `main`'s branch protection) for a problem `workflow_run`
+already solves structurally, the same way Publish Pages does.
 
 ## Project structure
 - `sim-core/` — the **`harbour-sim-core` library crate** (workspace member):
