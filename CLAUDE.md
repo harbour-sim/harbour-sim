@@ -984,8 +984,11 @@ like Pegasus.
   near-field anchors, sub-pixel noise from outside). Cockpit
   **free-look** (2026-08-09): the free-drag gesture (one finger / mouse
   claim 4 — the same gesture that pans the top-down view) rotates the
-  gaze in BOTH axes, same grab-the-world convention as the pan (drag
-  right → look left, drag down → look up); sensitivity is
+  gaze in BOTH axes, FPS-style: the VIEW follows the finger (drag right
+  → look right, drag down → look down) — deliberately the OPPOSITE of
+  the top-down pan's grab-the-world convention; that consistency was
+  tried first and felt backwards for a first-person gaze (owner call,
+  2026-08-09). Sensitivity is
   screen-relative (a full-width swipe ≈ 200° of yaw on any device). Yaw
   is BOAT-RELATIVE (a held look-astern stays astern through a turn) and
   clamps at ±180° — looking dead astern is the point, it's how you back

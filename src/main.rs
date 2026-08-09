@@ -360,9 +360,10 @@ async fn main() {
             // yaw whatever the screen size (phones get the same reach per
             // swipe as a desktop drag), pitch proportionally.
             let look_sens = 3.5 / sw;
-            // Same "grab the world" convention as the top-down pan: drag
-            // right → the world follows your finger → you look LEFT (CCW,
-            // positive yaw); drag down → look up.
+            // FPS-style: the VIEW follows the finger (drag right → look
+            // right = clockwise = negative yaw; drag down → look down) —
+            // the opposite of the top-down pan's grab-the-world convention;
+            // tried that first, owner preferred this (2026-08-09).
             let center_visible = (top_down && cam_offset.length() > 0.5)
                 || (in_cockpit && r3d.look_active());
 
@@ -466,7 +467,7 @@ async fn main() {
                         && pid == id
                     {
                         let d = p - prev;
-                        r3d.add_look(d.x * look_sens, d.y * look_sens);
+                        r3d.add_look(-d.x * look_sens, -d.y * look_sens);
                     }
                     pan_touch = Some((id, p));
                     pinch = None;
@@ -537,7 +538,7 @@ async fn main() {
                     }
                     Some(4) if in_cockpit => {
                         let d = mp - pan_mouse_prev;
-                        r3d.add_look(d.x * look_sens, d.y * look_sens);
+                        r3d.add_look(-d.x * look_sens, -d.y * look_sens);
                         pan_mouse_prev = mp;
                     }
                     _ => {}
