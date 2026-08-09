@@ -51,23 +51,39 @@ mod dims {
     pub const WATER_MARGIN: f32 = 600.0;
 }
 
-// Chase camera: behind and above the boat, looking a little ahead of it,
-// following the heading through a first-order lag so a hard-over turn
-// swings the view smoothly instead of snapping with the hull.
+// Chase camera: behind and above the boat, looking a little ahead of it.
+// The camera's PLANAR POSITION is the smoothed state (not the yaw): easing
+// the position toward the ideal chase point means a small yaw wiggle
+// barely moves the camera (the old yaw-lag rig swung the whole 22 m arm
+// with every helm correction), a steady turn settles into a natural
+// trailing angle, and accelerations make the camera hang back and catch
+// up. On top of that, a subtle ambient bob/sway (wind-scaled, cosmetic
+// render-clock motion like the ripples) keeps the view alive when the
+// boat runs dead straight.
 const CHASE_DIST: f32 = 22.0;
 const CHASE_HEIGHT: f32 = 8.0;
 const CHASE_LOOKAHEAD: f32 = 6.0;
 const CHASE_AIM_UP: f32 = 1.5;
-const CHASE_YAW_TAU: f32 = 0.45; // s
+const CHASE_POS_TAU: f32 = 0.7; // s, position-easing time constant
+/// The eased camera may trail/lead, but never outside this band of the
+/// ideal distance (a crash-stop can't lose the boat off-screen).
+const CHASE_DIST_BAND: (f32, f32) = (0.6, 1.5);
+/// Look-ahead along the boat's actual track (render-side velocity
+/// estimate), so the view leads a turn the way your eyes would.
+const CHASE_VEL_LOOKAHEAD: f32 = 0.4; // s
+const CHASE_VEL_MAX: f32 = 8.0; // m/s cap on the estimate (respawn jumps)
+/// Base vertical FOV, widened by up to `CHASE_FOV_SPEED_GAIN` at 3 m/s
+/// (about this hull's cruising speed). Speed-coupled FOV is the standard
+/// trick for making a straight run READ as motion — the edges of frame
+/// stretch as you gather way — and it's what carries the sense of speed
+/// on open water, where there's little nearby geometry to sweep past.
+const CHASE_FOV_DEG: f32 = 45.0;
+const CHASE_FOV_SPEED_GAIN: f32 = 5.0; // degrees at 3 m/s
+const CHASE_FOV_TAU: f32 = 1.2; // s — must lag well behind the throttle
 
 /// Sim world (x=east, y=north) + height → render space (y-up, north = -z).
 fn w3(p: Vec2, up: f32) -> Vec3 {
     vec3(p.x, up, -p.y)
-}
-
-/// A 2D heading (CCW from +x east) as a horizontal 3D direction.
-fn dir3(heading: f32) -> Vec3 {
-    vec3(heading.cos(), 0.0, -heading.sin())
 }
 
 /// Flat per-face shading against a fixed fake sun (macroquad has no
@@ -246,7 +262,16 @@ impl MeshBook {
 /// chase-camera state.
 pub struct Renderer3D {
     statics: Vec<Mesh>,
-    cam_yaw: f32,
+    /// Eased camera position on the water plane (world metres). This is
+    /// the smoothed state — see the CHASE_* notes above.
+    cam_pos: Vec2,
+    /// Previous frame's boat position + the render-side velocity estimate
+    /// it feeds (used for the track look-ahead; the sim's own velocity
+    /// isn't handed to the renderer, and this stays purely cosmetic).
+    last_boat: Vec2,
+    vel: Vec2,
+    /// Eased vertical FOV in degrees (speed-coupled — see CHASE_FOV_*).
+    fov_deg: f32,
 }
 
 impl Renderer3D {
@@ -336,33 +361,85 @@ impl Renderer3D {
         }
 
         book.flush();
-        Renderer3D { statics: book.meshes, cam_yaw: 0.0 }
+        Renderer3D {
+            statics: book.meshes,
+            cam_pos: Vec2::ZERO,
+            last_boat: Vec2::ZERO,
+            vel: Vec2::ZERO,
+            fov_deg: CHASE_FOV_DEG,
+        }
     }
 
-    /// Snap the chase yaw (fresh spawn / reset — no swooping to the new
-    /// heading).
-    pub fn snap_yaw(&mut self, heading: f32) {
-        self.cam_yaw = heading;
+    /// Snap the chase camera onto a pose (fresh spawn / reset — no swooping
+    /// across the marina to the new boat).
+    pub fn snap_to(&mut self, pos: Vec2, heading: f32) {
+        self.cam_pos = pos - Vec2::from_angle(heading) * CHASE_DIST;
+        self.last_boat = pos;
+        self.vel = Vec2::ZERO;
+        self.fov_deg = CHASE_FOV_DEG;
     }
 
     /// Draw the 3D scene for this frame. Sets its own `Camera3D`; the
     /// caller returns to the default camera afterwards for the HUD.
     pub fn draw(&mut self, sc: &Scenery, fr: &WorldFrame, dt: f32) {
-        // First-order yaw lag toward the boat's heading.
-        let k = 1.0 - (-dt / CHASE_YAW_TAU).exp();
-        self.cam_yaw = crate::lerp_angle(self.cam_yaw, fr.heading, k);
-
         // Perspective FOV is vertical, so a portrait phone would otherwise
         // fill its narrow width with the boat: back the camera off (and
         // lift it a little) as the aspect ratio drops below ~1.15.
         let aspect = screen_width() / screen_height();
         let boost = (1.15 / aspect).clamp(1.0, 1.9);
-        let back = dir3(self.cam_yaw);
+        let dist = CHASE_DIST * boost;
+
+        // Render-side velocity estimate, itself smoothed (the raw
+        // frame-to-frame delta is noisy at high frame rates). Cosmetic
+        // only — nothing here feeds back into the sim.
+        if dt > 1e-4 {
+            let raw = ((fr.pos - self.last_boat) / dt).clamp_length_max(CHASE_VEL_MAX);
+            self.vel = self.vel.lerp(raw, 1.0 - (-dt / 0.3).exp());
+        }
+        self.last_boat = fr.pos;
+
+        // Ease the camera POSITION toward the ideal chase point astern of
+        // the boat. Because the state is a position rather than an angle,
+        // a small helm correction barely disturbs it, while a sustained
+        // turn lets it settle into a trailing quarter view.
+        let ideal = fr.pos - Vec2::from_angle(fr.heading) * dist;
+        self.cam_pos = self.cam_pos.lerp(ideal, 1.0 - (-dt / CHASE_POS_TAU).exp());
+        // Keep the eased position inside a band of the ideal distance, so
+        // a crash-stop or a hard acceleration can never lose the boat.
+        let mut off = self.cam_pos - fr.pos;
+        let len = off.length();
+        if len < 1e-3 {
+            off = -Vec2::from_angle(fr.heading) * dist;
+        } else {
+            off *= len.clamp(dist * CHASE_DIST_BAND.0, dist * CHASE_DIST_BAND.1) / len;
+        }
+        self.cam_pos = fr.pos + off;
+
+        // Ambient motion: a slow bob/sway so the view is never dead still
+        // going straight. Scaled by the wind (a calm marina gets a calm
+        // camera) — render-clock cosmetics, like the ripples.
+        let t = fr.time;
+        let sea = (fr.env.wind_speed / 12.0).clamp(0.15, 1.0);
+        let bob = (t * 0.9).sin() * 0.22 * sea + (t * 1.37 + 1.1).sin() * 0.10 * sea;
+        let sway = (t * 0.7 + 0.4).sin() * 0.5 * sea;
+        let sway_v = off.perp().normalize_or_zero() * sway;
+
+        // Aim a little along the boat's actual track, not just its heading:
+        // the view leads a turn the way your eyes would.
+        let aim = fr.pos
+            + Vec2::from_angle(fr.heading) * CHASE_LOOKAHEAD
+            + self.vel * CHASE_VEL_LOOKAHEAD;
+
+        // Speed-coupled FOV, eased slowly so it reads as gathering way
+        // rather than tracking the throttle lever.
+        let want_fov = CHASE_FOV_DEG + CHASE_FOV_SPEED_GAIN * (self.vel.length() / 3.0).min(1.5);
+        self.fov_deg += (want_fov - self.fov_deg) * (1.0 - (-dt / CHASE_FOV_TAU).exp());
+
         set_camera(&Camera3D {
-            position: w3(fr.pos, CHASE_HEIGHT * boost.sqrt()) - back * CHASE_DIST * boost,
-            target: w3(fr.pos, CHASE_AIM_UP) + back * CHASE_LOOKAHEAD,
+            position: w3(self.cam_pos + sway_v, CHASE_HEIGHT * boost.sqrt() + bob),
+            target: w3(aim, CHASE_AIM_UP),
             up: Vec3::Y,
-            fovy: 45f32.to_radians(),
+            fovy: self.fov_deg.to_radians(),
             aspect: None,
             projection: Projection::Perspective,
             render_target: None,

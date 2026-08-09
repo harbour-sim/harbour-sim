@@ -166,12 +166,32 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
   is SHARED with render2d (`for_each_ripple`, `for_each_wash_streak`,
   `rudder_chord` — world-space callbacks each renderer projects itself)
   so the two views can never drift apart; translucent water decals ride
-  `DECAL_LIFT` (2 cm) above the waterplane against z-fighting. Chase
-  camera: behind/above the boat (`CHASE_*` consts), heading followed
-  through a first-order yaw lag (`lerp_angle`, τ 0.45 s), SNAPPED on
-  every respawn (`snap_yaw`) so R doesn't swoop the view. Deferred
-  knowingly: trees/rocks/skerries in 3D, mooring-line catenary, camera
-  collision with scenery, wave motion.
+  `DECAL_LIFT` (2 cm) above the waterplane against z-fighting.
+  **Chase camera** (`CHASE_*` consts; reworked 2026-08-09 after the
+  first pass read as "stiff" — owner report): the smoothed state is the
+  camera's PLANAR POSITION, not its yaw. The first version lagged the
+  yaw and derived the position from it, which welds the camera to a
+  rigid 22 m arm: every small helm correction swung the whole world,
+  and a straight run was dead still. Easing the POSITION toward the
+  ideal chase point (`CHASE_POS_TAU` 0.7 s) instead means a helm wiggle
+  barely disturbs the camera, a sustained turn settles into a natural
+  trailing quarter view (the hull visibly rotates IN FRAME rather than
+  the world swinging around it), and accelerations make the camera hang
+  back and catch up. Three supporting cues, all standard practice and
+  all cosmetic: the eased position is clamped into `CHASE_DIST_BAND`
+  (0.6–1.5× ideal, so a crash-stop can't lose the boat); the aim point
+  leads along the boat's actual TRACK via a render-side smoothed
+  velocity estimate (`CHASE_VEL_LOOKAHEAD`, capped by `CHASE_VEL_MAX`
+  against respawn jumps); and a wind-scaled ambient bob/sway plus a
+  slowly-eased speed-coupled FOV (`CHASE_FOV_*`, 45°+5° by 3 m/s, τ
+  1.2 s so it reads as gathering way, not as throttle) keep a straight
+  run feeling like motion. `snap_to(pos, heading)` re-seats the whole
+  rig on every respawn so R / editor Apply don't swoop across the
+  marina. NOT done: camera roll into the turn — the hull itself doesn't
+  heel (sim-core is 2D), so a rolling camera over a flat-lying boat
+  reads as a bug rather than as banking. Deferred knowingly:
+  trees/rocks/skerries in 3D, mooring-line catenary, camera collision
+  with scenery, wave motion.
 - `src/keel_editor.rs` — in-app editor for `BoatDesign`: drag a fixed-grid
   bar chart to paint the underwater area distribution, drag a displacement
   slider (4–14 t range bracketing the reference boats, 100 kg steps;
@@ -973,8 +993,9 @@ like Pegasus.
   Zoom/pan/CENTER are TOP-DOWN-ONLY: in the 3D modes those gestures are
   ignored (`top_down` gating in the input block) rather than silently
   panning a camera you can't see — free fingers do nothing there,
-  wheel/+-/C included, and the CENTER button hides. The chase yaw snaps
-  on every respawn path (R, editor Apply) via `Renderer3D::snap_yaw`,
+  wheel/+-/C included, and the CENTER button hides. The chase camera
+  re-seats on every respawn path (R, editor Apply) via
+  `Renderer3D::snap_to`,
   and the chase camera backs off (`boost` in render3d.rs) as the aspect
   ratio drops below ~1.15 — perspective FOV is VERTICAL, so a portrait
   phone would otherwise fill its narrow width with the boat. View mode

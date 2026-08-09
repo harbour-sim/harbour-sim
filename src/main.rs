@@ -118,9 +118,8 @@ impl ViewMode {
     }
 }
 
-/// Shortest-path angle interpolation (for the render lerp across a tick,
-/// and the chase camera's yaw lag in render3d).
-pub(crate) fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
+/// Shortest-path angle interpolation (for the render lerp across a tick).
+fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
     let mut d = (b - a) % std::f32::consts::TAU;
     if d > std::f32::consts::PI {
         d -= std::f32::consts::TAU;
@@ -221,7 +220,7 @@ async fn main() {
     let mut accum = 0.0f32;
     let (mut prev_pos, mut prev_heading) = sim.boat_pose();
     let (mut cur_pos, mut cur_heading) = (prev_pos, prev_heading);
-    r3d.snap_yaw(cur_heading);
+    r3d.snap_to(cur_pos, cur_heading);
 
     // Touch/mouse claims for the two dials + two sliders. "Fresh touch"
     // detection is by id-not-seen-last-frame, NOT by TouchPhase::Started —
@@ -594,9 +593,9 @@ async fn main() {
                 // the environment deliberately persists (same as always).
                 input = InputState::NEUTRAL;
                 // A fresh boat gets the camera back too (zoom persists),
-                // and the chase yaw snaps rather than swooping over.
+                // and the chase camera snaps rather than swooping over.
                 cam_offset = Vec2::ZERO;
-                r3d.snap_yaw(cur_heading);
+                r3d.snap_to(cur_pos, cur_heading);
             }
             if do_open_editor {
                 editor.load_design(&design);
@@ -1032,9 +1031,9 @@ async fn main() {
                     (sim, prev_pos, prev_heading, cur_pos, cur_heading) = respawn(&design);
                     accum = 0.0;
                     // Respawn = camera back on the boat (zoom persists),
-                    // chase yaw snapped like the R reset.
+                    // chase camera snapped like the R reset.
                     cam_offset = Vec2::ZERO;
-                    r3d.snap_yaw(cur_heading);
+                    r3d.snap_to(cur_pos, cur_heading);
                     editor.active = false;
                 }
                 EditorAction::Cancel => {
