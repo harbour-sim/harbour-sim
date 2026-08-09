@@ -970,12 +970,19 @@ like Pegasus.
   A CENTER button (twin of the C key) appears left of VIEW ONLY while
   the offset is >0.5 m; C, CENTER, R-reset and editor Apply all zero it
   (zoom persists throughout).
-- **View modes** (2026-08-08): `ViewMode { TopDown, Chase, Both }`
-  cycled in that order by the **V key** and the **VIEW button** (left of
-  KEEL; labelled with the view a press switches TO — "3D" / "3D+2D" /
-  "2D" — mobile-parity rule: V would otherwise have no touch
-  equivalent). TopDown is everything above; Chase is the 3D perspective
-  in `src/render3d.rs`; Both = Chase full-screen + a top-down INSET,
+- **View modes** (2026-08-08; Cockpit added 2026-08-09): `ViewMode {
+  TopDown, Chase, Both, Cockpit }` cycled in that order by the **V key**
+  and the **VIEW button** (left of KEEL; labelled with the view a press
+  switches TO — "3D" / "3D+2D" / "HELM" / "2D" — mobile-parity rule: V
+  would otherwise have no touch equivalent). TopDown is everything
+  above; Chase is the 3D perspective in `src/render3d.rs`; Cockpit is
+  the same scene from a first-person rig at the STARBOARD helm
+  (`COCKPIT_*` consts: eye off-centre because from the centreline the
+  sprayhood fills the frame — the same reason a real helmsman stands
+  where they see past it; rigid with the hull, damped bob, wider base
+  FOV, sprayhood + foredeck lines drawn ONLY in this view as the
+  near-field anchors, sub-pixel noise from outside); Both = Chase
+  full-screen + a top-down INSET,
   top-centre under the SOG line (the only reliably free HUD region —
   dials own the top corners, sliders the mid-edges, buttons the
   bottom), square `(min_dim·0.30).clamp(110, 220)` css px, following

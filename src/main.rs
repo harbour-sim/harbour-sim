@@ -106,6 +106,9 @@ enum ViewMode {
     /// immersion with the berthing-distance view kept in the corner of
     /// your eye. No zoom/pan either; the inset follows the boat.
     Both,
+    /// First-person at the helm, rigid with the hull (see render3d.rs).
+    /// The hardest view to moor from — and the most like the real thing.
+    Cockpit,
 }
 
 impl ViewMode {
@@ -113,7 +116,8 @@ impl ViewMode {
         match self {
             ViewMode::TopDown => ViewMode::Chase,
             ViewMode::Chase => ViewMode::Both,
-            ViewMode::Both => ViewMode::TopDown,
+            ViewMode::Both => ViewMode::Cockpit,
+            ViewMode::Cockpit => ViewMode::TopDown,
         }
     }
 }
@@ -672,11 +676,11 @@ async fn main() {
                 clear_background(Color::from_rgba(12, 38, 54, 255));
                 render2d::draw_world(sw, sh, scale, vec2(cam_x, cam_y), &scenery, &frame);
             }
-            ViewMode::Chase | ViewMode::Both => {
+            ViewMode::Chase | ViewMode::Both | ViewMode::Cockpit => {
                 // Overcast-Nordic sky; the waterplane meets it at the
                 // horizon.
                 clear_background(Color::from_rgba(96, 118, 138, 255));
-                r3d.draw(&scenery, &frame, dt);
+                r3d.draw(&scenery, &frame, dt, view == ViewMode::Cockpit);
                 // Back to the screen-space camera for the HUD below.
                 set_default_camera();
 
@@ -931,7 +935,8 @@ async fn main() {
         let view_label = match view {
             ViewMode::TopDown => "3D",
             ViewMode::Chase => "3D+2D",
-            ViewMode::Both => "2D",
+            ViewMode::Both => "HELM",
+            ViewMode::Cockpit => "2D",
         };
         let vl = measure_text(view_label, None, fs as u16, 1.0);
         draw_text(

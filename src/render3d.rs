@@ -81,6 +81,24 @@ const CHASE_FOV_DEG: f32 = 45.0;
 const CHASE_FOV_SPEED_GAIN: f32 = 5.0; // degrees at 3 m/s
 const CHASE_FOV_TAU: f32 = 1.2; // s — must lag well behind the throttle
 
+// Cockpit (helm) camera: standing at the helm in the cockpit well, rigidly
+// attached to the boat — you turn WITH the hull, which is exactly what
+// makes a first-person view read as "being aboard" (a smoothed heading
+// here would feel like the boat sliding out from under you). The ambient
+// bob still applies (damped — you move with the deck), and the same
+// speed-coupled FOV gain rides on the wider first-person base FOV.
+// The eye stands at the STARBOARD helm, not on the centreline: from dead
+// astern the sprayhood fills the frame, exactly the reason a real
+// helmsman stands where they can see past it down the side deck.
+const COCKPIT_EYE: (f32, f32) = (-4.4, -0.55); // boat-local (starboard aft)
+const COCKPIT_EYE_H: f32 = 2.35; // standing helmsman's eye above the water
+const COCKPIT_AIM_AHEAD: f32 = 40.0; // m ahead the gaze rests
+const COCKPIT_AIM_DOWN: f32 = 1.2; // gaze drop over that distance (m)
+const COCKPIT_FOV_DEG: f32 = 58.0;
+/// Sprayhood top above the water (drawn only in first person, as the
+/// near-field anchor your eye needs; from outside the boat it's noise).
+const SPRAYHOOD_TOP: f32 = 1.9;
+
 /// Sim world (x=east, y=north) + height → render space (y-up, north = -z).
 fn w3(p: Vec2, up: f32) -> Vec3 {
     vec3(p.x, up, -p.y)
@@ -381,7 +399,9 @@ impl Renderer3D {
 
     /// Draw the 3D scene for this frame. Sets its own `Camera3D`; the
     /// caller returns to the default camera afterwards for the HUD.
-    pub fn draw(&mut self, sc: &Scenery, fr: &WorldFrame, dt: f32) {
+    /// `cockpit` switches the camera rig from the trailing chase view to
+    /// the first-person helm position; the scene drawn is identical.
+    pub fn draw(&mut self, sc: &Scenery, fr: &WorldFrame, dt: f32, cockpit: bool) {
         // Perspective FOV is vertical, so a portrait phone would otherwise
         // fill its narrow width with the boat: back the camera off (and
         // lift it a little) as the aspect ratio drops below ~1.15.
@@ -424,20 +444,36 @@ impl Renderer3D {
         let sway = (t * 0.7 + 0.4).sin() * 0.5 * sea;
         let sway_v = off.perp().normalize_or_zero() * sway;
 
-        // Aim a little along the boat's actual track, not just its heading:
-        // the view leads a turn the way your eyes would.
-        let aim = fr.pos
-            + Vec2::from_angle(fr.heading) * CHASE_LOOKAHEAD
-            + self.vel * CHASE_VEL_LOOKAHEAD;
-
         // Speed-coupled FOV, eased slowly so it reads as gathering way
-        // rather than tracking the throttle lever.
-        let want_fov = CHASE_FOV_DEG + CHASE_FOV_SPEED_GAIN * (self.vel.length() / 3.0).min(1.5);
+        // rather than tracking the throttle lever (also glides the FOV
+        // across a chase↔cockpit switch instead of cutting).
+        let base_fov = if cockpit { COCKPIT_FOV_DEG } else { CHASE_FOV_DEG };
+        let want_fov = base_fov + CHASE_FOV_SPEED_GAIN * (self.vel.length() / 3.0).min(1.5);
         self.fov_deg += (want_fov - self.fov_deg) * (1.0 - (-dt / CHASE_FOV_TAU).exp());
 
+        let (position, target) = if cockpit {
+            // Standing at the helm: rigid with the hull (position AND
+            // heading — you're aboard), a damped share of the ambient bob,
+            // gaze resting on the water well ahead of the bow.
+            let (c, s) = (fr.heading.cos(), fr.heading.sin());
+            let (ex, ey) = COCKPIT_EYE;
+            let eye = fr.pos + vec2(ex * c - ey * s, ex * s + ey * c);
+            let ahead = eye + Vec2::from_angle(fr.heading) * COCKPIT_AIM_AHEAD;
+            let eye_h = COCKPIT_EYE_H + bob * 0.5;
+            (w3(eye, eye_h), w3(ahead, eye_h - COCKPIT_AIM_DOWN))
+        } else {
+            let aim = fr.pos
+                + Vec2::from_angle(fr.heading) * CHASE_LOOKAHEAD
+                + self.vel * CHASE_VEL_LOOKAHEAD;
+            (
+                w3(self.cam_pos + sway_v, CHASE_HEIGHT * boost.sqrt() + bob),
+                w3(aim, CHASE_AIM_UP),
+            )
+        };
+
         set_camera(&Camera3D {
-            position: w3(self.cam_pos + sway_v, CHASE_HEIGHT * boost.sqrt() + bob),
-            target: w3(aim, CHASE_AIM_UP),
+            position,
+            target,
             up: Vec3::Y,
             fovy: self.fov_deg.to_radians(),
             aspect: None,
@@ -520,6 +556,19 @@ impl Renderer3D {
             deck_h(0.6) + dims::MAST_H,
             Color::from_rgba(188, 190, 196, 255),
         );
+        if cockpit {
+            // Sprayhood over the companionway, just ahead of the eye — the
+            // near-field anchor that makes the first-person view read as
+            // standing IN a boat (from outside it's sub-pixel noise).
+            book.box_along(
+                bl(-3.0, 0.0),
+                bl(-2.2, 0.0),
+                0.8,
+                deck_h(-2.6) - 0.05,
+                SPRAYHOOD_TOP,
+                Color::from_rgba(70, 110, 130, 255),
+            );
+        }
         book.flush();
         for m in &book.meshes {
             draw_mesh(m);
@@ -529,6 +578,19 @@ impl Renderer3D {
         let rig = Color::from_rgba(120, 124, 132, 255);
         let boom_h = deck_h(0.6) + dims::BOOM_H;
         draw_line_3d(w3(bl(0.6, 0.0), boom_h), w3(bl(-2.0, 0.0), boom_h - 0.15), rig);
+
+        if cockpit {
+            // Foredeck detail lines (the 2D renderer's V), so the deck
+            // ahead reads as a deck rather than a bare slab.
+            let deck_line = Color::from_rgba(160, 156, 144, 255);
+            for side in [1.0f32, -1.0] {
+                draw_line_3d(
+                    w3(bl(4.2, 1.2 * side), deck_h(4.2) + 0.01),
+                    w3(bl(3.2, 0.0), deck_h(3.2) + 0.01),
+                    deck_line,
+                );
+            }
+        }
 
         // Rudder hint at the waterline (the blade itself is underwater):
         // the same chord the 2D renderer draws, as a surface decal.
