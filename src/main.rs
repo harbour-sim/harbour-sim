@@ -349,10 +349,22 @@ async fn main() {
             let mut do_open_editor = false;
             // Zoom/pan (and the CENTER twin) belong to the top-down camera
             // only; in the chase view those gestures are ignored rather
-            // than silently panning a camera you can't see.
+            // than silently panning a camera you can't see. The COCKPIT
+            // view reuses the same free-drag gesture as free-look (and
+            // C/CENTER as "eyes forward").
             let top_down = view == ViewMode::TopDown;
-            let mut do_center = top_down && is_key_pressed(KeyCode::C);
+            let in_cockpit = view == ViewMode::Cockpit;
+            let mut do_center = (top_down || in_cockpit) && is_key_pressed(KeyCode::C);
             let mut do_toggle_view = is_key_pressed(KeyCode::V);
+            // Drag-to-look sensitivity: a full-width swipe sweeps ~200° of
+            // yaw whatever the screen size (phones get the same reach per
+            // swipe as a desktop drag), pitch proportionally.
+            let look_sens = 3.5 / sw;
+            // Same "grab the world" convention as the top-down pan: drag
+            // right → the world follows your finger → you look LEFT (CCW,
+            // positive yaw); drag down → look up.
+            let center_visible = (top_down && cam_offset.length() > 0.5)
+                || (in_cockpit && r3d.look_active());
 
             // --- Touch input: dial drags + reset/keel taps -----------------
             let ts = touches();
@@ -388,7 +400,7 @@ async fn main() {
                         do_open_editor = true;
                     } else if view_rect.contains(p) {
                         do_toggle_view = true;
-                    } else if top_down && cam_offset.length() > 0.5 && center_rect.contains(p) {
+                    } else if center_visible && center_rect.contains(p) {
                         do_center = true;
                     }
                 }
@@ -449,6 +461,16 @@ async fn main() {
                     pan_touch = Some((id, p));
                     pinch = None;
                 }
+                [(id, p)] if in_cockpit => {
+                    if let Some((pid, prev)) = pan_touch
+                        && pid == id
+                    {
+                        let d = p - prev;
+                        r3d.add_look(d.x * look_sens, d.y * look_sens);
+                    }
+                    pan_touch = Some((id, p));
+                    pinch = None;
+                }
                 [(ida, pa), (idb, pb)] if top_down => {
                     let key = (ida.min(idb), ida.max(idb));
                     let d = (pa - pb).length();
@@ -484,10 +506,11 @@ async fn main() {
                     do_open_editor = true;
                 } else if view_rect.contains(mp) {
                     do_toggle_view = true;
-                } else if top_down && cam_offset.length() > 0.5 && center_rect.contains(mp) {
+                } else if center_visible && center_rect.contains(mp) {
                     do_center = true;
-                } else if top_down {
-                    // Anywhere on the water: drag to pan (claim 4).
+                } else if top_down || in_cockpit {
+                    // Anywhere on the water: drag to pan — or, at the
+                    // helm, drag to look around (claim 4 either way).
                     mouse_claim = Some(4);
                     pan_mouse_prev = mp;
                 }
@@ -506,10 +529,15 @@ async fn main() {
                     }
                     Some(2) => input.throttle = throttle_slider.value(mp),
                     Some(3) => input.rudder = rudder_slider.value(mp),
-                    Some(4) => {
+                    Some(4) if top_down => {
                         let d = mp - pan_mouse_prev;
                         cam_offset.x -= d.x / last_scale;
                         cam_offset.y += d.y / last_scale; // screen y is inverted
+                        pan_mouse_prev = mp;
+                    }
+                    Some(4) if in_cockpit => {
+                        let d = mp - pan_mouse_prev;
+                        r3d.add_look(d.x * look_sens, d.y * look_sens);
                         pan_mouse_prev = mp;
                     }
                     _ => {}
@@ -587,7 +615,11 @@ async fn main() {
                 view = view.next();
             }
             if do_center {
-                cam_offset = Vec2::ZERO;
+                if in_cockpit {
+                    r3d.reset_look(); // eyes forward
+                } else {
+                    cam_offset = Vec2::ZERO;
+                }
             }
             if do_reset {
                 // Fresh Sim per run — never reuse one (determinism rule).
@@ -947,10 +979,12 @@ async fn main() {
             text,
         );
 
-        // Centre-on-boat button (left of VIEW) — only in the top-down view,
-        // and only while the camera is panned off the boat; the touch/mouse
-        // twin of the C key.
-        if view == ViewMode::TopDown && cam_offset.length() > 0.5 {
+        // Centre button (left of VIEW) — the touch/mouse twin of the C key.
+        // Only while it has something to undo: a panned-off camera in the
+        // top-down view, or an off-axis gaze at the helm.
+        let show_center = (view == ViewMode::TopDown && cam_offset.length() > 0.5)
+            || (view == ViewMode::Cockpit && r3d.look_active());
+        if show_center {
             draw_rectangle(
                 center_rect.x,
                 center_rect.y,
@@ -992,11 +1026,7 @@ async fn main() {
         let help_x = sa_l + margin + 40.0;
         // On narrow screens the hint line runs under the buttons (they
         // share the bottom edge) — lift the block above them then.
-        let buttons_left = if view == ViewMode::TopDown && cam_offset.length() > 0.5 {
-            center_rect.x
-        } else {
-            view_rect.x
-        };
+        let buttons_left = if show_center { center_rect.x } else { view_rect.x };
         let help_w = help
             .iter()
             .map(|l| measure_text(l, None, (fs * 0.8) as u16, 1.0).width)

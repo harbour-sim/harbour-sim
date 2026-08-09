@@ -981,8 +981,19 @@ like Pegasus.
   sprayhood fills the frame — the same reason a real helmsman stands
   where they see past it; rigid with the hull, damped bob, wider base
   FOV, sprayhood + foredeck lines drawn ONLY in this view as the
-  near-field anchors, sub-pixel noise from outside); Both = Chase
-  full-screen + a top-down INSET,
+  near-field anchors, sub-pixel noise from outside). Cockpit
+  **free-look** (2026-08-09): the free-drag gesture (one finger / mouse
+  claim 4 — the same gesture that pans the top-down view) rotates the
+  gaze in BOTH axes, same grab-the-world convention as the pan (drag
+  right → look left, drag down → look up); sensitivity is
+  screen-relative (a full-width swipe ≈ 200° of yaw on any device). Yaw
+  is BOAT-RELATIVE (a held look-astern stays astern through a turn) and
+  clamps at ±180° — looking dead astern is the point, it's how you back
+  into a berth; pitch clamps in `COCKPIT_LOOK_PITCH_RANGE`. C/CENTER
+  mean "eyes forward" here (the CENTER button appears while the gaze is
+  off-axis, mirroring its panned-camera role — `Renderer3D::look_active`
+  drives it), and every respawn resets the gaze via `snap_to`. Both =
+  Chase full-screen + a top-down INSET,
   top-centre under the SOG line (the only reliably free HUD region —
   dials own the top corners, sliders the mid-edges, buttons the
   bottom), square `(min_dim·0.30).clamp(110, 220)` css px, following
@@ -997,10 +1008,11 @@ like Pegasus.
   (miniquad `apply_viewport`): multiply css px by `screen_dpi_scale()`
   and flip y via `(sh - iy - side) * dpi`. The HUD is drawn identically
   in every mode (the 3D modes call `set_default_camera()` before it).
-  Zoom/pan/CENTER are TOP-DOWN-ONLY: in the 3D modes those gestures are
-  ignored (`top_down` gating in the input block) rather than silently
-  panning a camera you can't see — free fingers do nothing there,
-  wheel/+-/C included, and the CENTER button hides. The chase camera
+  Zoom/pan are TOP-DOWN-ONLY: in Chase/Both those gestures are ignored
+  (`top_down` gating in the input block) rather than silently panning a
+  camera you can't see — free fingers do nothing there, wheel/+-
+  included — while Cockpit reuses the free-drag as free-look and
+  C/CENTER as eyes-forward (see above). The chase camera
   re-seats on every respawn path (R, editor Apply) via
   `Renderer3D::snap_to`,
   and the chase camera backs off (`boost` in render3d.rs) as the aspect
@@ -1050,8 +1062,9 @@ like Pegasus.
   blade-angle formula sim-core uses.
 - Controls: touch/mouse = drag the dials/sliders + RESET/KEEL/VIEW buttons
   (+ CENTER while panned), pinch = zoom, one-finger/mouse drag on the
-  water = pan, scroll wheel / +/- keys = zoom and C = centre (desktop
-  twins; zoom/pan/centre in the top-down view only), V = cycle view mode;
+  water = pan (top-down) or look around (helm view), scroll wheel / +/-
+  keys = zoom and C = centre / eyes-forward (desktop twins; zoom/pan in
+  the top-down view only), V = cycle view mode;
   keyboard = **the boat has the primary keys** (agreed 2026-08-03: driving
   is the main activity): W/S throttle up/down, A/D helm port/starboard
   (continuous `is_key_down`×dt like the env keys), Space = engine to

@@ -95,6 +95,11 @@ const COCKPIT_EYE_H: f32 = 2.35; // standing helmsman's eye above the water
 const COCKPIT_AIM_AHEAD: f32 = 40.0; // m ahead the gaze rests
 const COCKPIT_AIM_DOWN: f32 = 1.2; // gaze drop over that distance (m)
 const COCKPIT_FOV_DEG: f32 = 58.0;
+/// Free-look clamps: yaw ±180° (looking DEAD ASTERN is the point — it's
+/// how you back into a berth), pitch between "down at your own quarter
+/// wave" and "up the mast".
+const COCKPIT_LOOK_YAW_MAX: f32 = std::f32::consts::PI;
+const COCKPIT_LOOK_PITCH_RANGE: (f32, f32) = (-0.6, 0.9); // rad
 /// Sprayhood top above the water (drawn only in first person, as the
 /// near-field anchor your eye needs; from outside the boat it's noise).
 const SPRAYHOOD_TOP: f32 = 1.9;
@@ -290,6 +295,11 @@ pub struct Renderer3D {
     vel: Vec2,
     /// Eased vertical FOV in degrees (speed-coupled — see CHASE_FOV_*).
     fov_deg: f32,
+    /// Cockpit free-look offsets from the straight-ahead gaze: yaw (CCW
+    /// positive, boat-relative) and pitch (up positive). Driven by the
+    /// drag gesture in main.rs; cleared by C/CENTER and on respawn.
+    look_yaw: f32,
+    look_pitch: f32,
 }
 
 impl Renderer3D {
@@ -385,6 +395,8 @@ impl Renderer3D {
             last_boat: Vec2::ZERO,
             vel: Vec2::ZERO,
             fov_deg: CHASE_FOV_DEG,
+            look_yaw: 0.0,
+            look_pitch: 0.0,
         }
     }
 
@@ -395,6 +407,26 @@ impl Renderer3D {
         self.last_boat = pos;
         self.vel = Vec2::ZERO;
         self.fov_deg = CHASE_FOV_DEG;
+        self.reset_look();
+    }
+
+    /// Nudge the cockpit free-look by (yaw CCW, pitch up) radians.
+    pub fn add_look(&mut self, dyaw: f32, dpitch: f32) {
+        self.look_yaw = (self.look_yaw + dyaw).clamp(-COCKPIT_LOOK_YAW_MAX, COCKPIT_LOOK_YAW_MAX);
+        self.look_pitch =
+            (self.look_pitch + dpitch).clamp(COCKPIT_LOOK_PITCH_RANGE.0, COCKPIT_LOOK_PITCH_RANGE.1);
+    }
+
+    /// Whether the gaze is meaningfully off straight-ahead (drives the
+    /// CENTER button's visibility in the cockpit view).
+    pub fn look_active(&self) -> bool {
+        self.look_yaw.abs() > 0.02 || self.look_pitch.abs() > 0.02
+    }
+
+    /// Recentre the gaze (C key / CENTER button in the cockpit view).
+    pub fn reset_look(&mut self) {
+        self.look_yaw = 0.0;
+        self.look_pitch = 0.0;
     }
 
     /// Draw the 3D scene for this frame. Sets its own `Camera3D`; the
@@ -454,13 +486,18 @@ impl Renderer3D {
         let (position, target) = if cockpit {
             // Standing at the helm: rigid with the hull (position AND
             // heading — you're aboard), a damped share of the ambient bob,
-            // gaze resting on the water well ahead of the bow.
+            // gaze resting on the water well ahead of the bow — plus the
+            // free-look offsets (drag gesture): yaw is boat-relative, so
+            // a held look-astern stays astern while the boat turns.
             let (c, s) = (fr.heading.cos(), fr.heading.sin());
             let (ex, ey) = COCKPIT_EYE;
             let eye = fr.pos + vec2(ex * c - ey * s, ex * s + ey * c);
-            let ahead = eye + Vec2::from_angle(fr.heading) * COCKPIT_AIM_AHEAD;
+            let gaze = Vec2::from_angle(fr.heading + self.look_yaw);
+            let ahead = eye + gaze * COCKPIT_AIM_AHEAD;
             let eye_h = COCKPIT_EYE_H + bob * 0.5;
-            (w3(eye, eye_h), w3(ahead, eye_h - COCKPIT_AIM_DOWN))
+            let target_h =
+                eye_h - COCKPIT_AIM_DOWN + COCKPIT_AIM_AHEAD * self.look_pitch.tan();
+            (w3(eye, eye_h), w3(ahead, target_h))
         } else {
             let aim = fr.pos
                 + Vec2::from_angle(fr.heading) * CHASE_LOOKAHEAD
