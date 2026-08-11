@@ -930,8 +930,12 @@ async fn main() {
         // (sim.engine(), so they fade in/out with the lag, not the lever).
         // Render-only — reads sim state, feeds nothing back (get_time is
         // allowed here like the ripples). Ahead the slipstream leaves the
-        // stern along the deflected blade; astern it boils forward along
-        // both quarters — the two directions you'd see from a quay.
+        // stern along the deflected blade; astern the race is thrown
+        // forward against the hull, and the right-handed prop's ascending
+        // blades (counter-clockwise seen from astern) fling it up the
+        // STARBOARD quarter — the boil surfaces on the side OPPOSITE the
+        // port prop walk, which is the cue a helmsman actually reads
+        // ("boil to starboard, stern about to walk port").
         let engine = sim.engine();
         if engine.abs() > 0.05 {
             for i in 0u32..8 {
@@ -947,8 +951,14 @@ async fn main() {
                     let p = start + dir * (ph * (1.5 + 2.2 * engine));
                     (bl(p.x, p.y), bl(p.x + dir.x * 0.7, p.y + dir.y * 0.7))
                 } else {
-                    let side_y = if i % 2 == 0 { 1.0 } else { -1.0 };
-                    let start = vec2(-5.2, side_y * (1.4 + 0.6 * fy.abs()));
+                    // 6:2 starboard bias (local -y = starboard): the boil
+                    // sits on the quarter opposite the astern prop walk.
+                    // Streaks must START outboard of the hull's widest
+                    // half-beam (1.9, HULL_PTS) — the foam is drawn before
+                    // the hull fill, so anything closer in is painted over
+                    // for most of its forward run.
+                    let side_y = if i % 4 == 0 { 1.0 } else { -1.0 };
+                    let start = vec2(-5.2, side_y * (2.0 + 0.5 * fy.abs()));
                     let p = start + vec2(ph * (2.0 - 2.5 * engine), 0.0);
                     (bl(p.x, p.y), bl(p.x + 0.6, p.y))
                 };
