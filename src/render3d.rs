@@ -15,6 +15,7 @@
 //! to 10 000 vertices / 5 000 indices by macroquad's draw-call buffers, so
 //! static scenery is chunked by `MeshBook` well under those caps.
 
+use crate::camera::FovZoom;
 use crate::render2d::{Scenery, WorldFrame};
 use harbour_sim_core::sim::{HULL_PTS, JETTY_HALF_W, POLE_RADIUS};
 use macroquad::models::Vertex;
@@ -72,14 +73,14 @@ const CHASE_DIST_BAND: (f32, f32) = (0.6, 1.5);
 /// estimate), so the view leads a turn the way your eyes would.
 const CHASE_VEL_LOOKAHEAD: f32 = 0.4; // s
 const CHASE_VEL_MAX: f32 = 8.0; // m/s cap on the estimate (respawn jumps)
-/// Base vertical FOV, widened by up to `CHASE_FOV_SPEED_GAIN` at 3 m/s
-/// (about this hull's cruising speed). Speed-coupled FOV is the standard
-/// trick for making a straight run READ as motion — the edges of frame
-/// stretch as you gather way — and it's what carries the sense of speed
-/// on open water, where there's little nearby geometry to sweep past.
+/// Base vertical FOV. The speed-coupled WIDENING on top of it — the
+/// standard trick for making a straight run read as motion — lives in
+/// `camera::FovZoom` along with the travel bound that keeps it from
+/// outrunning the boat: widening the FOV pulls the scenery toward the
+/// vanishing point, and doing that faster than the camera advances makes
+/// the world drift backwards during acceleration (see camera.rs and
+/// docs/camera-speed-zoom.md).
 const CHASE_FOV_DEG: f32 = 45.0;
-const CHASE_FOV_SPEED_GAIN: f32 = 5.0; // degrees at 3 m/s
-const CHASE_FOV_TAU: f32 = 1.2; // s — must lag well behind the throttle
 
 // Cockpit (helm) camera: standing at the helm in the cockpit well, rigidly
 // attached to the boat — you turn WITH the hull, which is exactly what
@@ -293,8 +294,10 @@ pub struct Renderer3D {
     /// isn't handed to the renderer, and this stays purely cosmetic).
     last_boat: Vec2,
     vel: Vec2,
-    /// Eased vertical FOV in degrees (speed-coupled — see CHASE_FOV_*).
-    fov_deg: f32,
+    /// Speed-coupled vertical FOV, rate-bounded against the camera's own
+    /// travel so a widening view can never reverse the optical flow
+    /// (see camera.rs).
+    fov: FovZoom,
     /// Cockpit free-look offsets from the straight-ahead gaze: yaw (CCW
     /// positive, boat-relative) and pitch (up positive). Driven by the
     /// drag gesture in main.rs; cleared by C/CENTER and on respawn.
@@ -394,7 +397,7 @@ impl Renderer3D {
             cam_pos: Vec2::ZERO,
             last_boat: Vec2::ZERO,
             vel: Vec2::ZERO,
-            fov_deg: CHASE_FOV_DEG,
+            fov: FovZoom::new(CHASE_FOV_DEG),
             look_yaw: 0.0,
             look_pitch: 0.0,
         }
@@ -406,7 +409,7 @@ impl Renderer3D {
         self.cam_pos = pos - Vec2::from_angle(heading) * CHASE_DIST;
         self.last_boat = pos;
         self.vel = Vec2::ZERO;
-        self.fov_deg = CHASE_FOV_DEG;
+        self.fov.snap(CHASE_FOV_DEG);
         self.reset_look();
     }
 
@@ -476,13 +479,6 @@ impl Renderer3D {
         let sway = (t * 0.7 + 0.4).sin() * 0.5 * sea;
         let sway_v = off.perp().normalize_or_zero() * sway;
 
-        // Speed-coupled FOV, eased slowly so it reads as gathering way
-        // rather than tracking the throttle lever (also glides the FOV
-        // across a chase↔cockpit switch instead of cutting).
-        let base_fov = if cockpit { COCKPIT_FOV_DEG } else { CHASE_FOV_DEG };
-        let want_fov = base_fov + CHASE_FOV_SPEED_GAIN * (self.vel.length() / 3.0).min(1.5);
-        self.fov_deg += (want_fov - self.fov_deg) * (1.0 - (-dt / CHASE_FOV_TAU).exp());
-
         let (position, target) = if cockpit {
             // Standing at the helm: rigid with the hull (position AND
             // heading — you're aboard), a damped share of the ambient bob,
@@ -508,11 +504,27 @@ impl Renderer3D {
             )
         };
 
+        // Speed-coupled FOV, chosen LAST: `FovZoom` bounds how fast it may
+        // widen against the camera's own advance this frame, so it needs
+        // the position and aim already resolved (a lagged advance would
+        // only bound it approximately). Eased slowly so it reads as
+        // gathering way rather than tracking the throttle lever; the
+        // chase↔cockpit base change still glides, exempt from the bound
+        // because that switch teleports the camera anyway.
+        let base_fov = if cockpit { COCKPIT_FOV_DEG } else { CHASE_FOV_DEG };
+        let fovy = self.fov.update(
+            position,
+            (target - position).normalize_or_zero(),
+            base_fov,
+            self.vel.length(),
+            dt,
+        );
+
         set_camera(&Camera3D {
             position,
             target,
             up: Vec3::Y,
-            fovy: self.fov_deg.to_radians(),
+            fovy: fovy.to_radians(),
             aspect: None,
             projection: Projection::Perspective,
             render_target: None,

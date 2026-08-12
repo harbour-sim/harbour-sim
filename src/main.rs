@@ -19,6 +19,7 @@ use render2d::{Scenery, WorldFrame};
 use render3d::Renderer3D;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+mod camera;
 mod keel_editor;
 mod render2d;
 mod render3d;
