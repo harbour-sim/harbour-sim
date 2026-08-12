@@ -183,15 +183,30 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
   leads along the boat's actual TRACK via a render-side smoothed
   velocity estimate (`CHASE_VEL_LOOKAHEAD`, capped by `CHASE_VEL_MAX`
   against respawn jumps); and a wind-scaled ambient bob/sway plus a
-  slowly-eased speed-coupled FOV (`CHASE_FOV_*`, 45°+5° by 3 m/s, τ
-  1.2 s so it reads as gathering way, not as throttle) keep a straight
-  run feeling like motion. `snap_to(pos, heading)` re-seats the whole
+  slowly-eased speed-coupled FOV (base 45°, +5° by 3 m/s, τ 1.2 s so it
+  reads as gathering way, not as throttle) keep a straight run feeling
+  like motion. **The speed-coupled FOV lives in `camera::FovZoom`, not
+  here** (2026-08-12): widening the FOV pulls the scenery toward the
+  vanishing point, and doing that faster than the camera advances makes
+  the world drift BACKWARDS during acceleration — owner report, and
+  measured at up to "everything past 53 m runs backwards" a few seconds
+  into a full-throttle start. `FovZoom` bounds the widening rate against
+  the camera's own realized advance; it is called LAST in `draw`, after
+  the eye and aim are resolved, because the bound needs this frame's
+  true advance. See the camera bullets under Frontend conventions and
+  `docs/camera-speed-zoom.md`. `snap_to(pos, heading)` re-seats the whole
   rig on every respawn so R / editor Apply don't swoop across the
   marina. NOT done: camera roll into the turn — the hull itself doesn't
   heel (sim-core is 2D), so a rolling camera over a flat-lying boat
   reads as a bug rather than as banking. Deferred knowingly:
   trees/rocks/skerries in 3D, mooring-line catenary, camera collision
   with scenery, wave motion.
+- `src/camera.rs` — how far away the 3D cameras stand: `FovZoom`, the
+  speed-coupled field of view of the chase and cockpit rigs, and the
+  bound that keeps it from ever reading as the camera sliding backwards.
+  Pure frontend maths: no `Sim`, no rendering, so its properties are
+  unit-tested directly. See the camera bullet under Frontend conventions
+  and the proof in `docs/camera-speed-zoom.md`.
 - `src/keel_editor.rs` — in-app editor for `BoatDesign`: drag a fixed-grid
   bar chart to paint the underwater area distribution, drag a displacement
   slider (4–14 t range bracketing the reference boats, 100 kg steps;
@@ -296,6 +311,10 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
   boats the `BoatDesign` presets are named after, the derived numbers each
   preset produces, and exactly what the sim does / does not take from each
   boat (the shared-hull caveat).
+- `docs/camera-speed-zoom.md` — the speed-coupled FOV's no-reversal
+  theorem and its proof (`f' ≥ f·(1 − d/Z)`), the before/after
+  measurement of the chase view, what `src/camera.rs` does with it, and
+  the deliberate exemptions (view-mode switch, respawn, idle relaxation).
 - `rust-toolchain.toml` — **pins the Rust toolchain (1.94.1)**. The first
   preview deploy failed because the runner's newer preinstalled stable broke
   the wasm RELEASE link (`rust-lld: undefined symbol: console_log/now/...` —
@@ -1022,6 +1041,45 @@ like Pegasus.
   ratio drops below ~1.15 — perspective FOV is VERTICAL, so a portrait
   phone would otherwise fill its narrow width with the boat. View mode
   is a plain local: survives resets, resets to TopDown on reload.
+- **Speed-adaptive camera distance** (`src/camera.rs`, 2026-08-12). The
+  3D rigs widen their FOV as the boat gathers way; the lesson is that
+  **a view may only recede as fast as the camera travels**, or the
+  scenery flows the wrong way and the camera reads as sliding backwards
+  under acceleration (owner report against the chase view). Widening the
+  FOV pulls features toward the vanishing point, forward motion pushes
+  them away from it; with `f = cot(φ/2)` and `d` the camera's advance
+  along its view axis, no static feature within `Z` drifts the wrong way
+  iff **`f' ≥ f·(1 − d/Z)`** (advancing; the inequality flips making
+  sternway). Proved in `docs/camera-speed-zoom.md`, enforced exactly in
+  f-space by `FovZoom::update`, unit-tested in `src/camera.rs`. Notes
+  that matter when touching this:
+  - **Only one direction ever binds** — narrowing while advancing
+    reinforces the flow and needs no bound — and **no bound protects
+    every depth**: `d/Z → 0` at infinity while the zoom term doesn't, so
+    the far field HAS to drift inward when you widen. Hence an explicit
+    reach, `FLOW_REACH_M` = 150 m (the water, jetties, fleet and both
+    shores of a 125 m channel).
+  - The cap, not the easing, is what carries the proof: a lag filter
+    (`FOV_TAU`) still widens arbitrarily fast when the target jumps far
+    enough. `FOV_TAU` is feel only.
+  - Measured before/after on a full-throttle start: the old unbounded
+    τ-easing reversed everything past **53 m** three seconds in (the
+    chase camera sits 22 m astern, so that is the entire scene ahead of
+    the boat), and everything at all in the first frames, when the FOV
+    had begun opening but the camera had not yet moved. The full 5°
+    gain now costs ~19 m of travel — the price the bound puts on it.
+  - `d` is the REALIZED advance, so the rig's own deliberate hang-back
+    under acceleration (`CHASE_POS_TAU`, the distance band) is charged
+    to the zoom automatically — which is why `FovZoom::update` is called
+    LAST in `Renderer3D::draw`, after the eye and aim exist.
+  - The base FOV change on a chase↔cockpit switch is EXEMPT (that switch
+    teleports the camera; there is no continuous flow to protect), as is
+    `snap_to` on respawn. `IDLE_FOV_RELAX` is the stopped-boat carve-out
+    (narrowing only, faded out by `MANOEUVRING_SPEED`), so a crash stop
+    can't strand the view wide.
+  - The boat itself is not a static feature: the rig is still allowed to
+    hang back and let the hull recede in frame. The bound is about the
+    WORLD, which is what carries the motion cue.
 - **Touch controls**: the two HUD compass indicators are draggable **dials**
   (`Dial` struct) — drag direction from the dial centre = the flow's TOWARD
   direction (wind label still displays the mariners' FROM convention:
