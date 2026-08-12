@@ -201,12 +201,12 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
   reads as a bug rather than as banking. Deferred knowingly:
   trees/rocks/skerries in 3D, mooring-line catenary, camera collision
   with scenery, wave motion.
-- `src/camera.rs` — how far away the 3D cameras stand: `FovZoom`, the
-  speed-coupled field of view of the chase and cockpit rigs, and the
-  bound that keeps it from ever reading as the camera sliding backwards.
-  Pure frontend maths: no `Sim`, no rendering, so its properties are
-  unit-tested directly. See the camera bullet under Frontend conventions
-  and the proof in `docs/camera-speed-zoom.md`.
+- `src/camera.rs` — how far away each camera stands, and the flow bounds
+  that keep a view pulling back from ever reading as the camera sliding
+  backwards: `SpeedZoom` (top-down visible width) and `FovZoom` (the 3D
+  rigs' speed-coupled FOV). Pure frontend maths: no `Sim`, no rendering,
+  so its properties are unit-tested directly. See the camera bullets under
+  Frontend conventions and the proofs in `docs/camera-speed-zoom.md`.
 - `src/keel_editor.rs` — in-app editor for `BoatDesign`: drag a fixed-grid
   bar chart to paint the underwater area distribution, drag a displacement
   slider (4–14 t range bracketing the reference boats, 100 kg steps;
@@ -311,10 +311,12 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
   boats the `BoatDesign` presets are named after, the derived numbers each
   preset produces, and exactly what the sim does / does not take from each
   boat (the shared-hull caveat).
-- `docs/camera-speed-zoom.md` — the speed-coupled FOV's no-reversal
-  theorem and its proof (`f' ≥ f·(1 − d/Z)`), the before/after
-  measurement of the chase view, what `src/camera.rs` does with it, and
-  the deliberate exemptions (view-mode switch, respawn, idle relaxation).
+- `docs/camera-speed-zoom.md` — the no-reversal theorems and their
+  proofs, in both projections: orthographic (`ρ·|ΔW| ≤ δ`, the top-down
+  width) and perspective (`f' ≥ f·(1 − d/Z)`, the 3D FOV, with the
+  before/after measurement of the chase view). Plus what `src/camera.rs`
+  does with them and the deliberate exemptions (user zoom, resize,
+  view-mode switch, idle relaxation).
 - `rust-toolchain.toml` — **pins the Rust toolchain (1.94.1)**. The first
   preview deploy failed because the runner's newer preinstalled stable broke
   the wasm RELEASE link (`rust-lld: undefined symbol: console_log/now/...` —
@@ -1041,45 +1043,81 @@ like Pegasus.
   ratio drops below ~1.15 — perspective FOV is VERTICAL, so a portrait
   phone would otherwise fill its narrow width with the boat. View mode
   is a plain local: survives resets, resets to TopDown on reload.
-- **Speed-adaptive camera distance** (`src/camera.rs`, 2026-08-12). The
-  3D rigs widen their FOV as the boat gathers way; the lesson is that
-  **a view may only recede as fast as the camera travels**, or the
+- **Speed-adaptive camera distance** (`src/camera.rs`, 2026-08-12).
+  Every view pulls back as the boat gathers way; the shared lesson is
+  that **a view may only recede as fast as the camera travels**, or the
   scenery flows the wrong way and the camera reads as sliding backwards
-  under acceleration (owner report against the chase view). Widening the
-  FOV pulls features toward the vanishing point, forward motion pushes
-  them away from it; with `f = cot(φ/2)` and `d` the camera's advance
-  along its view axis, no static feature within `Z` drifts the wrong way
-  iff **`f' ≥ f·(1 − d/Z)`** (advancing; the inequality flips making
-  sternway). Proved in `docs/camera-speed-zoom.md`, enforced exactly in
-  f-space by `FovZoom::update`, unit-tested in `src/camera.rs`. Notes
-  that matter when touching this:
-  - **Only one direction ever binds** — narrowing while advancing
-    reinforces the flow and needs no bound — and **no bound protects
-    every depth**: `d/Z → 0` at infinity while the zoom term doesn't, so
-    the far field HAS to drift inward when you widen. Hence an explicit
-    reach, `FLOW_REACH_M` = 150 m (the water, jetties, fleet and both
-    shores of a 125 m channel).
-  - The cap, not the easing, is what carries the proof: a lag filter
-    (`FOV_TAU`) still widens arbitrarily fast when the target jumps far
-    enough. `FOV_TAU` is feel only.
-  - Measured before/after on a full-throttle start: the old unbounded
-    τ-easing reversed everything past **53 m** three seconds in (the
-    chase camera sits 22 m astern, so that is the entire scene ahead of
-    the boat), and everything at all in the first frames, when the FOV
-    had begun opening but the camera had not yet moved. The full 5°
-    gain now costs ~19 m of travel — the price the bound puts on it.
-  - `d` is the REALIZED advance, so the rig's own deliberate hang-back
-    under acceleration (`CHASE_POS_TAU`, the distance band) is charged
-    to the zoom automatically — which is why `FovZoom::update` is called
-    LAST in `Renderer3D::draw`, after the eye and aim exist.
-  - The base FOV change on a chase↔cockpit switch is EXEMPT (that switch
-    teleports the camera; there is no continuous flow to protect), as is
-    `snap_to` on respawn. `IDLE_FOV_RELAX` is the stopped-boat carve-out
-    (narrowing only, faded out by `MANOEUVRING_SPEED`), so a crash stop
-    can't strand the view wide.
-  - The boat itself is not a static feature: the rig is still allowed to
-    hang back and let the hull recede in frame. The bound is about the
-    WORLD, which is what carries the motion cue.
+  under acceleration (owner report against the 3D chase view). Two
+  bounds, one per projection, both proved in
+  `docs/camera-speed-zoom.md` and unit-tested in `src/camera.rs`:
+  - **Perspective (`FovZoom`, the 3D rigs)** — the case the artifact was
+    reported in. Widening the FOV pulls features toward the vanishing
+    point, forward motion pushes them away from it; with `f = cot(φ/2)`
+    and `d` the camera's advance along its view axis, no static feature
+    within `Z` drifts the wrong way iff **`f' ≥ f·(1 − d/Z)`**
+    (advancing; the inequality flips making sternway). Notes:
+    - Unlike the orthographic case, **only one direction ever binds** —
+      narrowing while advancing reinforces the flow and needs no bound —
+      and **no bound protects every depth**: `d/Z → 0` at infinity while
+      the zoom term doesn't, so the far field HAS to drift inward when
+      you widen. Hence an explicit reach, `FLOW_REACH_M` = 150 m (the
+      water, jetties, fleet and both shores of a 125 m channel).
+    - Measured before/after on a full-throttle start: the old unbounded
+      τ-easing reversed everything past **53 m** three seconds in (the
+      chase camera sits 22 m astern, so that is the entire scene ahead
+      of the boat), and everything at all in the first frames, when the
+      FOV had begun opening but the camera had not yet moved.
+    - `d` is the REALIZED advance, so the rig's own deliberate hang-back
+      under acceleration (`CHASE_POS_TAU`, the distance band) is charged
+      to the zoom automatically — which is why `FovZoom::update` is
+      called LAST in `Renderer3D::draw`, after the eye and aim exist.
+    - The base FOV change on a chase↔cockpit switch is EXEMPT (that
+      switch teleports the camera; there is no continuous flow to
+      protect), as is `snap_to` on respawn. `IDLE_FOV_RELAX` is the
+      stopped-boat carve-out, the twin of `IDLE_RELAX` below.
+  - **Orthographic (`SpeedZoom`, the top-down view)** — the same idea in
+    the simpler projection: a multiplier on the visible width, 1.0 below
+    `SPEED_ZOOM_LO` (0.5 m/s) ramping to `SPEED_ZOOM_MAX` (1.35, so
+    150 → ~202 m) at `SPEED_ZOOM_HI` (2.8 m/s, near this hull's measured
+    top speed). Widening pulls features toward the screen centre, which
+    for everything ASTERN is forwards; with `W` the visible width, `δ`
+    the camera's world travel over the frame and `ρ = ½√(1+(sh/sw)²)`,
+    no visible static feature can move forwards iff **`ρ·|ΔW| ≤ δ`**.
+    `SpeedZoom::update` enforces it at `FLOW_MARGIN = 0.5`, which keeps
+    at least half the backward flow and extends the guarantee to twice
+    the visible radius (so nothing drifts forwards INTO frame either).
+    Notes that matter when touching this:
+    - The bound contains no `W`, no dt and no acceleration — it holds at
+      any zoom level and under any acceleration, including collisions. It
+      is a *hard cap*, and the cap is what carries the proof; the
+      smoothing next to it (`SETTLE_M`, an e-fold measured in metres of
+      TRAVEL, not seconds — the "momentum" knob) is feel only. A lag
+      filter alone cannot deliver the guarantee.
+    - It prices the zoom span in TRAVEL: the 1.35 span costs ~60 m of it
+      in either direction at the default view. That is why the span is
+      modest — a wider one would still be pulled back well into a slow
+      approach, and there is no way to buy it back faster without the
+      artifact.
+    - `δ` is the REALIZED camera displacement (pan offset and world-rect
+      clamp included), so the camera POSITION is resolved first in
+      `main.rs`, at the previous frame's width, and the width chosen
+      against that frame's true `δ`; a lagged `δ` would only bound it
+      approximately. The one cost is that the world-rect margins lag the
+      width by a step (centimetres, against a 6 m pad).
+    - `δ = 0` freezes the zoom by construction (stopped boat, or a camera
+      pinned by the world clamp). `IDLE_RELAX` is the one deliberate
+      exemption — it lets a stopped boat's view creep back IN (never out)
+      so a crash stop can't strand the camera pulled back, faded out
+      entirely by `SPEED_ZOOM_LO`, i.e. it never overlaps the regime the
+      artifact lives in. The user's own pinch/wheel zoom and window
+      resizes are exempt too (their hand explains the motion).
+    - Unlike the user zoom, the speed zoom is not a preference: R-reset
+      calls `SpeedZoom::reset()`, which also forgets the last camera
+      position so the respawn teleport isn't credited as travel.
+    - The properties above are unit-tested in `src/camera.rs` (the screen-
+      flow checks evaluate the flow expression at `ξ = ±reach·R`, which
+      bounds every point in between by linearity — a check of the property,
+      not a sample of it).
 - **Touch controls**: the two HUD compass indicators are draggable **dials**
   (`Dial` struct) — drag direction from the dial centre = the flow's TOWARD
   direction (wind label still displays the mariners' FROM convention:

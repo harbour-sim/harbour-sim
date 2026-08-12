@@ -11,6 +11,7 @@
 //! space with the drawing/mouse coordinates. HUD sizes below are therefore
 //! written directly in css px.
 
+use camera::SpeedZoom;
 use harbour_sim_core::boat::BoatDesign;
 use harbour_sim_core::sim::{Env, InputState, PHYSICS_DT, Sim};
 use keel_editor::{EditorAction, EditorLayout, KeelEditor};
@@ -244,6 +245,12 @@ async fn main() {
     // a camera preference — it survives resets and respawns.
     let mut zoom = 1.0f32;
     let mut pinch: Option<(u64, u64, f32)> = None;
+    // Speed-adaptive camera distance on top of the user's zoom: the view
+    // eases back as the boat gathers way, rate-bounded so the scenery can
+    // never appear to run FORWARDS while it does (see src/camera.rs and
+    // docs/camera-speed-zoom.md). Unlike the user zoom this is not a
+    // preference — a fresh boat starts at the close-up.
+    let mut speed_zoom = SpeedZoom::new();
     // Camera pan: an OFFSET from the boat, in world metres (one-finger
     // drag on the water, or a mouse drag — mouse_claim 4). The camera
     // keeps FOLLOWING the boat while panned, displaced by this — watch
@@ -630,9 +637,12 @@ async fn main() {
                 // Helm and engine come back neutral with the fresh boat;
                 // the environment deliberately persists (same as always).
                 input = InputState::NEUTRAL;
-                // A fresh boat gets the camera back too (zoom persists),
-                // and the chase camera snaps rather than swooping over.
+                // A fresh boat gets the camera back too (user zoom
+                // persists; the speed zoom does not — and the respawn
+                // teleport must not be credited to it as travel), and the
+                // chase camera snaps rather than swooping over.
                 cam_offset = Vec2::ZERO;
+                speed_zoom.reset();
                 r3d.snap_to(cur_pos, cur_heading);
             }
             if do_open_editor {
@@ -665,11 +675,22 @@ async fn main() {
         let zoom_lo = (sw / ZOOM_OUT_MAX_W) / base_scale;
         let zoom_hi = (sw / ZOOM_IN_MIN_W) / base_scale;
         zoom = zoom.clamp(zoom_lo.min(1.0), zoom_hi.max(1.0));
-        let scale = base_scale * zoom;
+        // The scale at speed-zoom 1 — the view the USER has selected. The
+        // speed zoom widens it as the boat gathers way (see camera.rs).
+        let unit_scale = base_scale * zoom;
+        let unit_width = sw / unit_scale;
+        // The camera POSITION is resolved first, at the previous frame's
+        // width, so this frame's camera travel is known before the width
+        // is chosen — the no-reversal bound in camera.rs constrains ΔW
+        // against Δc over the SAME frame, and a lagged Δc would only
+        // bound it approximately. The width then moves by at most a few
+        // centimetres, which is all the world-rect margins below are
+        // stale by (against a 6 m pad, and re-clamped every frame).
+        let scale_prov = unit_scale / speed_zoom.mult();
         let (wl, wr) = (bmin.x - 6.0, bmax.x + 6.0);
         let (wb, wt) = (bmin.y - 6.0, bmax.y + 6.0);
-        let vis_hw = sw * 0.5 / scale;
-        let vis_hh = sh * 0.5 / scale;
+        let vis_hw_prov = sw * 0.5 / scale_prov;
+        let vis_hh_prov = sh * 0.5 / scale_prov;
         // Keep the pan target inside the world, so shoving the offset
         // against the edge racks up no invisible travel to undo later —
         // clamped as a POINT (boat + offset), then folded back into the
@@ -681,16 +702,28 @@ async fn main() {
         );
         // Follow the boat, displaced by the pan offset.
         let follow = pos + cam_offset;
-        let cam_x = if vis_hw * 2.0 >= wr - wl {
+        let cam_x = if vis_hw_prov * 2.0 >= wr - wl {
             (wl + wr) * 0.5
         } else {
-            follow.x.clamp(wl + vis_hw, wr - vis_hw)
+            follow.x.clamp(wl + vis_hw_prov, wr - vis_hw_prov)
         };
-        let cam_y = if vis_hh * 2.0 >= wt - wb {
+        let cam_y = if vis_hh_prov * 2.0 >= wt - wb {
             (wb + wt) * 0.5
         } else {
-            follow.y.clamp(wb + vis_hh, wt - vis_hh)
+            follow.y.clamp(wb + vis_hh_prov, wt - vis_hh_prov)
         };
+        // Speed-adaptive distance: fed the camera's REALIZED position, so
+        // the travel it spends is the real thing (world clamp and pan
+        // included), not the boat's velocity standing in for it.
+        let scale = unit_scale
+            / speed_zoom.update(
+                vec2(cam_x, cam_y),
+                vec2(sw, sh),
+                unit_width,
+                ZOOM_OUT_MAX_W,
+                sim.boat_vel().0.length(),
+                dt,
+            );
         last_scale = scale;
 
         // --- World (top-down render2d.rs / chase render3d.rs) -------------
