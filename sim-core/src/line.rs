@@ -257,21 +257,28 @@ impl Fairlead {
     }
 }
 
-/// What a line's shore end is belayed to. Only affects presentation and
-/// (later) scoring — physically both are a fixed point.
+/// What kind of fixed point ashore a line is belayed to. Presentation
+/// (and, later, scoring) only — physically both are the same thing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AnchorKind {
+pub enum ShoreKind {
     /// A cleat on a pontoon face.
     Cleat,
     /// One of the marina's mooring poles.
     Pole,
 }
 
-/// A fixed point ashore to belay to.
+/// Where a line's far end is made fast.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Anchor {
-    pub pos: Vec2,
-    pub kind: AnchorKind,
+pub enum Anchor {
+    /// A fixed point ashore: a pontoon cleat or a mooring pole.
+    Shore { pos: Vec2, kind: ShoreKind },
+    /// A fairlead on ANOTHER boat (2026-08-20): rafting up alongside, or
+    /// taking a line to your neighbour while you get sorted out. Unlike
+    /// a cleat this end MOVES, and the rope pulls on it just as hard as
+    /// it pulls on you — `step_lines` applies the equal and opposite
+    /// force at the far hull's own fairlead, so leaning on a neighbour's
+    /// rope drags the neighbour.
+    Boat { hull: Hull, fairlead: Fairlead },
 }
 
 /// A line's stage of life.
@@ -286,9 +293,21 @@ pub enum LineState {
     Fast,
 }
 
+/// Which hull a line is made fast to. The player's boat and every boat in
+/// the moored fleet lie to the same kind of rope, computed by the same
+/// code — the fleet's lines are not decoration.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hull {
+    Player,
+    /// Index into the moored fleet, in `moored_boats()` order.
+    Moored(u16),
+}
+
 /// One mooring line.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Line {
+    /// The hull this line is made fast to.
+    pub hull: Hull,
     /// Stable identity for the frontend to select and tend by. Ids are
     /// monotonic and NEVER recycled: a cast-off line's id must not come
     /// back and quietly re-target a command aimed at the old one (the
@@ -345,12 +364,13 @@ pub(crate) fn apply_command(
     cmd: LineCommand,
     pass_speed: f32,
     fairlead_world: impl Fn(Fairlead) -> Vec2,
+    anchor_world: impl Fn(Anchor) -> Vec2,
 ) {
     match cmd {
         LineCommand::MakeFast { fairlead, anchor } => {
             // The cap is on the PLAYER's ropes — the moored fleet's lines
             // share this set but are not the crew's to spend.
-            if lines.len() >= LINE_COUNT_MAX {
+            if lines.iter().filter(|l| l.hull == Hull::Player).count() >= LINE_COUNT_MAX {
                 return;
             }
             // One rope per fairlead. Doubling up is real seamanship, but
@@ -358,16 +378,27 @@ pub(crate) fn apply_command(
             // is almost always a fumbled gesture rather than an intent
             // (owner call, 2026-08-20) — and it would sit exactly on top
             // of the first, unselectable.
-            if lines.iter().any(|l| l.fairlead == fairlead) {
+            if lines.iter().any(|l| l.hull == Hull::Player && l.fairlead == fairlead) {
                 return;
             }
-            let dist = (anchor.pos - fairlead_world(fairlead)).length();
+            // Not to your own boat. A rope from one of her fairleads to
+            // another pulls at only one end (`anchor_of` has no second
+            // hull to push back on), so hauling it in would drive her
+            // along on her own bootstraps. The UI never offers it — the
+            // reachable set is shore fittings and OTHER hulls — but a
+            // command is input, and input is checked here for the same
+            // reason `tick` clamps a corrupt recording's throttle.
+            if matches!(anchor, Anchor::Boat { hull: Hull::Player, .. }) {
+                return;
+            }
+            let dist = (anchor_world(anchor) - fairlead_world(fairlead)).length();
             if dist > LINE_REACH_MAX {
                 return; // nobody can get a line that far
             }
             let id = *next_id;
             *next_id += 1;
             lines.push(Line {
+                hull: Hull::Player,
                 id,
                 fairlead,
                 anchor,
@@ -380,7 +411,9 @@ pub(crate) fn apply_command(
             });
         }
         LineCommand::Tend { id, rate } => {
-            if let Some(l) = lines.iter_mut().find(|l| l.id == id && l.is_fast()) {
+            if let Some(l) =
+                lines.iter_mut().find(|l| l.id == id && l.is_fast() && l.hull == Hull::Player)
+            {
                 let rate = rate.clamp(-1.0, 1.0);
                 if rate > 0.0 {
                     // Hauling in: what you can gather is what the line
@@ -394,7 +427,9 @@ pub(crate) fn apply_command(
                 }
             }
         }
-        LineCommand::CastOff { id } => lines.retain(|l| l.id != id),
+        LineCommand::CastOff { id } => {
+            lines.retain(|l| l.id != id || l.hull != Hull::Player);
+        }
     }
 }
 
@@ -405,6 +440,15 @@ pub(crate) fn apply_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Anchor resolver for these unit tests: everything here is belayed
+    /// ashore, so the far end never moves.
+    fn shore_at(a: Anchor) -> Vec2 {
+        match a {
+            Anchor::Shore { pos, .. } => pos,
+            Anchor::Boat { .. } => unreachable!("no fleet in these unit tests"),
+        }
+    }
 
     /// The two constants of the load–elongation curve are DERIVED from
     /// the two published anchor points, not asserted independently of
@@ -513,9 +557,10 @@ mod tests {
 
     fn fast_line(scope: f32, tension: f32) -> Vec<Line> {
         vec![Line {
+            hull: Hull::Player,
             id: 1,
             fairlead: Fairlead::PortBow,
-            anchor: Anchor { pos: Vec2::ZERO, kind: AnchorKind::Cleat },
+            anchor: Anchor::Shore { pos: Vec2::ZERO, kind: ShoreKind::Cleat },
             scope,
             state: LineState::Fast,
             tension,
@@ -537,6 +582,7 @@ mod tests {
             LineCommand::Tend { id: 1, rate: 1.0 },
             LINE_PASS_SPEED,
             |_| Vec2::new(10.0, 0.0),
+            shore_at,
         );
         let gathered = 10.0 - slack[0].scope;
         assert!((gathered - LINE_HAUL_RATE * PHYSICS_DT).abs() < 1e-6);
@@ -548,6 +594,7 @@ mod tests {
             LineCommand::Tend { id: 1, rate: 1.0 },
             LINE_PASS_SPEED,
             |_| Vec2::new(10.0, 0.0),
+            shore_at,
         );
         assert_eq!(loaded[0].scope, 10.0, "a fully loaded line should not come in");
     }
@@ -565,7 +612,8 @@ mod tests {
                 LineCommand::Tend { id: 1, rate: -1.0 },
                 LINE_PASS_SPEED,
                 |_| Vec2::new(10.0, 0.0),
-                );
+                shore_at,
+            );
         }
         assert_eq!(lines[0].scope, LINE_SCOPE_MAX);
     }
@@ -576,11 +624,11 @@ mod tests {
         let mut id = 0;
         let cmd = LineCommand::MakeFast {
             fairlead: Fairlead::PortBow,
-            anchor: Anchor { pos: Vec2::new(LINE_REACH_MAX + 1.0, 0.0),
-                kind: AnchorKind::Pole,
+            anchor: Anchor::Shore { pos: Vec2::new(LINE_REACH_MAX + 1.0, 0.0),
+                kind: ShoreKind::Pole,
             },
         };
-        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO);
+        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO, shore_at);
         assert!(lines.is_empty());
         assert_eq!(id, 0, "a refused order must not burn an id");
     }
@@ -594,9 +642,9 @@ mod tests {
         let mut id = 0;
         let cmd = LineCommand::MakeFast {
             fairlead: Fairlead::PortBow,
-            anchor: Anchor { pos: Vec2::new(5.0, 0.0), kind: AnchorKind::Cleat },
+            anchor: Anchor::Shore { pos: Vec2::new(5.0, 0.0), kind: ShoreKind::Cleat },
         };
-        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO);
+        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO, shore_at);
         let first = lines[0].id;
         crate::line::apply_command(
             &mut lines,
@@ -604,9 +652,44 @@ mod tests {
             LineCommand::CastOff { id: first },
             LINE_PASS_SPEED,
             |_| Vec2::ZERO,
+            shore_at,
         );
-        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO);
+        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO, shore_at);
         assert_ne!(lines[0].id, first);
+    }
+
+    /// A rope from one of her own fairleads to another pulls at only one
+    /// end, so hauling it in would drive her along on her own bootstraps.
+    /// The UI never offers such an anchor, but a command is input, and
+    /// input is where a corrupt recording gets checked (CodeRabbit
+    /// review, 2026-08-21).
+    #[test]
+    fn a_line_cannot_be_made_fast_to_your_own_boat() {
+        let mut lines = Vec::new();
+        let mut id = 0;
+        let cmd = LineCommand::MakeFast {
+            fairlead: Fairlead::PortBow,
+            anchor: Anchor::Boat { hull: Hull::Player, fairlead: Fairlead::StbdQuarter },
+        };
+        // Any anchor resolves 5 m off the bow here — near enough to
+        // reach, so only the hull check can refuse it.
+        let near = |_: Anchor| Vec2::new(5.0, 0.0);
+        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO, near);
+        assert!(lines.is_empty(), "she cannot haul on herself");
+        // A rope to the boat in the next berth is still fine.
+        let neighbour = LineCommand::MakeFast {
+            fairlead: Fairlead::PortBow,
+            anchor: Anchor::Boat { hull: Hull::Moored(0), fairlead: Fairlead::StbdQuarter },
+        };
+        crate::line::apply_command(
+            &mut lines,
+            &mut id,
+            neighbour,
+            LINE_PASS_SPEED,
+            |_| Vec2::ZERO,
+            near,
+        );
+        assert_eq!(lines.len(), 1, "a neighbour is a legal place to make fast");
     }
 
     #[test]
@@ -615,18 +698,18 @@ mod tests {
         let mut id = 0;
         let cmd = LineCommand::MakeFast {
             fairlead: Fairlead::PortBow,
-            anchor: Anchor { pos: Vec2::new(5.0, 0.0), kind: AnchorKind::Cleat },
+            anchor: Anchor::Shore { pos: Vec2::new(5.0, 0.0), kind: ShoreKind::Cleat },
         };
         for _ in 0..4 {
-            crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO);
+            crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO, shore_at);
         }
         assert_eq!(lines.len(), 1, "a fumbled second gesture must not double the line");
         // ...and a different handle is still free.
         let other = LineCommand::MakeFast {
             fairlead: Fairlead::StbdBow,
-            anchor: Anchor { pos: Vec2::new(5.0, 0.0), kind: AnchorKind::Cleat },
+            anchor: Anchor::Shore { pos: Vec2::new(5.0, 0.0), kind: ShoreKind::Cleat },
         };
-        crate::line::apply_command(&mut lines, &mut id, other, LINE_PASS_SPEED, |_| Vec2::ZERO);
+        crate::line::apply_command(&mut lines, &mut id, other, LINE_PASS_SPEED, |_| Vec2::ZERO, shore_at);
         assert_eq!(lines.len(), 2);
     }
 
@@ -639,9 +722,9 @@ mod tests {
         for f in Fairlead::ALL.iter().chain(Fairlead::ALL.iter()) {
             let cmd = LineCommand::MakeFast {
                 fairlead: *f,
-                anchor: Anchor { pos: Vec2::new(5.0, 0.0), kind: AnchorKind::Cleat },
+                anchor: Anchor::Shore { pos: Vec2::new(5.0, 0.0), kind: ShoreKind::Cleat },
             };
-            crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO);
+            crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO, shore_at);
         }
         assert_eq!(lines.len(), Fairlead::ALL.len().min(LINE_COUNT_MAX));
     }

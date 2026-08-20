@@ -40,7 +40,9 @@ RESET button returns the boat to its fairway start, engine to neutral,
 helm amidships.
 
 The LINES button opens mooring mode: six fairleads appear along the hull
-and every cleat or pole within throwing range is ringed. Drag from a fairlead
+and everything within throwing range is ringed — cleats along the
+pontoons, mooring poles, and the fairleads of any boat lying close
+enough to take a line (a rope to your neighbour hauls on her too). Drag from a fairlead
 to one of them — or tap the fairlead, then tap the anchor — and the crew
 passes the line, which takes a moment longer the further it has to go.
 Tap a rope already out to HAUL it in, let it SLACK, or CAST OFF. Hauling
