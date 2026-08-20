@@ -441,8 +441,8 @@ mod tests {
     /// time it sheds one.
     #[test]
     fn slipping_through_a_turn_churns_far_harder_than_running_straight() {
-        let straight = run(InputState { throttle: 1.0, rudder: 0.0 });
-        let turning = run(InputState { throttle: 1.0, rudder: 1.0 });
+        let straight = run(InputState { throttle: 1.0, rudder: 0.0, ..InputState::NEUTRAL });
+        let turning = run(InputState { throttle: 1.0, rudder: 1.0, ..InputState::NEUTRAL });
         assert!(
             turning.per_metre > straight.per_metre * 2.0,
             "turn should churn much harder per metre sailed: straight {:.2}, turning {:.2}",
@@ -463,7 +463,7 @@ mod tests {
     /// the race leaves its own aerated white water lying astern.
     #[test]
     fn running_straight_still_leaves_a_trail() {
-        let t = run(InputState { throttle: 1.0, rudder: 0.0 });
+        let t = run(InputState { throttle: 1.0, rudder: 0.0, ..InputState::NEUTRAL });
         assert!(t.churn > 1.0, "straight running should still shed some churn, got {:.2}", t.churn);
         assert!(t.prop, "the prop race should shed its own aerated churn");
     }

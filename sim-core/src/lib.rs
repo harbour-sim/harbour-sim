@@ -6,4 +6,5 @@
 
 pub mod boat;
 pub mod keel;
+pub mod line;
 pub mod sim;
