@@ -529,10 +529,8 @@ like Pegasus.
   - **`LINE_MBL`** = 34.6 kN: 1/2" three-strand nylon at 6400 lbf
     (Cordage Institute / ASTM D-4268 test methods) scaled by d² to the
     modeled 14 mm. A line exceeding it PARTS. **`LINE_DAMPING_RATIO`**
-    (0.05 of critical) is the one number here that is neither sourced nor
-    derived — same status as `HULL_FORM_FACTOR`, and flagged the same
-    way; most of a moored boat's damping is the water, which the hull
-    model already provides.
+    (0.20 of critical) is a calibration inside a sourced band rather than
+    a measured constant — see the snub-restitution bullet below.
   - **Lines are sim STATE, orders are input** — exactly the engine-spool
     split. `InputState::line` carries at most one `LineCommand` per tick
     (`MakeFast`/`Tend`/`CastOff`), which is all a pair of hands can issue
@@ -575,12 +573,97 @@ like Pegasus.
     (`CLEAT_SPACING`, half a berth width apart along both faces, so every
     berth has one at each end and one in the middle) and the mooring
     poles, both from sim-core's geometry functions.
+  - **What lets go is a fitting on the BOAT** (2026-08-20, owner: "what I
+    wanted simulated was a cleat tearing off a boat; shore cleats are
+    more robust than the ones on boats"). `weakest_link` walks a line's
+    load path — this boat's deck fitting, the rope, and whatever the far
+    end is made fast to — and the lowest of the three gives, with `Gave`
+    naming it so the HUD can say which. BoatUS Foundation's cleat testing
+    had cleat ASSEMBLIES failing between 1,190 and 7,500 lbf (5.3–33 kN),
+    and note what that tested: BOAT deck hardware bolted through a deck.
+    `DECK_FITTING_MBL` = 14 kN sits mid-band. It is NOT evidence about
+    pontoon cleats, which are commercial gear through-bolted to a float
+    frame, so `PONTOON_CLEAT_MBL` = 25 kN sits above any boat's fitting
+    and below the rope's 34.6 kN. **The ordering matters more than the
+    values**: deck fitting < shore cleat < rope, so what tears out is the
+    thing on the boat. A mooring POLE has no fitting at all — the line
+    goes round it — so there too the boat's own cleat is the limit. A
+    parted ROPE is therefore the rare case; the tie-break in
+    `weakest_link` puts this boat's fitting first, so a rope to another
+    boat with identical hardware blames the one doing the pulling.
+    Measured threshold (`measure_snap_threshold`): backing onto a 5 m
+    scope with slack out, she holds at a 3.2 kn arrival and tears the
+    fitting out at 3.8 — a genuinely bad arrival for 8.5 tonnes.
+    **Getting the ordering backwards was a real bug** (the first version
+    had the pontoon cleat weakest at 9 kN): the marina then destroyed
+    itself at the top of the wind dial, losing 63 harbour cleats to a
+    slammed wind reversal, because those breast lines sat at 87 % of a
+    9 kN limit before anything happened. With the ordering right the same
+    reversal peaks at 10.6 kN against 14 kN and costs nothing.
+  - **What the weather can do to the marina** (2026-08-20, re-measured
+    2026-08-21; `measure_resting_mooring_loads` and
+    `measure_mooring_loads`). At `WIND_MAX` (25 m/s) the fleet's
+    most-loaded ropes sit at a p90 of 7.8 kN — 56 % of the 14 kN deck
+    fitting that holds them — and a slammed SE→NW reversal peaks at
+    10.6 kN and costs nothing. The suddenness was never the issue: a
+    step from calm to 50 knots in one tick peaks at 4.8 kN. What made
+    the marina fragile was the FITTING ORDERING (see
+    `DECK_FITTING_MBL`), not the weather model. Two things worth
+    remembering from that investigation: a berth's breast lines carry
+    more than its crossed pole lines (p90 7.8 vs 6.9 kN at `WIND_MAX`)
+    because the pole lines meet a beam load at poor angles; and a wind
+    DIRECTION swept round has a resonance band at 6–8 s per revolution,
+    the mooring system's own period (12.4 kN at 6 s against 7.8 kN at
+    45 s), far more punishing than any step — so "smooth the dial" would
+    move a fast sweep toward the dangerous band, not away from it. Max
+    wind AND max current together still reach 14 kN, which is correct
+    (water is ~800× denser than air) and a marina nobody would have
+    built; `CURRENT_MAX` is the knob there, not the physics.
+  - **A torn-out fitting stays torn out** (2026-08-20). Without this the
+    punishment for a bad arrival was "throw the same line at the same
+    cleat again", which quietly undoes the consequence. `Sim.broken`
+    records each `Fitting` as it goes — `Fitting::Shore(pos)` for a
+    pontoon cleat, `Fitting::Deck(hull, fairlead)` for a deck fitting —
+    and `MakeFast` refuses either end if its fitting is gone. Identified
+    by POSITION rather than index because the marina's cleats are
+    generated geometry with no identity of their own. A parted ROPE
+    leaves both fittings intact; anything else takes one with it.
+    `new_continuing` carries the damage across (a keel change does not
+    repair the marina) — and PRUNES the fresh rigging to match, because
+    `build` re-rigs the fleet knowing nothing about it and a boat would
+    otherwise get its carried-away cleat back while the renderer still
+    drew the holes (CodeRabbit review, 2026-08-21;
+    `a_keel_change_does_not_re_rig_a_fitting_that_tore_out`). R-reset
+    builds a fresh `Sim` and everything is whole again, which is what
+    starting a run over should mean. The
+    renderer draws a carried-away cleat as the holes it left and a torn
+    fairlead as a crossed-out stub, and `reachable`/`nearest_fairlead`
+    stop offering them.
+  - **The damper must not out-pull the rope.** Damping force is bounded
+    by the elastic tension (`LINE_DAMP_FORCE_CAP`), which is the shape of
+    hysteretic damping — energy lost per cycle is a FRACTION of energy
+    stored — and fixes a measured artefact: because the load-elongation
+    curve is sub-linear its tangent stiffness is formally infinite at
+    zero strain, so a damper sized from that stiffness spiked at exactly
+    the moment of contact (1.6 kN of damping against 267 N of elastic
+    tension), felt as a snatch the rope should not give.
+  - **How springy the rope is, in one number.** `measure_snub_restitution`
+    (ignored harness) brings the boat up on a paid-out line at 2.5 kn and
+    reports how much of her way she gets back. The damping ratio is a
+    calibration inside the published 20–50 % hysteresis band for nylon,
+    not a measured constant: 0.05 returns 61 % of her kinetic energy,
+    0.10 48 %, 0.20 32 %, 0.35 20 %. Shipped at 0.20 — the damped end,
+    deliberately, because nothing here models the friction of a line
+    surging round a cleat and through a fairlead, which in life eats a
+    real share of a snatch.
   - **Gotcha (found in the first backing test)**: arriving on a short
-    line with real sternway SNATCHES — 1.5 kn onto a 5 m scope peaks near
-    17 kN, half the breaking load, and the boat rebounds forward off it
-    and goes slack again before settling. That bounce is the physics, not
-    an artefact, so line tests must check the ENVELOPE over a run (peak
-    tension, peak stretch) rather than sampling tension at one instant.
+    line with real sternway SNATCHES, and the boat rebounds forward off
+    it and goes slack again before settling, so line tests must check the
+    ENVELOPE over a run (peak tension, peak stretch) rather than sampling
+    at one instant. A second lesson from the same place (2026-08-20): a
+    snatch needs SPEED onto SLACK. Backing from rest on a taut line just
+    loads up to the thrust and holds — two tests were written with that
+    backwards and proved the opposite of what they claimed.
   - **Six fairleads, none on the centreline** (owner call, 2026-08-20):
     bow pair, waist pair, quarters. A stem-head or stern fairlead sits
     right between its own port and starboard pair, which makes the

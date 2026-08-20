@@ -89,15 +89,22 @@ pub const LINE_STRAIN_BREAK: f32 = 0.490;
 
 /// Internal damping, as a fraction of critical for the line/boat pair.
 ///
-/// This is the one number in the rope model that is neither sourced nor
-/// derived — the same status as `HULL_FORM_FACTOR` in sim.rs, and flagged
-/// the same way. Nylon's hysteresis (it warms up under cyclic load) is
-/// real damping, but no loss factor could be sourced, so this is a
-/// deliberately small fraction: enough to take the ring out of a snatch
-/// load, not enough to pretend the rope is a shock absorber. Most of a
-/// moored boat's damping is the WATER, and the hull model already
-/// provides that in full.
-const LINE_DAMPING_RATIO: f32 = 0.05;
+/// A calibration inside a sourced band rather than a measured constant,
+/// and worth being precise about which. Nylon rope's hysteresis — the
+/// reason it warms up under cyclic load — is commonly put at a 20–50 %
+/// energy loss per cycle, and the model's own snub benchmark spans that
+/// band: at 0.05 the rope gives back 61 % of the boat's kinetic energy,
+/// at 0.10 48 %, at 0.20 32 %, at 0.35 20 % (measured 2026-08-20, 2.5 kn
+/// onto an 8 m scope).
+///
+/// 0.20 is the DAMPED end of that band, chosen deliberately (owner
+/// report: "the ropes are too bouncy"). Two things justify sitting there
+/// rather than at the material's own figure: the whole rope is one
+/// Kelvin–Voigt element, and — the bigger omission — nothing here models
+/// the friction of a line surging round a cleat and through a fairlead,
+/// which in life eats a real share of a snatch. The remaining
+/// springiness is nylon behaving like nylon; it is supposed to give.
+const LINE_DAMPING_RATIO: f32 = 0.20;
 
 /// Strain at `dist` for a line of unstretched length `scope`. Negative
 /// (or zero) means slack.
@@ -125,22 +132,118 @@ pub fn line_stiffness(scope: f32, dist: f32) -> f32 {
     LINE_CURVE_P * line_tension(scope, dist) / (e * scope.max(1e-3))
 }
 
+/// Cap on the damping force, as a multiple of the elastic tension the
+/// line is carrying at that moment.
+///
+/// This is not a fudge, it is the shape of the physics: a rope's damping
+/// is HYSTERETIC — the energy lost per cycle is a fraction of the energy
+/// stored — so the damping force scales with the load and cannot run
+/// away from it. Without the cap the model produced a real artefact
+/// (measured 2026-08-20: 1.6 kN of damping against 267 N of elastic
+/// tension at the instant a line came up). The cause is that the
+/// load-elongation curve is sub-linear, so its TANGENT stiffness is
+/// formally infinite at zero strain, and a damper sized from that
+/// stiffness spikes at exactly the moment of first contact — which is
+/// felt as a snatch the rope should not give.
+const LINE_DAMP_FORCE_CAP: f32 = 1.0;
+
 /// Total pull (N) along the line: elastic tension plus the material's
 /// damping, given how fast it is being stretched (`stretch_rate` > 0 =
-/// lengthening) and the mass it works against. Clamped at zero, so
-/// damping can never turn a rope into a strut.
+/// lengthening) and the mass it works against. The damping term is
+/// bounded by the tension in both directions, so it can never turn a
+/// rope into a strut, nor kick as the rope takes up.
 pub fn line_pull(scope: f32, dist: f32, stretch_rate: f32, mass: f32) -> f32 {
     let t = line_tension(scope, dist);
     if t <= 0.0 {
         return 0.0;
     }
     let c = 2.0 * LINE_DAMPING_RATIO * (line_stiffness(scope, dist) * mass).sqrt();
-    (t + c * stretch_rate).max(0.0)
+    let damp = (c * stretch_rate).clamp(-t, t * LINE_DAMP_FORCE_CAP);
+    t + damp
 }
 
 // ---------------------------------------------------------------------------
 // Handling: where a line lands, how long it takes, how it is tended
 // ---------------------------------------------------------------------------
+
+// What the FITTINGS at each end of a line will take before they let go.
+//
+// A rope is rarely the weak link, and this is the mooring lesson people
+// learn the expensive way: a cleat pulls out of a deck, taking a chunk of
+// laminate with it, long before good nylon parts. BoatUS Foundation's
+// cleat testing had real cleat ASSEMBLIES failing between 1,190 and
+// 7,500 lbf (5.3–33 kN) — and note what was tested there: BOAT deck
+// hardware, bolted through a deck. `DECK_FITTING_MBL` sits mid-band, for
+// a backing-plated cleat on a 38-footer.
+//
+// SHORE hardware is the more robust end (owner call, 2026-08-20, and the
+// honest reading of the source above: it is not evidence about pontoon
+// cleats at all). A marina's cleat is commercial gear through-bolted to a
+// float frame and rated for the berth, so it is set above any boat's own
+// fitting and below the rope. The ordering is what matters more than the
+// value: deck fitting < shore cleat < rope, so what tears out is the
+// thing on the BOAT, which is what this models — and a mooring POLE has
+// no fitting at all, the line goes round it.
+//
+// The consequence that matters for feel: a snatch load that would
+// otherwise store enough energy to catapult the boat now tears the cleat
+// off the deck instead, which is exactly what it does in life.
+pub const DECK_FITTING_MBL: f32 = 14_000.0;
+pub const PONTOON_CLEAT_MBL: f32 = 25_000.0;
+
+/// What gave way when a line let go.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Gave {
+    /// The rope itself parted.
+    Rope,
+    /// The fairlead or cleat on this boat's own deck.
+    Fairlead,
+    /// The cleat on the pontoon.
+    Cleat,
+    /// The fitting on the boat at the other end.
+    Neighbour,
+}
+
+impl Gave {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Gave::Rope => "the line parted",
+            Gave::Fairlead => "the deck fitting tore out",
+            Gave::Cleat => "the pontoon cleat tore out",
+            Gave::Neighbour => "the fitting on her deck tore out",
+        }
+    }
+}
+
+/// A fitting that has been torn out. Identified by WHERE it was rather
+/// than by an index, because the marina's cleats are generated geometry
+/// with no identity of their own — the position they came from is the
+/// only stable name they have.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Fitting {
+    /// A cleat ashore, at this point.
+    Shore(Vec2),
+    /// A deck fitting on a hull.
+    Deck(Hull, Fairlead),
+}
+
+/// The weakest link in a line's load path, and what it is: the rope, the
+/// fitting on this boat, or whatever the far end is made fast to. Every
+/// line runs through this boat's own deck fitting, so that is always in
+/// the chain.
+pub fn weakest_link(anchor: Anchor) -> (f32, Gave) {
+    let far = match anchor {
+        // The line goes ROUND a pole; nothing to tear out of it.
+        Anchor::Shore { kind: ShoreKind::Pole, .. } => (LINE_MBL, Gave::Rope),
+        Anchor::Shore { kind: ShoreKind::Cleat, .. } => (PONTOON_CLEAT_MBL, Gave::Cleat),
+        Anchor::Boat { .. } => (DECK_FITTING_MBL, Gave::Neighbour),
+    };
+    let mine = (DECK_FITTING_MBL, Gave::Fairlead);
+    let rope = (LINE_MBL, Gave::Rope);
+    // Ours first, so a tie with an identical fitting at the far end
+    // blames this boat — we are the one loading it.
+    [mine, far, rope].into_iter().min_by(|a, b| a.0.total_cmp(&b.0)).expect("three links")
+}
 
 /// How far a line can be got ashore, metres. A heaving line goes further
 /// than this in real life; this is the game constraint that stops rope
@@ -334,6 +437,15 @@ impl Line {
         }
     }
 
+    /// Test helper: a shore anchor's world point.
+    #[cfg(test)]
+    pub fn anchor_pos_for_test(&self) -> Vec2 {
+        match self.anchor {
+            Anchor::Shore { pos, .. } => pos,
+            Anchor::Boat { .. } => unreachable!("shore anchors only in these tests"),
+        }
+    }
+
     pub fn is_fast(&self) -> bool {
         self.state == LineState::Fast
     }
@@ -356,6 +468,19 @@ pub enum LineCommand {
     CastOff { id: u32 },
 }
 
+/// The fitting an anchor depends on, if it has one — a pole has none.
+pub fn anchor_fitting(anchor: Anchor) -> Option<Fitting> {
+    match anchor {
+        Anchor::Shore { kind: ShoreKind::Pole, .. } => None,
+        Anchor::Shore { pos, kind: ShoreKind::Cleat } => Some(Fitting::Shore(pos)),
+        Anchor::Boat { hull, fairlead } => Some(Fitting::Deck(hull, fairlead)),
+    }
+}
+
+pub fn fitting_broken(broken: &[Fitting], f: Fitting) -> bool {
+    broken.contains(&f)
+}
+
 /// Apply one order to the line set. `boat` maps a fairlead to its world
 /// position, so this stays independent of how the caller stores the pose.
 pub(crate) fn apply_command(
@@ -363,6 +488,7 @@ pub(crate) fn apply_command(
     next_id: &mut u32,
     cmd: LineCommand,
     pass_speed: f32,
+    broken: &[Fitting],
     fairlead_world: impl Fn(Fairlead) -> Vec2,
     anchor_world: impl Fn(Anchor) -> Vec2,
 ) {
@@ -379,6 +505,14 @@ pub(crate) fn apply_command(
             // (owner call, 2026-08-20) — and it would sit exactly on top
             // of the first, unselectable.
             if lines.iter().any(|l| l.hull == Hull::Player && l.fairlead == fairlead) {
+                return;
+            }
+            // A fitting that has been torn out stays torn out: you
+            // cannot re-use the cleat you just pulled off the pontoon,
+            // nor your own deck fitting once it has gone.
+            if fitting_broken(broken, Fitting::Deck(Hull::Player, fairlead))
+                || anchor_fitting(anchor).is_some_and(|f| fitting_broken(broken, f))
+            {
                 return;
             }
             // Not to your own boat. A rope from one of her fairleads to
@@ -581,6 +715,7 @@ mod tests {
             &mut id,
             LineCommand::Tend { id: 1, rate: 1.0 },
             LINE_PASS_SPEED,
+            &[],
             |_| Vec2::new(10.0, 0.0),
             shore_at,
         );
@@ -593,6 +728,7 @@ mod tests {
             &mut id,
             LineCommand::Tend { id: 1, rate: 1.0 },
             LINE_PASS_SPEED,
+            &[],
             |_| Vec2::new(10.0, 0.0),
             shore_at,
         );
@@ -611,6 +747,7 @@ mod tests {
                 &mut id,
                 LineCommand::Tend { id: 1, rate: -1.0 },
                 LINE_PASS_SPEED,
+                &[],
                 |_| Vec2::new(10.0, 0.0),
                 shore_at,
             );
@@ -628,7 +765,7 @@ mod tests {
                 kind: ShoreKind::Pole,
             },
         };
-        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO, shore_at);
+        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, &[], |_| Vec2::ZERO, shore_at);
         assert!(lines.is_empty());
         assert_eq!(id, 0, "a refused order must not burn an id");
     }
@@ -644,17 +781,18 @@ mod tests {
             fairlead: Fairlead::PortBow,
             anchor: Anchor::Shore { pos: Vec2::new(5.0, 0.0), kind: ShoreKind::Cleat },
         };
-        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO, shore_at);
+        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, &[], |_| Vec2::ZERO, shore_at);
         let first = lines[0].id;
         crate::line::apply_command(
             &mut lines,
             &mut id,
             LineCommand::CastOff { id: first },
             LINE_PASS_SPEED,
+            &[],
             |_| Vec2::ZERO,
             shore_at,
         );
-        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO, shore_at);
+        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, &[], |_| Vec2::ZERO, shore_at);
         assert_ne!(lines[0].id, first);
     }
 
@@ -674,7 +812,7 @@ mod tests {
         // Any anchor resolves 5 m off the bow here — near enough to
         // reach, so only the hull check can refuse it.
         let near = |_: Anchor| Vec2::new(5.0, 0.0);
-        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO, near);
+        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, &[], |_| Vec2::ZERO, near);
         assert!(lines.is_empty(), "she cannot haul on herself");
         // A rope to the boat in the next berth is still fine.
         let neighbour = LineCommand::MakeFast {
@@ -686,6 +824,7 @@ mod tests {
             &mut id,
             neighbour,
             LINE_PASS_SPEED,
+            &[],
             |_| Vec2::ZERO,
             near,
         );
@@ -701,7 +840,7 @@ mod tests {
             anchor: Anchor::Shore { pos: Vec2::new(5.0, 0.0), kind: ShoreKind::Cleat },
         };
         for _ in 0..4 {
-            crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO, shore_at);
+            crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, &[], |_| Vec2::ZERO, shore_at);
         }
         assert_eq!(lines.len(), 1, "a fumbled second gesture must not double the line");
         // ...and a different handle is still free.
@@ -709,7 +848,7 @@ mod tests {
             fairlead: Fairlead::StbdBow,
             anchor: Anchor::Shore { pos: Vec2::new(5.0, 0.0), kind: ShoreKind::Cleat },
         };
-        crate::line::apply_command(&mut lines, &mut id, other, LINE_PASS_SPEED, |_| Vec2::ZERO, shore_at);
+        crate::line::apply_command(&mut lines, &mut id, other, LINE_PASS_SPEED, &[], |_| Vec2::ZERO, shore_at);
         assert_eq!(lines.len(), 2);
     }
 
@@ -724,7 +863,7 @@ mod tests {
                 fairlead: *f,
                 anchor: Anchor::Shore { pos: Vec2::new(5.0, 0.0), kind: ShoreKind::Cleat },
             };
-            crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, |_| Vec2::ZERO, shore_at);
+            crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, &[], |_| Vec2::ZERO, shore_at);
         }
         assert_eq!(lines.len(), Fairlead::ALL.len().min(LINE_COUNT_MAX));
     }

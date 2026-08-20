@@ -18,8 +18,8 @@
 //! and hands them to `Sim::tick` through `InputState`, one per tick.
 
 use harbour_sim_core::line::{
-    Anchor, Fairlead, Hull, Line, LineCommand, LineState, ShoreKind, LINE_COUNT_MAX, LINE_MBL,
-    LINE_REACH_MAX,
+    anchor_fitting, fitting_broken, Anchor, Fairlead, Fitting, Gave, Hull, Line, LineCommand,
+    LineState, ShoreKind, LINE_COUNT_MAX, LINE_MBL, LINE_REACH_MAX,
 };
 use macroquad::prelude::*;
 use std::collections::VecDeque;
@@ -148,6 +148,26 @@ impl MooringUi {
             return None;
         }
         Some(LineCommand::Tend { id, rate })
+    }
+
+    /// Report anything that let go this tick, with the cause sim-core
+    /// worked out — a rope that vanishes without explanation is exactly
+    /// the kind of silence the notes exist to prevent. Called once per
+    /// physics tick, and almost always with an empty slice.
+    pub fn report_failures(&mut self, failures: &[(u32, Hull, Gave)]) {
+        // The player's own ropes first — but a mooring parting on a
+        // berthed boat is worth hearing about too, because she is now
+        // lying to one rope fewer and it is very likely your fault.
+        if let Some((_, hull, gave)) = failures
+            .iter()
+            .find(|(_, h, _)| *h == Hull::Player)
+            .or_else(|| failures.first())
+        {
+            match hull {
+                Hull::Player => self.say(gave.describe()),
+                Hull::Moored(_) => self.say("a mooring gave way on the boat you leaned on"),
+            }
+        }
     }
 
     /// Forget stale selections once a line is gone (cast off, parted, or
@@ -368,6 +388,9 @@ pub struct Ctx<'a> {
     pub moored: &'a [(Vec2, f32)],
     pub anchors: &'a [Anchor],
     pub lines: &'a [Line],
+    /// Fittings torn out this run — no longer offered, and drawn as the
+    /// wreckage they are.
+    pub broken: &'a [Fitting],
     pub layout: MooringLayout,
 }
 
@@ -411,15 +434,31 @@ impl Ctx<'_> {
             .iter()
             .copied()
             .filter(|a| (self.anchor_pos(*a) - self.boat_pos).length() <= near)
+            .filter(|a| !self.fitting_gone(*a))
             .collect();
         for (i, (p, _)) in self.moored.iter().enumerate() {
             if (*p - self.boat_pos).length() > near {
                 continue;
             }
             let hull = Hull::Moored(i as u16);
-            v.extend(Fairlead::ALL.map(|fairlead| Anchor::Boat { hull, fairlead }));
+            v.extend(
+                Fairlead::ALL
+                    .map(|fairlead| Anchor::Boat { hull, fairlead })
+                    .into_iter()
+                    .filter(|a| !self.fitting_gone(*a)),
+            );
         }
         v
+    }
+
+    /// Has this anchor's fitting been torn out?
+    pub fn fitting_gone(&self, a: Anchor) -> bool {
+        anchor_fitting(a).is_some_and(|f| fitting_broken(self.broken, f))
+    }
+
+    /// Has one of OUR OWN deck fittings gone?
+    pub fn fairlead_gone(&self, f: Fairlead) -> bool {
+        fitting_broken(self.broken, Fitting::Deck(Hull::Player, f))
     }
 
     /// The player's own fairleads — what the handles and the reach test
@@ -432,6 +471,7 @@ impl Ctx<'_> {
 fn nearest_fairlead(p: Vec2, cx: &Ctx, r: f32) -> Option<(Fairlead, f32)> {
     Fairlead::ALL
         .iter()
+        .filter(|&&f| !cx.fairlead_gone(f))
         .map(|&f| (f, (cx.view.w2s(cx.fairlead_world(f)) - p).length()))
         .filter(|(_, d)| *d <= r)
         .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -498,6 +538,8 @@ const HANDLE: Color = Color::new(0.95, 0.93, 0.85, 0.9);
 const ARMED: Color = Color::new(1.0, 0.82, 0.30, 1.0);
 const TOO_FAR: Color = Color::new(1.0, 0.42, 0.36, 1.0);
 const REACH_RING: Color = Color::new(1.0, 0.82, 0.30, 0.22);
+/// A fitting that has been carried away.
+pub const TORN_OUT: Color = Color::new(0.85, 0.35, 0.30, 0.85);
 
 /// Points along a line from `a` to `b` carrying `slack` metres of extra
 /// rope. A taut line is the straight chord; a slack one bights out to the
@@ -627,6 +669,13 @@ pub fn draw_handles(ui: &MooringUi, cx: &Ctx) {
     }
     for &f in &Fairlead::ALL {
         let s = cx.view.w2s(cx.fairlead_world(f));
+        if cx.fairlead_gone(f) {
+            // Torn out: the hole is still there, the fitting is not.
+            let r = (0.3 * scale).max(4.0);
+            draw_circle_lines(s.x, s.y, r, 2.0, TORN_OUT);
+            draw_line(s.x - r, s.y - r, s.x + r, s.y + r, 2.0, TORN_OUT);
+            continue;
+        }
         let armed = ui.armed == Some(f);
         let r = if armed { (0.42 * scale).max(6.0) } else { (0.28 * scale).max(3.5) };
         draw_circle(s.x, s.y, r, if armed { ARMED } else { HANDLE });

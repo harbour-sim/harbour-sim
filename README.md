@@ -10,8 +10,11 @@ real close-quarters technique works: back and fill, kick the bow round with
 a burst of ahead power, feel the stern walk to port going astern. Mooring lines are in: lead a rope from any
 fairlead to a pontoon cleat or a mooring pole, and it is made fast at the
 length it lands at — then haul it in or surge it out to work the boat
-alongside. The ropes are elastic nylon, they only pull, they go visibly
-slack when you close on the cleat, and they can part if you snatch them.
+alongside. The ropes are elastic nylon, they only pull, and they go visibly
+slack when you close on the cleat. Snatch one hard and a fitting carries
+away — the cleat comes off your own deck long before good nylon parts,
+which is how it goes in life — and what tore out stays torn out for the
+rest of the run.
 A line made fast forward with the engine ahead against it springs the boat
 alongside, because the pull acts where the rope really is. Still to come:
 scenarios and scoring.
