@@ -19,7 +19,7 @@
 
 use harbour_sim_core::line::{
     Anchor, Fairlead, Hull, Line, LineCommand, LineState, ShoreKind, LINE_COUNT_MAX, LINE_MBL,
-    LINE_PASS_SPEED_MAX, LINE_PASS_SPEED_MIN, LINE_REACH_MAX,
+    LINE_REACH_MAX,
 };
 use macroquad::prelude::*;
 use std::collections::VecDeque;
@@ -60,8 +60,6 @@ pub struct MooringLayout {
     pub haul: Rect,
     pub slack: Rect,
     pub cast: Rect,
-    /// Track of the line-handling speed setting.
-    pub speed: Rect,
 }
 
 /// What a press currently owns. One at a time — you cannot haul a line
@@ -72,8 +70,6 @@ enum Grab {
     Pass(Fairlead, Vec2),
     /// Holding HAUL (+1) or SLACK (-1).
     Tend(f32),
-    /// Dragging the line-handling speed setting.
-    Speed,
 }
 
 pub struct MooringUi {
@@ -88,10 +84,6 @@ pub struct MooringUi {
     /// Where the current grab started, to tell a tap from a drag.
     press_at: Vec2,
     queue: VecDeque<LineCommand>,
-    /// Configuration: how fast the crew gets a line ashore (m/s of
-    /// connection distance). Rides the input stream — see
-    /// `InputState::line_pass_speed`.
-    pub pass_speed: f32,
     /// A short message and the time it fades at: why an order was
     /// refused, or what just happened to a rope. An order that silently
     /// does nothing is the worst kind — the reach limit in particular is
@@ -112,7 +104,7 @@ fn grab_radius(scale: f32) -> f32 {
 }
 
 impl MooringUi {
-    pub fn new(pass_speed: f32) -> MooringUi {
+    pub fn new() -> MooringUi {
         MooringUi {
             active: false,
             selected: None,
@@ -120,7 +112,6 @@ impl MooringUi {
             grab: None,
             press_at: Vec2::ZERO,
             queue: VecDeque::new(),
-            pass_speed,
             note: None,
             passing: Vec::new(),
         }
@@ -229,11 +220,6 @@ impl MooringUi {
                 return true;
             }
         }
-        if cx.layout.speed.contains(p) {
-            self.grab = Some(Grab::Speed);
-            self.set_speed(p, cx);
-            return true;
-        }
         let r = grab_radius(cx.view.scale);
         // An armed fairlead + a press on an anchor completes the pass —
         // the two-tap path, for anyone who would rather not drag.
@@ -292,7 +278,6 @@ impl MooringUi {
                     self.grab = None;
                 }
             }
-            Some(Grab::Speed) => self.set_speed(p, cx),
             None => {}
         }
     }
@@ -344,12 +329,6 @@ impl MooringUi {
         self.grab = None;
     }
 
-    fn set_speed(&mut self, p: Vec2, cx: &Ctx) {
-        let t = ((p.x - cx.layout.speed.x) / cx.layout.speed.w.max(1.0)).clamp(0.0, 1.0);
-        let raw = LINE_PASS_SPEED_MIN + t * (LINE_PASS_SPEED_MAX - LINE_PASS_SPEED_MIN);
-        self.pass_speed = (raw * 2.0).round() / 2.0; // 0.5 m/s steps
-    }
-
     /// The anchor under `p`, if it is one this fairlead could reach.
     fn anchor_near(&self, p: Vec2, f: Fairlead, cx: &Ctx) -> Option<Anchor> {
         self.anchor_under(p, f, cx, true)
@@ -373,10 +352,6 @@ impl MooringUi {
             .map(|(a, _)| a)
     }
 
-    /// 0..1 position of the speed setting on its track.
-    pub fn speed_frac(&self) -> f32 {
-        (self.pass_speed - LINE_PASS_SPEED_MIN) / (LINE_PASS_SPEED_MAX - LINE_PASS_SPEED_MIN)
-    }
 }
 
 /// Everything the mooring UI needs to know about the world this frame.

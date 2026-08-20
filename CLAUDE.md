@@ -192,6 +192,35 @@ already solves structurally, the same way Publish Pages does.
   line still going ashore). Turns gestures into `LineCommand`s and hands
   them to `tick` through `InputState` — it never touches physics. See
   Frontend conventions.
+- `src/settings.rs` — the **settings menu** (2026-08-20): an overlay for
+  the knobs that configure the game rather than sail the boat. Settings
+  do NOT live in the play HUD (owner call): the HUD's job is the boat,
+  and something you set once and forget has no business holding
+  permanent space on a phone screen. Follows the keel editor's overlay
+  pattern — freezes the game while open (input AND the physics tick),
+  which is what lets it reuse keys and take presses without fighting the
+  HUD's touch claims. Opened by the gear button (bottom row, left of
+  LINES) or **O**; closed by CLOSE, Escape, O again, or a tap on the
+  dimmed scrim. Adding a setting is a row in `ROWS` plus an arm in
+  both `value` and `value_mut` (`draw` reads through the former). Currently holds one: LINE HANDLING, the crew's
+  line-passing speed, which the frame loop feeds to
+  `InputState::line_pass_speed` (so it still rides the recorded input
+  stream — see Mooring lines).
+  **Gotcha (found live, 2026-08-20)**: the key press or button tap that
+  OPENS an overlay is still "pressed" when that overlay's own input runs
+  later in the same frame, so it closed itself instantly and the menu
+  never appeared. `SettingsMenu::open` sets a `just_opened` flag and the
+  first `update` returns without reading input at all. Any future
+  self-toggling overlay needs the same guard — the keel editor dodges it
+  only because E is handled in exactly one place.
+  **Gotcha (CodeRabbit review, 2026-08-21)**: the mouse and touch paths
+  share one `grab`, and `simulate_mouse_with_touch(false)` means the
+  mouse button reads permanently UP on a phone — so the mouse branch's
+  `else { grab = None }` fired every frame, ahead of the touch loop, and
+  the slider took the value under the tap and then ignored the drag.
+  The release is gated on `self.touch.is_none()`. The keel editor dodges
+  this by keeping `mouse_on_weight` and `weight_touch` separate; a
+  shared claim needs the gate.
 - `src/keel_editor.rs` — in-app editor for `BoatDesign`: drag a fixed-grid
   bar chart to paint the underwater area distribution, drag a displacement
   slider (4–14 t range bracketing the reference boats, 100 kg steps;
@@ -529,8 +558,9 @@ like Pegasus.
   - **Pass speed is a SETTING, not a constant of the world**
     (`InputState::line_pass_speed`, clamped 1–20 m/s in `tick` like
     throttle and rudder): a player knob for how much of the game is rope
-    work, carried in the input stream rather than on the `Sim` so a
-    recording replays with the crew speed it was made at.
+    work, set in the settings menu (`src/settings.rs`) and carried in the
+    input stream rather than on the `Sim`, so a recording replays with
+    the crew speed it was made at.
   - **Tending is force-limited one way and not the other.** Hauling in
     derates linearly to zero as the line's own tension approaches
     `LINE_HAUL_FORCE_MAX` (700 N, about what a person can hold), so you
@@ -1184,8 +1214,9 @@ like Pegasus.
   each frame, so shoving against the edge racks up no invisible travel,
   and a zero offset can never turn nonzero on its own (the boat is
   always inside the world). Pinch/wheel zoom leaves the offset alone.
-  A CENTER button (twin of the C key) appears left of LINES ONLY while
-  the offset is >0.5 m; C, CENTER, R-reset and editor Apply all zero it
+  A CENTER button (twin of the C key) appears left of the settings
+  gear ONLY while the offset is >0.5 m; C, CENTER, R-reset and editor
+  Apply all zero it
   (zoom persists throughout).
 - **Touch controls**: the two HUD compass indicators are draggable **dials**
   (`Dial` struct) — drag direction from the dial centre = the flow's TOWARD
@@ -1285,9 +1316,11 @@ like Pegasus.
     line still going ashore snakes out with its end running ahead of it.
     Cleats are drawn as studs on the pontoon faces from
     `cleat_positions()`, so a stud you can see is a stud you can reach.
-  - The PASS SPEED slider in the panel is the `line_pass_speed` setting
-    (see Mooring lines under Simulation model), and `hud_button` is the
-    shared plate/rim/label helper the whole bottom row now uses.
+  - The crew's line-passing speed is a SETTING and lives in the settings
+    menu (`src/settings.rs`), not in this panel — the mooring panel
+    carries only the controls you use while handling a rope.
+    `hud_button` is the shared plate/rim/label helper the whole bottom
+    row uses.
 - **Safe-area insets**: `index.html` resolves `env(safe-area-inset-*)` via a
   hidden probe element (+ folds the floating-toolbar height in via
   `visualViewport`) and pushes css px into the wasm export
@@ -1313,8 +1346,8 @@ like Pegasus.
   the water and under the land fills, jetties, moored boats, the ropes
   and the player's own hull.
 - Controls: touch/mouse = drag the dials/sliders + the bottom row's
-  RESET/KEEL/LINES buttons (+ CENTER while panned, leftmost of the
-  row), pinch = zoom, one-finger/mouse drag on the
+  RESET/KEEL/LINES buttons and settings gear (+ CENTER while panned,
+  leftmost of the row), pinch = zoom, one-finger/mouse drag on the
   water = pan, scroll wheel / +/- keys = zoom and C = centre (desktop
   twins);
   keyboard = **the boat has the primary keys** (agreed 2026-08-03: driving
@@ -1323,7 +1356,8 @@ like Pegasus.
   neutral (edge-triggered). Wind keeps ←/→ dir + ↑/↓ speed; current sits
   on the IJKL "second arrows" cluster (J/L dir, I/K speed) — which is why
   the keel editor moved from K to **E** (K = current speed down now).
-  **T** opens LINES mode (mooring lines — see above). R
+  **T** opens LINES mode (mooring lines — see above), **O** the settings
+  menu. R
   reset (reset = `respawn(&design)`, a fresh `Sim::new_with_design`,
   never an in-place teleport; env is kept but **helm/engine reset to
   `InputState::NEUTRAL`** — a fresh boat doesn't inherit a live

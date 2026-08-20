@@ -47,9 +47,9 @@ to one of them — or tap the fairlead, then tap the anchor — and the crew
 passes the line, which takes a moment longer the further it has to go.
 Tap a rope already out to HAUL it in, let it SLACK, or CAST OFF. Hauling
 only works while the line is light: a loaded rope will not come in by
-hand, which is what springs and the engine are for. PASS SPEED sets how
-quickly the crew works, if you would rather practise the boat handling
-than the rope work.
+hand, which is what springs and the engine are for. How quickly the crew works is a setting — the
+gear button (or O) opens the settings menu, where LINE HANDLING trades
+rope work for boat handling.
 
 **Keyboard**:
 
@@ -65,6 +65,7 @@ than the rope work.
 | + / - | Zoom in / out (also mouse wheel) |
 | C | Centre the camera back on the boat |
 | T | Mooring lines mode |
+| O | Settings menu |
 | R | Reset the boat to its fairway start |
 | E | Keel design editor |
 
