@@ -18,9 +18,11 @@ use harbour_sim_core::sim::{
 };
 use keel_editor::{EditorAction, EditorLayout, KeelEditor};
 use macroquad::prelude::*;
+use wake::Wake;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 mod keel_editor;
+mod wake;
 
 // DEFAULT zoom bounds for the fill-screen camera: never show more than
 // VIEW_MAX_W × VIEW_MAX_H metres, never fewer than VIEW_MIN_W metres across.
@@ -237,6 +239,8 @@ async fn main() {
     let mut input = InputState::NEUTRAL;
 
     let mut accum = 0.0f32;
+    // Cosmetic churned-water trail (src/wake.rs) — render-only state.
+    let mut wake = Wake::new();
     let (mut prev_pos, mut prev_heading) = sim.boat_pose();
     let (mut cur_pos, mut cur_heading) = (prev_pos, prev_heading);
 
@@ -603,6 +607,9 @@ async fn main() {
                 input = InputState::NEUTRAL;
                 // A fresh boat gets the camera back too (zoom persists).
                 cam_offset = Vec2::ZERO;
+                // ...and a clean slate of water: a surviving wake would
+                // draw a streak from wherever the boat was to the spawn.
+                wake.clear();
             }
             if do_open_editor {
                 editor.load_design(&design);
@@ -625,6 +632,11 @@ async fn main() {
                 (cur_pos, cur_heading) = sim.boat_pose();
                 accum -= PHYSICS_DT;
             }
+
+            // Cosmetic wake, advanced on the FRAME's dt (it is render
+            // state, not physics) and only while the sim is running —
+            // the editor freeze holds the water still too.
+            wake.update(dt, &sim, &design, &env);
         }
         // Physics is frozen while the keel editor is open — the displayed
         // pose just holds at whatever it last interpolated to.
@@ -705,6 +717,10 @@ async fn main() {
             let b = w2s(vec2(x + 1.4, y));
             draw_line(a.x, a.y, b.x, b.y, 1.5, Color::from_rgba(120, 170, 190, 26));
         }
+
+        // The boat's own churned-water trail, on the water with the
+        // ripples and under the land fills that cover the strays.
+        wake.draw(w2s, scale, visible);
 
         // --- Shore (Hinsholmen look: road side NW, wooded hill SE) --------
         // Deterministic scatter helper for trees: same hash idiom as the

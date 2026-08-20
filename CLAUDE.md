@@ -220,6 +220,50 @@ already solves structurally, the same way Publish Pages does.
   lever arm that turns sway force into yaw moment. When adjustable mass
   distribution lands (Roadmap), the marker must read the design instead
   of this constant.
+- `src/wake.rs` — the boat's **churned-water trail** (2026-08-20).
+  Cosmetic and frontend-only, like the ripples and the prop-wash
+  streaks: it READS `Sim` (`boat_pose`/`boat_vel`/`engine`) and the
+  active `BoatDesign` and feeds nothing back. A ring of `Eddy` patches
+  (position, imparted water motion, swirl, radius, birth strength,
+  aeration) shed from six sources — five stations spread over the
+  design's waterline plus the prop — advected, spread and faded each
+  frame. What makes it more than a particle effect is that the shed
+  strength at a station is the SAME strip quantity `tick` integrates
+  for cross-flow drag, `V(x) = v_lat + w·(x − com)`, squared: a hull
+  with a sideways component is a separated bluff body and churns far
+  harder than one running straight, which is exactly the behaviour
+  asked for and what
+  `slipping_through_a_turn_churns_far_harder_than_running_straight`
+  pins (per metre sailed AND per patch shed). Straight running still
+  sheds (boundary layer, `AXIAL_WEIGHT`, alternating quarters) and the
+  prop race sheds its own aerated white water (`Eddy::foam`) distinct
+  from the hull's smooth boil — the live slipstream streaks in
+  `main.rs` are what LEAVES the blade, these are what it leaves lying
+  on the water. **Everything is water-relative**: strengths come from
+  `boat_vel − current_vel` and every eddy is advected by the current
+  for its whole life, so a wake laid across a stream sets down-current
+  while it fades and a boat drifting WITH the current stirs nothing
+  (`shed_turbulence_is_carried_by_the_current`). Frozen with the sim
+  while the keel editor is open (the `update` call lives inside the
+  same `!editor.active` block as `sim.tick`); cleared by the R-reset
+  (a surviving trail would streak across the marina to the spawn), NOT
+  by the editor's Apply — that boat carries on from where it was.
+  **Gotcha (measured 2026-08-20, three passes at the look)**: a trail
+  of spreading translucent patches gets BRIGHTER with distance unless
+  the dilution exponent beats the overlap. Patch count over a point
+  goes as their radius (they line up along a track), so a `1/r`
+  dilution composites flat and a `1/r²` one tapers — the first pass
+  used neither and whited out into a solid cloud. Related: birth
+  strength drives spawn RATE and patch SIZE but deliberately NOT
+  opacity — coverage and texture are how turbulence actually reads on
+  water, and folding strength in a third time crushed the faint end
+  out of existence. Verified in headless Chromium (straight run, hard
+  turn, and a 2.5 m/s beam current) rather than assumed; the trail
+  costs ~25% of frame time under swiftshader's SOFTWARE rasteriser at
+  the `EDDY_CAP` worst case, all of it fill rate from the translucent
+  patches (skipping the swirl arcs on faint eddies measured as no
+  change at all) — negligible on any real GPU, but that is the knob if
+  it ever needs one.
 - `index.html` — web wrapper: boot guard (standalone script ahead of the
   bundle that paints script errors on screen), loading overlay,
   `__GIT_REVISION__` placeholder (deploy-time sed → wasm `?v=` cache-buster),
@@ -997,7 +1041,11 @@ like Pegasus.
   so they fade with the spool lag) and follow the deflected blade ahead /
   boil forward along the quarters astern; the rudder blade itself is drawn
   BEFORE the hull fill (root under the counter), swinging by the same
-  blade-angle formula sim-core uses.
+  blade-angle formula sim-core uses. The churned-water trail
+  (`src/wake.rs`, see Project structure) is the other render-side
+  reader of sim state: it draws right after the ripples, so it sits on
+  the water and under the land fills, jetties, moored boats and the
+  player's own hull.
 - Controls: touch/mouse = drag the dials/sliders + RESET/KEEL buttons
   (+ CENTER while panned), pinch = zoom, one-finger/mouse drag on the
   water = pan, scroll wheel / +/- keys = zoom and C = centre (desktop
