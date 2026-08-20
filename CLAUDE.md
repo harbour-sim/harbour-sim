@@ -131,7 +131,8 @@ already solves structurally, the same way Publish Pages does.
   any nondeterminism**; it uses `glam` (pinned to the version macroquad
   0.4.15 re-exports, so `Vec2` unifies across the boundary) + `rapier2d`.
   - `sim-core/src/sim.rs` — `Sim` (Rapier world: the marina's boundary
-    polyline, jetties, mooring poles and moored fleet, plus the boat),
+    polyline, jetties, mooring poles, the moored fleet — DYNAMIC bodies
+    on their own mooring lines since 2026-08-20 — plus the boat),
     `Env` (wind/current), all physics constants, harbour geometry
     constants, unit tests.
   - `sim-core/src/keel.rs` — `KeelProfile` (piecewise-linear underwater
@@ -168,8 +169,10 @@ already solves structurally, the same way Publish Pages does.
 - `src/main.rs` — macroquad frontend: input, fixed-timestep loop with render
   interpolation, top-down rendering (water/ripples, the Hinsholmen scenery —
   grass/tree road shore with quay apron NW, wooded rocky hill shore SE,
-  plank pontoons, mooring poles, moored boats with crossed stern lines out
-  to their pole pairs and breast lines to the jetty, rounded silt-ringed
+  plank pontoons, mooring poles, moored boats drawn at the LIVE poses
+  sim-core gives them, with their crossed stern lines and breast lines
+  drawn by the same rope path as the player's (they are the same
+  `Line`s), rounded silt-ringed
   bay head NE, open sea SW with a skerry chain at the world's edge — and
   the player's boat), HUD
   (wind/current dials, throttle/rudder sliders, SOG readout, key help),
@@ -538,10 +541,16 @@ like Pegasus.
   - **Fairleads are read off `HULL_PTS`** (the shoulder vertex, the
     waist, midway along the aft run — the outline's own half-beam at each
     station), so a fairlead is always exactly on the hull the renderer
-    draws and the collider uses. Anchors are the pontoon cleats
+    draws and the collider uses. Shore anchors are the pontoon cleats
     (`CLEAT_SPACING`, half a berth width apart along both faces, so every
     berth has one at each end and one in the middle) and the mooring
     poles, both from sim-core's geometry functions.
+  - **Gotcha (found in the first backing test)**: arriving on a short
+    line with real sternway SNATCHES — 1.5 kn onto a 5 m scope peaks near
+    17 kN, half the breaking load, and the boat rebounds forward off it
+    and goes slack again before settling. That bounce is the physics, not
+    an artefact, so line tests must check the ENVELOPE over a run (peak
+    tension, peak stretch) rather than sampling tension at one instant.
   - **Six fairleads, none on the centreline** (owner call, 2026-08-20):
     bow pair, waist pair, quarters. A stem-head or stern fairlead sits
     right between its own port and starboard pair, which makes the
@@ -553,6 +562,71 @@ like Pegasus.
     fumbled gesture, and it would sit exactly on top of the first where
     nothing could select it (`a_fairlead_carries_only_one_rope`). With
     six handles the count cap and the handle count now coincide.
+  - **A line can be made fast to another BOAT** (2026-08-20):
+    `Anchor::Boat { hull, fairlead }` alongside `Anchor::Shore`, so
+    rafting up — or taking a line to your neighbour while you get sorted
+    out — is a rope like any other. It pulls at BOTH ends: `step_lines`
+    applies the equal and opposite force at the far hull's own fairlead
+    and wakes her, because she is being hauled on rather than lying to
+    her own moorings. Pinned by a force balance against a no-rope control
+    (`a_line_to_a_neighbour_hauls_on_the_neighbour_too`): her own
+    moorings go from ~2 N lying quiet to a few hundred N with a rope on
+    her quarter. Measuring her DISPLACEMENT instead is a trap — the
+    marina shakes down onto its moorings over the first half-minute
+    either way, and that motion is far bigger than the effect.
+  - **The moored fleet lies to the same ropes** (2026-08-20, second
+    commit): every berthed boat is a DYNAMIC body with four real `Line`s
+    — two crossed to its pole pair, two breast lines to the pontoon face,
+    the rig of the reference photos — instead of a static collider with
+    renderer-only decoration. One `Line` type, one tension law, one
+    `tick`: `Hull::Player` / `Hull::Moored(i)` on each line says which
+    hull it pulls. So an occupied berth still stops you, but it GIVES
+    when you lean on it and its moorings put it back
+    (`an_occupied_berth_is_blocked_by_the_moored_boat` checks all three),
+    and the whole marina leans a little when the wind gets up. Their
+    lines are made fast at exactly the distance they span at rest, so the
+    marina starts snug with no slack and no invented pre-tension: any
+    movement in any direction lengthens at least one of a berth's four
+    ropes. The breast lines belay to the two studs STRADDLING the berth
+    centre — real stations from `cleat_point`, the one generator
+    `cleat_positions` also goes through, so a rope ends where a stud is
+    drawn (CodeRabbit review, 2026-08-21: they used to sit a free 1.3 m
+    either side of centre, about half a cleat spacing, so all 150 of
+    them finished on bare planking and a fitting torn out there was
+    recorded at a point no stud ever occupied;
+    `every_fleet_cleat_is_a_cleat_the_renderer_draws` pins it). Exact
+    float equality is why that is ONE generator and not two agreeing
+    formulas: a shore fitting is identified BY its position. What made
+    it fit was PHASING the cleat grid half a spacing off the pole
+    stations (`CLEAT_PHASE`), so each berth gets a pair 1.25 m either
+    side of its centre instead of one stud dead centre and one out at
+    the boundary where a pole already stands. That was not cosmetic
+    book-keeping: snapping to the boundary studs (±2.5 m) instead splays
+    the lines wider, meets a beam load at poorer angles, and turned a
+    max-wind reversal from costing nothing into tearing out 22 fittings;
+    putting both lines on one central stud drops the inboard yaw
+    restraint entirely. The phased grid leaves every measured mooring
+    load within noise of what the off-grid rig gave.
+  - **Sleep is what makes ~75 extra hulls affordable**, and it took some
+    care. Measured cost per `tick` (native release, full marina): 101 µs
+    with the old static fleet, 113 µs now — but **375 µs** in the version
+    where the fleet never slept, a 3.7× regression that would have shown
+    up on a phone. The fix is that a berthed boat settling on its ropes
+    is allowed to doze: the fleet's hull forces, its rope pulls, AND its
+    per-tick `reset_forces`/`reset_torques` all pass `wake_up: false`,
+    and `step_lines` skips a sleeping hull's ropes entirely.
+    **Gotcha**: `reset_forces(true)` was the one that kept the whole
+    marina awake — easy to miss, since it reads as bookkeeping rather
+    than as a force. The one thing sleep would otherwise break is that
+    wind and current are knobs the PLAYER turns, so `tick` compares `env`
+    against the previous tick's and wakes every moored body when it
+    changes (`a_change_of_wind_wakes_the_sleeping_fleet` pins it);
+    contact wakes a boat by itself, so nudging one still works.
+  - Fleet line ids live in their own range (`FLEET_LINE_ID_BASE`), so the
+    crew's ids stay 0, 1, 2… however many boats are berthed, and a
+    `CastOff` can never name one of the marina's own. `new_continuing`
+    transplants only the player's lines — `build` re-rigs the marina
+    from scratch, and its boats sit centimetres from where they were.
   - **Known simplification**: lines don't collide with anything — they
     pass through poles, jetties and moored hulls, with no friction round
     a turn and no catenary weight. Top-down 2D; documented on the module.
@@ -1195,8 +1269,12 @@ like Pegasus.
     attached.
   - **The tend buttons follow the SELECTION, never the status line**: a
     transient note must not make live controls vanish from under a thumb.
-  - **Drawing**: ropes are drawn whether or not the mode is open (once a
-    line is out it's part of the world), BEFORE the hull so the end tucks
+  - **Drawing**: `draw_ropes` draws EVERY rope in the marina, the
+    player's and the fleet's, through one path — they are the same thing,
+    so they are drawn by the same code (the fleet's just quieter, and
+    culled against the camera: a few hundred ropes exist and a berth or
+    two is ever on screen). Ropes are drawn whether or not the mode is
+    open (once a line is out it's part of the world), BEFORE the hull so the end tucks
     under the deck edge at its fairlead — the same ordering trick as the
     rudder blade. A slack line bights out to the side by the parabolic
     arc-length relation `h = sqrt(3*d*slack/8)`, so the bight grows the
@@ -1289,10 +1367,9 @@ like Pegasus.
   the abstraction once a second ship type actually needs to coexist with
   the first.
 - **Ropes**: DONE 2026-08-20 (see Mooring lines under Simulation model and
-  LINES mode under Frontend conventions). What the rope work leaves open:
-  the moored fleet's own lines are still renderer-only decoration on
-  static hulls (agreed follow-up: make them real `Line`s on dynamic
-  bodies, so the whole marina lies to its ropes); line MATERIAL is fixed
+  LINES mode under Frontend conventions), including the moored fleet —
+  the whole marina lies to real ropes on dynamic hulls. What the rope
+  work leaves open: line MATERIAL is fixed
   at 14 mm three-strand nylon (polyester would be a per-line choice, and
   the curve is already the only thing that would vary); and lines pass
   through poles, hulls and jetties without contact or friction (no turn

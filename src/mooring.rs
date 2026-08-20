@@ -18,7 +18,7 @@
 //! and hands them to `Sim::tick` through `InputState`, one per tick.
 
 use harbour_sim_core::line::{
-    Anchor, AnchorKind, Fairlead, Line, LineCommand, LineState, LINE_COUNT_MAX, LINE_MBL,
+    Anchor, Fairlead, Hull, Line, LineCommand, LineState, ShoreKind, LINE_COUNT_MAX, LINE_MBL,
     LINE_PASS_SPEED_MAX, LINE_PASS_SPEED_MIN, LINE_REACH_MAX,
 };
 use macroquad::prelude::*;
@@ -174,7 +174,7 @@ impl MooringUi {
         }
         self.passing.clear();
         self.passing
-            .extend(lines.iter().filter(|l| !l.is_fast()).map(|l| l.id));
+            .extend(lines.iter().filter(|l| l.hull == Hull::Player && !l.is_fast()).map(|l| l.id));
     }
 
     /// Leaving the mode drops whatever is in hand, mid-gesture.
@@ -330,10 +330,10 @@ impl MooringUi {
     /// refusal has a reason attached instead of nothing happening.
     fn order_pass(&mut self, fairlead: Fairlead, anchor: Anchor, cx: &Ctx) {
         let reach = (cx.anchor_pos(anchor) - cx.fairlead_world(fairlead)).length();
-        let mine = cx.lines.iter();
+        let mine = cx.lines.iter().filter(|l| l.hull == Hull::Player);
         if reach > LINE_REACH_MAX {
             self.say(&format!("too far to throw - {reach:.0} m, reach is {LINE_REACH_MAX:.0} m"));
-        } else if cx.lines.iter().any(|l| l.fairlead == fairlead) {
+        } else if cx.lines.iter().any(|l| l.hull == Hull::Player && l.fairlead == fairlead) {
             self.say(&format!("the {} already has a line on it", fairlead.label()));
         } else if mine.count() >= LINE_COUNT_MAX {
             self.say("no line left to spare - cast one off first");
@@ -387,33 +387,70 @@ pub struct Ctx<'a> {
     /// last physics tick.
     pub boat_pos: Vec2,
     pub boat_heading: f32,
+    /// The moored fleet's live poses, in sim-core order — the fleet lies
+    /// to real ropes, so its boats move, and their fairleads move with
+    /// them.
+    pub moored: &'a [(Vec2, f32)],
     pub anchors: &'a [Anchor],
     pub lines: &'a [Line],
     pub layout: MooringLayout,
 }
 
 impl Ctx<'_> {
-    /// Where an anchor is in the world.
-    pub fn anchor_pos(&self, a: Anchor) -> Vec2 {
-        a.pos
+    /// Pose of whichever hull a line is made fast to.
+    pub fn hull_pose(&self, hull: Hull) -> (Vec2, f32) {
+        match hull {
+            Hull::Player => (self.boat_pos, self.boat_heading),
+            Hull::Moored(i) => {
+                *self.moored.get(usize::from(i)).unwrap_or(&(self.boat_pos, self.boat_heading))
+            }
+        }
     }
 
-    /// World position of one of the boat's fairleads, at the pose the
-    /// player can actually see.
-    pub fn fairlead_world(&self, f: Fairlead) -> Vec2 {
+    pub fn fairlead_of(&self, hull: Hull, f: Fairlead) -> Vec2 {
+        let (pos, heading) = self.hull_pose(hull);
         let l = f.local();
-        let (c, s) = (self.boat_heading.cos(), self.boat_heading.sin());
-        self.boat_pos + vec2(l.x * c - l.y * s, l.x * s + l.y * c)
+        let (c, s) = (heading.cos(), heading.sin());
+        pos + vec2(l.x * c - l.y * s, l.x * s + l.y * c)
     }
 
-    /// Every anchor the crew could plausibly reach right now.
+    /// Where an anchor is in the world. A cleat or a pole is a fixed
+    /// point; a neighbour's fairlead moves with the neighbour.
+    pub fn anchor_pos(&self, a: Anchor) -> Vec2 {
+        match a {
+            Anchor::Shore { pos, .. } => pos,
+            Anchor::Boat { hull, fairlead } => self.fairlead_of(hull, fairlead),
+        }
+    }
+
+    /// Every anchor the crew could plausibly reach right now: the fixed
+    /// ones ashore, plus the fairleads of any boat lying close enough to
+    /// take a line (rafting up, or a line to your neighbour while you
+    /// get sorted out). The boat ones are generated per call rather than
+    /// held in a list because they MOVE — and only for hulls near
+    /// enough to matter, which is a handful at most.
     pub fn reachable(&self) -> Vec<Anchor> {
         let near = LINE_REACH_MAX + 14.0;
-        self.anchors
+        let mut v: Vec<Anchor> = self
+            .anchors
             .iter()
             .copied()
-            .filter(|a| (a.pos - self.boat_pos).length() <= near)
-            .collect()
+            .filter(|a| (self.anchor_pos(*a) - self.boat_pos).length() <= near)
+            .collect();
+        for (i, (p, _)) in self.moored.iter().enumerate() {
+            if (*p - self.boat_pos).length() > near {
+                continue;
+            }
+            let hull = Hull::Moored(i as u16);
+            v.extend(Fairlead::ALL.map(|fairlead| Anchor::Boat { hull, fairlead }));
+        }
+        v
+    }
+
+    /// The player's own fairleads — what the handles and the reach test
+    /// are about.
+    pub fn fairlead_world(&self, f: Fairlead) -> Vec2 {
+        self.fairlead_of(Hull::Player, f)
     }
 }
 
@@ -446,9 +483,9 @@ fn passing_slack(from: Vec2, to: Vec2, t: f32) -> f32 {
 /// a slack line is drawn bulging off to one side, so tapping the rope
 /// you can see missed it entirely (owner report, 2026-08-20).
 fn dist_to_rope(p: Vec2, l: &Line, cx: &Ctx) -> f32 {
-    let hull_pos = cx.boat_pos;
-    let from = cx.fairlead_world(l.fairlead);
-    let to = l.anchor.pos;
+    let (hull_pos, _) = cx.hull_pose(l.hull);
+    let from = cx.fairlead_of(l.hull, l.fairlead);
+    let to = cx.anchor_pos(l.anchor);
     let (a, b) = match l.state {
         LineState::Passing { .. } => (from, from + (to - from) * l.pass_progress()),
         LineState::Fast => (from, to),
@@ -466,6 +503,8 @@ fn dist_to_rope(p: Vec2, l: &Line, cx: &Ctx) -> f32 {
 fn nearest_line(p: Vec2, cx: &Ctx, r: f32) -> Option<(u32, f32)> {
     cx.lines
         .iter()
+        // The marina's own moorings are not the crew's to work.
+        .filter(|l| l.hull == Hull::Player)
         .map(|l| (l.id, dist_to_rope(p, l, cx)))
         .filter(|(_, d)| *d <= r)
         .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -478,6 +517,8 @@ fn nearest_line(p: Vec2, cx: &Ctx, r: f32) -> Option<(u32, f32)> {
 const ROPE: Color = Color::new(0.87, 0.85, 0.76, 0.95);
 const ROPE_SLACK: Color = Color::new(0.72, 0.71, 0.65, 0.85);
 const ROPE_LOADED: Color = Color::new(0.95, 0.55, 0.25, 1.0);
+/// The moored fleet's own ropes: the same model, drawn quieter.
+const FLEET_ROPE: Color = Color::new(0.78, 0.77, 0.72, 0.78);
 const HANDLE: Color = Color::new(0.95, 0.93, 0.85, 0.9);
 const ARMED: Color = Color::new(1.0, 0.82, 0.30, 1.0);
 const TOO_FAR: Color = Color::new(1.0, 0.42, 0.36, 1.0);
@@ -528,20 +569,27 @@ fn polyline(pts: &[Vec2], w2s: impl Fn(Vec2) -> Vec2, width: f32, col: Color) {
 ///
 /// `visible` culls against the camera: the marina carries a few hundred
 /// ropes and only a berth or two is ever on screen.
-pub fn draw_ropes(cx: &Ctx, selected: Option<u32>) {
+pub fn draw_ropes(cx: &Ctx, selected: Option<u32>, visible: impl Fn(Vec2, f32) -> bool) {
     let scale = cx.view.scale;
     let w2s = |p: Vec2| cx.view.w2s(p);
     for l in cx.lines {
-        let from = cx.fairlead_world(l.fairlead);
-        let to = l.anchor.pos;
-        let width = (0.11 * scale).max(1.6);
+        let (hull_pos, _) = cx.hull_pose(l.hull);
+        if !visible(hull_pos, 26.0) {
+            continue;
+        }
+        let mine = l.hull == Hull::Player;
+        let from = cx.fairlead_of(l.hull, l.fairlead);
+        let to = cx.anchor_pos(l.anchor);
+        // The fleet's ropes are the same physics but quieter on screen:
+        // they are scenery until you disturb one.
+        let width = if mine { (0.11 * scale).max(1.6) } else { (0.07 * scale).max(1.0) };
         match l.state {
             LineState::Passing { .. } => {
                 // Still going ashore: the rope snakes out toward the
                 // cleat, with the heaving line's end running ahead of it.
                 let t = l.pass_progress();
                 let tip = from + (to - from) * t;
-                let pts = rope_points(from, tip, (to - from).length() * t * 0.25, cx.boat_pos);
+                let pts = rope_points(from, tip, passing_slack(from, to, t), hull_pos);
                 polyline(&pts, w2s, width * 0.8, ROPE_SLACK);
                 let s = w2s(tip);
                 draw_circle(s.x, s.y, (0.25 * scale).max(2.5), ROPE);
@@ -550,17 +598,18 @@ pub fn draw_ropes(cx: &Ctx, selected: Option<u32>) {
                 let dist = (to - from).length();
                 let slack = (l.scope - dist).max(0.0);
                 let load = (l.tension / LINE_MBL).clamp(0.0, 1.0).powf(0.4);
+                let base = if mine { ROPE } else { FLEET_ROPE };
                 let col = if slack > 0.02 {
-                    ROPE_SLACK
+                    if mine { ROPE_SLACK } else { FLEET_ROPE }
                 } else {
                     Color::new(
-                        ROPE.r + (ROPE_LOADED.r - ROPE.r) * load,
-                        ROPE.g + (ROPE_LOADED.g - ROPE.g) * load,
-                        ROPE.b + (ROPE_LOADED.b - ROPE.b) * load,
-                        1.0,
+                        base.r + (ROPE_LOADED.r - base.r) * load,
+                        base.g + (ROPE_LOADED.g - base.g) * load,
+                        base.b + (ROPE_LOADED.b - base.b) * load,
+                        base.a,
                     )
                 };
-                let pts = rope_points(from, to, slack, cx.boat_pos);
+                let pts = rope_points(from, to, slack, hull_pos);
                 if selected == Some(l.id) {
                     polyline(&pts, w2s, width + 4.0, Color::new(0.4, 0.85, 1.0, 0.35));
                 }
@@ -581,17 +630,25 @@ pub fn draw_handles(ui: &MooringUi, cx: &Ctx) {
     // with the boat's own half-length folded in, so the ring appears for
     // everything a fairlead could actually make.
     for a in cx.reachable() {
-        if !Fairlead::ALL.iter().any(|&f| (a.pos - cx.fairlead_world(f)).length() <= LINE_REACH_MAX)
-        {
+        let at = cx.anchor_pos(a);
+        if !Fairlead::ALL.iter().any(|&f| (at - cx.fairlead_world(f)).length() <= LINE_REACH_MAX) {
             continue;
         }
-        let s = cx.view.w2s(a.pos);
+        let s = cx.view.w2s(at);
         let r = (0.9 * scale).max(7.0);
-        let col = match a.kind {
-            AnchorKind::Cleat => Color::new(0.95, 0.93, 0.85, 0.55),
-            AnchorKind::Pole => Color::new(1.0, 0.85, 0.55, 0.55),
-        };
-        draw_circle_lines(s.x, s.y, r, 2.0, col);
+        match a {
+            Anchor::Shore { kind: ShoreKind::Cleat, .. } => {
+                draw_circle_lines(s.x, s.y, r, 2.0, Color::new(0.95, 0.93, 0.85, 0.55))
+            }
+            Anchor::Shore { kind: ShoreKind::Pole, .. } => {
+                draw_circle_lines(s.x, s.y, r, 2.0, Color::new(1.0, 0.85, 0.55, 0.55))
+            }
+            // A neighbour's own fairlead: a legal place to make fast, and
+            // marked differently because taking a line to her drags HER.
+            Anchor::Boat { .. } => {
+                draw_circle_lines(s.x, s.y, r * 0.8, 2.0, Color::new(0.62, 0.86, 1.0, 0.6))
+            }
+        }
     }
     for &f in &Fairlead::ALL {
         let s = cx.view.w2s(cx.fairlead_world(f));

@@ -17,7 +17,8 @@
 use crate::boat::{BoatDesign, RudderDesign};
 use crate::keel::{flat_plate_cd, KeelDerived, KeelProfile};
 use crate::line::{
-    line_pull, Fairlead, Line, LineCommand, LineState, LINE_MBL, LINE_PASS_SPEED, LINE_PASS_SPEED_MAX,
+    line_pull, Anchor, Fairlead, Hull, Line, LineCommand, LineState, ShoreKind, LINE_MBL,
+    LINE_PASS_SPEED, LINE_PASS_SPEED_MAX,
     LINE_PASS_SPEED_MIN, LINE_REACH_MAX, LINE_SCOPE_MAX, LINE_SCOPE_MIN,
 };
 use glam::Vec2;
@@ -930,7 +931,7 @@ fn wave_resistance_coefficient(froude: f32) -> f32 {
 
 // Sway and yaw keep a linear low-speed term (surge no longer has one — see
 // below) because their quadratic terms are keel-profile-derived
-// (`self.keel.drag_area`, `self.keel.drag_cubic_moment`), so a flat linear floor
+// (`self.hull.keel.drag_area`, `self.hull.keel.drag_cubic_moment`), so a flat linear floor
 // would silently fall out of proportion for any profile far from the one
 // it was tuned against (an extreme fin keel would keep a full keel's
 // low-speed damping; an extreme full keel would keep a fin keel's).
@@ -1219,6 +1220,192 @@ impl InputState {
 // Sim
 // ---------------------------------------------------------------------------
 
+/// The world point of a shore anchor. The fleet's rigging is
+/// shore-anchored by construction, so this is all its build step needs;
+/// a line whose far end is another BOAT is resolved in `step_lines`,
+/// against that hull's frame for the tick.
+fn shore_pos(a: Anchor) -> Vec2 {
+    match a {
+        Anchor::Shore { pos, .. } => pos,
+        Anchor::Boat { .. } => unreachable!("the marina's own moorings are all ashore"),
+    }
+}
+
+/// Where the moored fleet's line ids start. Their own range, so the
+/// crew's ids stay small and stable whatever the marina is doing — and so
+/// a `CastOff` aimed at a player line can never name one of theirs.
+const FLEET_LINE_ID_BASE: u32 = 1_000_000;
+
+/// Everything the hull-force model needs to know about a boat's shape,
+/// derived once at construction. One set per hull KIND: the player's,
+/// from the active `BoatDesign`, and the moored fleet's, from the default
+/// one — every boat in the marina is pushed around by the same code.
+#[derive(Clone, Copy)]
+struct HullCoeffs {
+    /// Underwater lateral-area moments (area, CLR lever arm, yaw damping
+    /// integral), derived from a `KeelProfile`.
+    keel: KeelDerived,
+    /// Wetted surface area (m²), integrated from `HULL_PTS` + the keel
+    /// profile — see `wetted_surface_area`. Feeds the ITTC-1957 axial
+    /// friction term.
+    wetted: f32,
+    /// WATERLINE length (m), from the keel profile's nonzero support
+    /// (`waterline_extent`) — the hydrodynamic length Reynolds number,
+    /// Froude number and hull speed are defined against.
+    length: f32,
+    /// Attached-flow (lifting) lateral coefficients — see
+    /// `attached_flow_coeffs`. Ahead only.
+    att_flow: AttachedFlow,
+}
+
+impl HullCoeffs {
+    fn of(design: &BoatDesign) -> HullCoeffs {
+        let (wl_aft, wl_fwd) = waterline_extent(&design.keel);
+        HullCoeffs {
+            keel: design.keel.derive(),
+            wetted: wetted_surface_area(&design.keel, &design.rudder),
+            length: wl_fwd - wl_aft,
+            att_flow: attached_flow_coeffs(&design.keel, hull_com_x()),
+        }
+    }
+}
+
+/// Unpack a hull's kinematic state for this tick, including its velocity
+/// relative to the water. Cheap and force-free, so it can be done even
+/// for a boat asleep on its moorings.
+fn hull_frame(rb: &RigidBody, env: &Env) -> BoatFrame {
+
+    let rot = *rb.rotation();
+    let fwd = Vec2::new(rot.re, rot.im); // bow direction (local +x)
+    let side = Vec2::new(-rot.im, rot.re); // port direction (local +y)
+    let pos = Vec2::new(rb.translation().x, rb.translation().y);
+    let v = Vec2::new(rb.linvel().x, rb.linvel().y);
+    let w = rb.angvel();
+    let mass = rb.mass();
+
+    let vr = v - env.current_vel();
+    let surge = vr.dot(fwd);
+    let sway = vr.dot(side);
+    BoatFrame { pos, fwd, side, v, w, mass, surge, sway }
+}
+
+/// Every force a floating hull feels from the water and the air: drag,
+/// the rotation-induced side force, attached flow, and windage. Shared by
+/// the player's boat and by every boat in the moored fleet — one model,
+/// so a berthed boat lies to its ropes for the same reasons the player's
+/// does. Propulsion and steering are the player's alone and stay in
+/// `tick`. `wake` is false for the fleet: a boat settling on its ropes
+/// must be allowed to fall asleep (see the wake block in `tick`).
+fn apply_hull_forces(
+    rb: &mut RigidBody,
+    env: &Env,
+    c: &HullCoeffs,
+    f: &BoatFrame,
+    wake: bool,
+) {
+    // Drag is on motion RELATIVE TO THE WATER (`surge`/`sway`, already
+    // unpacked by `hull_frame`): a uniform current is just "the water
+    // moves", so the same formula both damps the boat and carries it
+    // along. Quadratic in relative speed, split into surge (easy) and
+    // sway (hard) components.
+    let BoatFrame { pos, fwd, side, v, w, mass, surge, sway } = *f;
+    // Axial (surge) resistance: ITTC-1957 skin friction over the actual
+    // wetted surface, not a bluff-body Cd over frontal area — see the
+    // block comment above `NU_WATER`. No fore/aft asymmetry: friction
+    // depends on wetted area and speed, not on which end leads (unlike
+    // the windage below, this hull doesn't have a flat transom to
+    // separate flow off — HULL_PTS tapers to a point at both ends).
+    // No added low-speed linear term either — but for the right
+    // reason (maintainer review caught the first version of this
+    // comment stating the mechanism BACKWARDS): Cf actually RISES
+    // slowly as Re falls (~1/log²Re — 0.003 at Re 10⁷, 0.008 at the
+    // 10⁵ floor). The FORCE still converges cleanly to zero at rest
+    // because the u² factor below collapses far faster than Cf's
+    // logarithmic growth, and below ITTC_RE_FLOOR Cf is capped
+    // anyway. It's the product that vanishes, not the coefficient.
+    let re = surge.abs() * c.length / NU_WATER;
+    let cf = ittc57_cf(re) * HULL_FORM_FACTOR;
+    let f_friction = 0.5 * RHO_WATER * cf * c.wetted * surge * surge.abs();
+    // Wave-making resistance — see the block comment above
+    // `wave_resistance_coefficient` for the derivation (approximate,
+    // generically calibrated, not hull-form-fitted; negligible here at
+    // 1-3 kn, Fn~0.05-0.15, so this doesn't disturb the friction fix's
+    // own benchmark).
+    let froude = surge.abs() / (G_EARTH * c.length).sqrt();
+    let f_wave = mass * G_EARTH * wave_resistance_coefficient(froude) * surge.signum();
+    let f_surge = -fwd * (f_friction + f_wave);
+    let f_sway = -side
+        * (0.5 * RHO_WATER * c.keel.drag_area * sway * sway.abs()
+            + k_lin_sway(c.keel.drag_area) * sway);
+    // Surge drag acts through the centre; the lateral force acts at the
+    // keel profile's DRAG-WEIGHTED centre of lateral resistance (see
+    // keel.rs's `drag_clr_offset` — pulled toward whichever end carries
+    // more flat-plate keel material, not just where the raw area sits)
+    // — aft-of-centre for a typical skeg/rudder boat => weathervaning.
+    rb.add_force(vector![f_surge.x, f_surge.y], wake);
+    let clr = pos + fwd * c.keel.drag_clr_offset;
+    rb.add_force_at_point(vector![f_sway.x, f_sway.y], point![clr.x, clr.y], wake);
+
+    // Yaw drag: the same lateral-area profile, but its Cd-weighted
+    // cubic moment — the water resists the hull sweeping around its
+    // own axis more than it resists straight sway, because points far
+    // from the pivot move faster during rotation and drag is quadratic
+    // in speed.
+    let c_yaw_q = yaw_damping_coefficient(c.keel.drag_cubic_moment);
+    rb.add_torque(-(c_yaw_q * w * w.abs() + k_lin_yaw(c_yaw_q) * w), wake);
+
+    // Rotation-induced SIDE FORCE (the torque above's inseparable twin):
+    // the strips resisting the spin don't pull symmetrically when the
+    // (Cd-weighted) area is biased fore/aft. A strip at position x
+    // sweeps sideways at w·x, so its drag is ∝ cd(x)·a(x)·(w·x)|w·x|;
+    // summed along the hull the net sway force is
+    // -0.5·ρ·w|w|·∫cd(x)·a(x)·x|x|dx (the profile's signed
+    // drag_swept_moment — no separate Cd factor, already folded in per
+    // station, see keel.rs). For an aft-biased keel spun clockwise the
+    // stern out-drags the bow and shoves the boat to starboard, which
+    // is what puts the effective centre of rotation aft of the centre
+    // of mass. Applied through the centre (the couple component is
+    // already the torque above); sway↔yaw cross terms are neglected,
+    // consistent with the sway/yaw drag split.
+    let f_spin = -side * (0.5 * RHO_WATER * w * w.abs() * c.keel.drag_swept_moment);
+    rb.add_force(vector![f_spin.x, f_spin.y], wake);
+
+    // Attached-flow (lifting) lateral force + moment — the OTHER half
+    // of the strip model the three drag terms above belong to; see the
+    // block comment at `AttachedFlow`. Making way AHEAD only — see the
+    // validity-domain note on that struct for why sternway stays on
+    // the separated (drag) half alone. The leading (bow) boundary
+    // enters with m_a = 0 (undisturbed water ahead of the boat
+    // carries no body-imposed momentum), so only the Kutta-cut
+    // boundary survives in the boundary term. Scales with u·V:
+    // identically zero at rest, in pure sway, and in pure yaw — those
+    // regimes belong to the separated (drag) half above.
+    if surge > 0.0 {
+        let p = &c.att_flow;
+        let v_cut = sway + w * p.chi_cut;
+        let y_att = -surge * p.ma_cut * v_cut;
+        let n_att =
+            -surge * p.chi_cut * p.ma_cut * v_cut - surge * (sway * p.j0 + w * p.j1);
+        let f_att = side * y_att;
+        rb.add_force(vector![f_att.x, f_att.y], wake);
+        rb.add_torque(n_att, wake);
+    }
+
+    // --- Wind load: air moving relative to the hull/superstructure.
+    let ar = env.wind_vel() - v;
+    let a_ax = ar.dot(fwd);
+    let a_lat = ar.dot(side);
+    // a_ax > 0: relative wind moves toward the bow, i.e. it's blowing
+    // FROM astern (a following wind) => the stern meets it first.
+    let cd_air_ax = if a_ax > 0.0 { CD_AIR_STERN } else { CD_AIR_BOW };
+    let f_wax = fwd * (0.5 * RHO_AIR * cd_air_ax * WIND_AREA_FRONT * a_ax * a_ax.abs());
+    let f_wlat = side * (0.5 * RHO_AIR * CD_AIR_LAT * WIND_AREA_LAT * a_lat * a_lat.abs());
+    rb.add_force(vector![f_wax.x, f_wax.y], wake);
+    // Lateral windage centre sits forward => the bow falls off downwind.
+    let wc = pos + fwd * WIND_CENTER_OFFSET;
+    rb.add_force_at_point(vector![f_wlat.x, f_wlat.y], point![wc.x, wc.y], wake);
+}
+
 /// The boat's kinematic state for one tick, as `tick` has already
 /// unpacked it — passed on to `step_lines` so the line code doesn't have
 /// to re-derive the frame (or re-borrow the body) to find its fairleads.
@@ -1232,6 +1419,10 @@ struct BoatFrame {
     v: Vec2,
     w: f32,
     mass: f32,
+    /// Velocity components RELATIVE TO THE WATER, along the bow and port
+    /// axes — unpacked once, reused by the propeller and the rudder.
+    surge: f32,
+    sway: f32,
 }
 
 pub struct Sim {
@@ -1248,25 +1439,20 @@ pub struct Sim {
     integration_params: IntegrationParameters,
     gravity: Vector<f32>,
     boat: RigidBodyHandle,
-    /// Underwater lateral-area moments (area, CLR lever arm, yaw damping
-    /// integral), derived once from a `KeelProfile` at construction.
-    keel: KeelDerived,
-    /// Wetted surface area (m²), integrated once from `HULL_PTS` + the
-    /// keel profile at construction — see `wetted_surface_area`. Feeds the
-    /// ITTC-1957 axial friction term in `tick`.
-    wetted_surface: f32,
-    /// The design's WATERLINE length (m), from the keel profile's nonzero
-    /// support at construction (`waterline_extent`) — the hydrodynamic
-    /// length that Reynolds number, Froude number and hull speed are
-    /// defined against. Per-design since 2026-08-04: an HR 38's 9.5 m
-    /// waterline and an O'Day's 10.2 m now motor like different boats
-    /// (hull speed scales with √LWL), where previously every design ran
-    /// on the shared 11.9 m outline length.
-    hull_length: f32,
-    /// Attached-flow (lifting) lateral coefficients — integrated once from
-    /// the keel profile at construction, see `attached_flow_coeffs` and the
-    /// block comment above it. Ahead only (see ibid.).
-    att_flow: AttachedFlow,
+    /// This boat's hydrodynamic coefficients, derived once at
+    /// construction — see `HullCoeffs`.
+    hull: HullCoeffs,
+    /// The moored fleet's, ditto (the default design's).
+    fleet_hull: HullCoeffs,
+    /// The moored fleet's bodies, in `moored_boats()` order — DYNAMIC
+    /// since 2026-08-20: the marina's boats lie to real ropes, so they
+    /// have to be able to move on them.
+    moored: Vec<RigidBodyHandle>,
+    /// Scratch: the fleet's unpacked frames for this tick, refilled at
+    /// the top of every `tick` so the mooring lines can find a fairlead
+    /// without re-reading each body. A field rather than a local so the
+    /// allocation happens once, at construction.
+    frames: Vec<BoatFrame>,
     /// The active design's rudder blade, in the derived form `tick` needs
     /// (position, area, effective AR, post-stall ceiling) — see
     /// `RudderFoil` and `RudderDesign` in boat.rs.
@@ -1281,6 +1467,9 @@ pub struct Sim {
     lines: Vec<Line>,
     /// Next line id. Monotonic, never recycled — see `Line::id`.
     next_line_id: u32,
+    /// The environment the last tick ran with, so a change to it can wake
+    /// the sleeping fleet — see the wake block in `tick`.
+    last_env: Env,
     /// Ticks advanced since spawn.
     pub ticks: u64,
 }
@@ -1326,9 +1515,12 @@ impl Sim {
         let (vel, angvel) = self.boat_vel();
         let engine = self.engine;
         let mut sim = Self::build(design, true);
-        // Lines come across too: opening the keel editor while lying to
-        // your ropes must not quietly cast them all off.
-        sim.lines.clone_from(&self.lines);
+        // The crew's lines come across: opening the keel editor while
+        // lying to your ropes must not quietly cast them all off. The
+        // FLEET's rigging is not transplanted — `build` has just rigged
+        // the marina fresh, and its boats sit centimetres from where they
+        // were, so re-tying them is invisible.
+        sim.lines.extend(self.lines.iter().filter(|l| l.hull == Hull::Player));
         sim.next_line_id = self.next_line_id;
         {
             let rb = &mut sim.bodies[sim.boat];
@@ -1357,11 +1549,12 @@ impl Sim {
     }
 
     fn build(design: &BoatDesign, with_harbour: bool) -> Sim {
-        let keel = design.keel.derive();
-        let wetted_surface = wetted_surface_area(&design.keel, &design.rudder);
-        let (wl_aft, wl_fwd) = waterline_extent(&design.keel);
-        let hull_length = wl_fwd - wl_aft;
-        let att_flow = attached_flow_coeffs(&design.keel, hull_com_x());
+        let hull = HullCoeffs::of(design);
+        // The moored fleet are generic 38-footers, not copies of whatever
+        // the player is currently sailing: their coefficients come from
+        // the default design and stay put when the keel editor changes
+        // the player's.
+        let fleet_hull = HullCoeffs::of(&BoatDesign::hallberg_rassy_38());
         let rudder = RudderFoil::from(&design.rudder);
         let mut bodies = RigidBodySet::new();
         let mut colliders = ColliderSet::new();
@@ -1379,7 +1572,10 @@ impl Sim {
         // hill shore back sea→head, and the rounded head arc closing the
         // loop. No wall crosses the entrance itself: the marina is open
         // to the sea.
-        let hull: Vec<Point<f32>> = HULL_PTS.iter().map(|&(x, y)| point![x, y]).collect();
+        let hull_pts: Vec<Point<f32>> = HULL_PTS.iter().map(|&(x, y)| point![x, y]).collect();
+        let mut moored: Vec<RigidBodyHandle> = Vec::new();
+        let mut fleet_lines: Vec<(Hull, Fairlead, Anchor)> = Vec::new();
+        let fleet = if with_harbour { moored_boats() } else { Vec::new() };
         if with_harbour {
             let mut boundary: Vec<Point<f32>> =
                 road_shore().iter().map(|p| point![p.x, p.y]).collect();
@@ -1428,18 +1624,75 @@ impl Sim {
                 );
             }
 
-            // Moored boats: the same hull shape as the player's, parked as
-            // static colliders — an occupied berth is a real obstacle.
-            for mb in moored_boats() {
-                colliders.insert(
-                    ColliderBuilder::convex_hull(&hull)
+            // The moored fleet. DYNAMIC bodies since 2026-08-20: every
+            // boat here lies to real `Line`s (rigged below), so it has to
+            // be able to work on them — a berthed boat nudged by the
+            // player's topsides gives, snubs and comes back, and the
+            // whole marina leans a little in a breeze. They keep the
+            // collider order they had as static obstacles, and CCD stays
+            // off: they move centimetres, and paying for continuous
+            // collision on ~75 hulls would be waste.
+            // Hoisted: building the design allocates its keel profile,
+            // and this loop runs once per berthed hull.
+            let fleet_displacement = BoatDesign::hallberg_rassy_38().displacement_kg;
+            for mb in &fleet {
+                let body = RigidBodyBuilder::dynamic()
+                    .translation(vector![mb.pos.x, mb.pos.y])
+                    .rotation(mb.heading)
+                    .build();
+                let handle = bodies.insert(body);
+                colliders.insert_with_parent(
+                    ColliderBuilder::convex_hull(&hull_pts)
                         .expect("hull points form a convex polygon")
-                        .translation(vector![mb.pos.x, mb.pos.y])
-                        .rotation(mb.heading)
+                        .mass(fleet_displacement)
                         .friction(0.4)
                         .restitution(0.05)
                         .build(),
+                    handle,
+                    &mut bodies,
                 );
+                moored.push(handle);
+            }
+            // ...and the ropes holding them: the classic Swedish pole
+            // berth of the reference photos — two crossed lines from the
+            // outboard quarters to the pole pair, two breast lines from
+            // the inboard end to the pontoon face.
+            for (bi, mb) in fleet.iter().enumerate() {
+                let (c, sn) = (mb.heading.cos(), mb.heading.sin());
+                let to_world =
+                    |l: Vec2| mb.pos + Vec2::new(l.x * c - l.y * sn, l.x * sn + l.y * c);
+                let port = Vec2::new(-sn, c);
+                let hull_ref = Hull::Moored(bi as u16);
+                // The outboard end is whichever end is NOT at the jetty.
+                let (outboard, inboard) = if mb.bow_to_jetty {
+                    (
+                        [Fairlead::PortQuarter, Fairlead::StbdQuarter],
+                        [Fairlead::PortBow, Fairlead::StbdBow],
+                    )
+                } else {
+                    (
+                        [Fairlead::PortBow, Fairlead::StbdBow],
+                        [Fairlead::PortQuarter, Fairlead::StbdQuarter],
+                    )
+                };
+                // CROSSED to the poles: each pole takes the fairlead on
+                // the far side, which is what stops the outboard end
+                // wandering across the berth.
+                for &pole in &mb.poles {
+                    let on_port = (pole - mb.pos).dot(port) >= 0.0;
+                    let f = if on_port { outboard[1] } else { outboard[0] };
+                    fleet_lines.push((hull_ref, f, Anchor::Shore { pos: pole, kind: ShoreKind::Pole }));
+                }
+                // Breast lines to the face, one off each inboard quarter
+                // to the stud on its own side of the berth.
+                let across = Vec2::new(-mb.out.y, mb.out.x);
+                for &f in &inboard {
+                    let q = to_world(f.local());
+                    let side = usize::from((q - mb.jetty_face).dot(across) >= 0.0);
+                    let anchor =
+                        Anchor::Shore { pos: mb.breast_cleats[side], kind: ShoreKind::Cleat };
+                    fleet_lines.push((hull_ref, f, anchor));
+                }
             }
         }
 
@@ -1452,7 +1705,7 @@ impl Sim {
             .build();
         let boat = bodies.insert(body);
         colliders.insert_with_parent(
-            ColliderBuilder::convex_hull(&hull)
+            ColliderBuilder::convex_hull(&hull_pts)
                 .expect("hull points form a convex polygon")
                 // Total mass = the design's displacement; Rapier derives
                 // the angular inertia and COM from the shape as if that
@@ -1465,6 +1718,33 @@ impl Sim {
             boat,
             &mut bodies,
         );
+
+        // The fleet's rigging becomes real `Line`s, made fast at exactly
+        // the distance each spans at rest: the marina starts snug, with
+        // no slack anywhere and no invented pre-tension — any movement in
+        // any direction lengthens at least one of a berth's four ropes.
+        let lines: Vec<Line> = fleet_lines
+            .iter()
+            .enumerate()
+            .map(|(k, &(hull_ref, fairlead, anchor))| {
+                let Hull::Moored(bi) = hull_ref else {
+                    unreachable!("the fleet rigs only fleet hulls");
+                };
+                let mb = &fleet[usize::from(bi)];
+                let (c, sn) = (mb.heading.cos(), mb.heading.sin());
+                let l = fairlead.local();
+                let at = mb.pos + Vec2::new(l.x * c - l.y * sn, l.x * sn + l.y * c);
+                Line {
+                    hull: hull_ref,
+                    id: FLEET_LINE_ID_BASE + k as u32,
+                    fairlead,
+                    anchor,
+                    scope: (shore_pos(anchor) - at).length().clamp(LINE_SCOPE_MIN, LINE_SCOPE_MAX),
+                    state: LineState::Fast,
+                    tension: 0.0,
+                }
+            })
+            .collect();
 
         Sim {
             bodies,
@@ -1483,14 +1763,15 @@ impl Sim {
             },
             gravity: vector![0.0, 0.0],
             boat,
-            keel,
-            wetted_surface,
-            hull_length,
-            att_flow,
+            hull,
+            fleet_hull,
+            frames: Vec::with_capacity(moored.len()),
+            moored,
             rudder,
             engine: 0.0,
-            lines: Vec::new(),
+            lines,
             next_line_id: 0,
+            last_env: Env::CALM,
             ticks: 0,
         }
     }
@@ -1499,7 +1780,7 @@ impl Sim {
     /// (area, CLR lever arm, yaw damping integral) — exposed read-only so
     /// the frontend can show what a profile actually produced.
     pub fn keel(&self) -> KeelDerived {
-        self.keel
+        self.hull.keel
     }
 
     /// Boat pose: (position, heading). Heading is the Rapier rotation angle;
@@ -1561,6 +1842,18 @@ impl Sim {
         &self.lines
     }
 
+    /// The moored fleet's live poses, in `moored_boats()` order — they
+    /// lie to real ropes now, so where each one is became sim state
+    /// rather than a fixed list the renderer could read off the geometry
+    /// functions.
+    pub fn moored_poses(&self) -> impl Iterator<Item = (Vec2, f32)> + '_ {
+        self.moored.iter().map(|&h| {
+            let rb = &self.bodies[h];
+            let t = rb.translation();
+            (Vec2::new(t.x, t.y), rb.rotation().angle())
+        })
+    }
+
     /// World position of one of the boat's fairleads, at the sim's own
     /// (un-interpolated) pose. The renderer transforms `Fairlead::local`
     /// by its INTERPOLATED pose instead, so lines don't judder between
@@ -1577,10 +1870,27 @@ impl Sim {
     /// of `tick` only for readability — it is part of the same tick and
     /// obeys the same rule (nothing here may be called from outside).
     fn step_lines(&mut self, input: &InputState, boat: BoatFrame) {
-        let BoatFrame { pos, fwd, side, v, w, mass } = boat;
-        let to_world = |f: Fairlead| {
+        let world_of = |frame: &BoatFrame, f: Fairlead| {
             let l = f.local();
-            pos + fwd * l.x + side * l.y
+            frame.pos + frame.fwd * l.x + frame.side * l.y
+        };
+        // Where a line's far end IS this tick. A cleat or a pole is a
+        // fixed point; a neighbour's fairlead moves with the neighbour.
+        let frames = &self.frames;
+        let anchor_of = |a: Anchor| -> (Vec2, Option<usize>) {
+            match a {
+                Anchor::Shore { pos, .. } => (pos, None),
+                Anchor::Boat { hull: Hull::Player, fairlead } => (world_of(&boat, fairlead), None),
+                Anchor::Boat { hull: Hull::Moored(i), fairlead } => {
+                    let k = usize::from(i);
+                    match frames.get(k) {
+                        Some(f) => (world_of(f, fairlead), Some(k)),
+                        // No fleet (the open-water test arena): treat it
+                        // as unreachable rather than panicking.
+                        None => (Vec2::new(f32::MAX, f32::MAX), None),
+                    }
+                }
+            }
         };
         if let Some(cmd) = input.line {
             // Clamped defensively, like throttle and rudder: a corrupt
@@ -1592,7 +1902,8 @@ impl Sim {
                 &mut self.next_line_id,
                 cmd,
                 pass_speed,
-                to_world,
+                |f| world_of(&boat, f),
+                |a| anchor_of(a).0,
             );
         }
         if self.lines.is_empty() {
@@ -1602,10 +1913,28 @@ impl Sim {
         // that parted. `Vec::new` doesn't allocate, so the usual tick
         // (nothing lost) stays allocation-free.
         let mut lost: Vec<u32> = Vec::new();
-        let rb = &mut self.bodies[self.boat];
         for line in &mut self.lines {
-            let p = to_world(line.fairlead);
-            let to_anchor = line.anchor.pos - p;
+            // Whose rope this is decides which hull it pulls on: the
+            // player's boat and the moored fleet lie to the same ropes,
+            // computed by the same code.
+            let (frame, handle, wake) = match line.hull {
+                Hull::Player => (boat, self.boat, true),
+                Hull::Moored(i) => {
+                    let handle = self.moored[usize::from(i)];
+                    // A boat asleep on its moorings is in equilibrium:
+                    // its ropes are doing exactly what they did last
+                    // tick, and recomputing them would change nothing —
+                    // and waking it to find that out is the one thing
+                    // that would make ~300 ropes expensive.
+                    if self.bodies[handle].is_sleeping() {
+                        continue;
+                    }
+                    (self.frames[usize::from(i)], handle, false)
+                }
+            };
+            let p = world_of(&frame, line.fairlead);
+            let (anchor_at, on_boat) = anchor_of(line.anchor);
+            let to_anchor = anchor_at - p;
             let dist = to_anchor.length();
             match line.state {
                 LineState::Passing { elapsed, total } => {
@@ -1636,19 +1965,32 @@ impl Sim {
                     // the yaw sweep at its own offset) — a line at the
                     // quarter feels the stern's swing, not the COM's
                     // motion.
-                    let r = p - pos;
-                    let v_pt = v + Vec2::new(-w * r.y, w * r.x);
+                    let r = p - frame.pos;
+                    let v_pt = frame.v + Vec2::new(-frame.w * r.y, frame.w * r.x);
                     // The line stretches when its fairlead moves AWAY
                     // from the anchor.
                     let stretch_rate = -v_pt.dot(dir);
-                    let pull = line_pull(line.scope, dist, stretch_rate, mass);
+                    let pull = line_pull(line.scope, dist, stretch_rate, frame.mass);
                     line.tension = pull;
                     if pull >= LINE_MBL {
                         lost.push(line.id); // parted
                         continue;
                     }
                     let f = dir * pull;
-                    rb.add_force_at_point(vector![f.x, f.y], point![p.x, p.y], true);
+                    self.bodies[handle]
+                        .add_force_at_point(vector![f.x, f.y], point![p.x, p.y], wake);
+                    // A rope made fast to a NEIGHBOUR pulls the
+                    // neighbour just as hard, at her own fairlead — and
+                    // wakes her, because she is genuinely being hauled
+                    // on rather than lying quietly to her own moorings.
+                    if let Some(k) = on_boat {
+                        let other = self.moored[k];
+                        self.bodies[other].add_force_at_point(
+                            vector![-f.x, -f.y],
+                            point![anchor_at.x, anchor_at.y],
+                            true,
+                        );
+                    }
                 }
             }
         }
@@ -1671,120 +2013,42 @@ impl Sim {
         // thrust below sees this tick's value deterministically.
         self.engine += (throttle - self.engine) * (PHYSICS_DT / THROTTLE_TAU);
 
+        // A berthed boat that has settled on its ropes is allowed to
+        // SLEEP: Rapier skips it, and so do we. The one thing sleep would
+        // otherwise break is that wind and current are knobs the PLAYER
+        // turns — a sleeping boat would ignore them — so a change of
+        // environment wakes the whole marina. (Contact wakes a boat by
+        // itself, so nudging one with your topsides still works.)
+        if *env != self.last_env {
+            for i in 0..self.moored.len() {
+                self.bodies[self.moored[i]].wake_up(true);
+            }
+            self.last_env = *env;
+        }
+        // Every boat in the marina — the player's and the moored fleet's
+        // — takes its wind and water forces from the same model. The
+        // fleet first, so the frames the mooring lines need are ready.
+        self.frames.clear();
+        for i in 0..self.moored.len() {
+            let rb = &mut self.bodies[self.moored[i]];
+            let f = hull_frame(rb, env);
+            if !rb.is_sleeping() {
+                // `false` throughout, including the resets: waking a boat
+                // to tell it its forces changed is exactly what would
+                // stop the marina ever settling.
+                rb.reset_forces(false);
+                rb.reset_torques(false);
+                apply_hull_forces(rb, env, &self.fleet_hull, &f, false);
+            }
+            self.frames.push(f);
+        }
+
         let rb = &mut self.bodies[self.boat];
         rb.reset_forces(true);
         rb.reset_torques(true);
-
-        let rot = *rb.rotation();
-        let fwd = Vec2::new(rot.re, rot.im); // bow direction (local +x)
-        let side = Vec2::new(-rot.im, rot.re); // port direction (local +y)
-        let pos = Vec2::new(rb.translation().x, rb.translation().y);
-        let v = Vec2::new(rb.linvel().x, rb.linvel().y);
-        let w = rb.angvel();
-        let mass = rb.mass();
-
-        // --- Hydrodynamic drag: the hull moving RELATIVE TO THE WATER.
-        // A uniform current is just "the water moves"; the same formula
-        // both damps the boat and carries it along. Quadratic in relative
-        // speed, split into surge (easy) and sway (hard) components.
-        let vr = v - env.current_vel();
-        let surge = vr.dot(fwd);
-        let sway = vr.dot(side);
-        // Axial (surge) resistance: ITTC-1957 skin friction over the actual
-        // wetted surface, not a bluff-body Cd over frontal area — see the
-        // block comment above `NU_WATER`. No fore/aft asymmetry: friction
-        // depends on wetted area and speed, not on which end leads (unlike
-        // the windage below, this hull doesn't have a flat transom to
-        // separate flow off — HULL_PTS tapers to a point at both ends).
-        // No added low-speed linear term either — but for the right
-        // reason (maintainer review caught the first version of this
-        // comment stating the mechanism BACKWARDS): Cf actually RISES
-        // slowly as Re falls (~1/log²Re — 0.003 at Re 10⁷, 0.008 at the
-        // 10⁵ floor). The FORCE still converges cleanly to zero at rest
-        // because the u² factor below collapses far faster than Cf's
-        // logarithmic growth, and below ITTC_RE_FLOOR Cf is capped
-        // anyway. It's the product that vanishes, not the coefficient.
-        let re = surge.abs() * self.hull_length / NU_WATER;
-        let cf = ittc57_cf(re) * HULL_FORM_FACTOR;
-        let f_friction = 0.5 * RHO_WATER * cf * self.wetted_surface * surge * surge.abs();
-        // Wave-making resistance — see the block comment above
-        // `wave_resistance_coefficient` for the derivation (approximate,
-        // generically calibrated, not hull-form-fitted; negligible here at
-        // 1-3 kn, Fn~0.05-0.15, so this doesn't disturb the friction fix's
-        // own benchmark).
-        let froude = surge.abs() / (G_EARTH * self.hull_length).sqrt();
-        let f_wave = mass * G_EARTH * wave_resistance_coefficient(froude) * surge.signum();
-        let f_surge = -fwd * (f_friction + f_wave);
-        let f_sway = -side
-            * (0.5 * RHO_WATER * self.keel.drag_area * sway * sway.abs()
-                + k_lin_sway(self.keel.drag_area) * sway);
-        // Surge drag acts through the centre; the lateral force acts at the
-        // keel profile's DRAG-WEIGHTED centre of lateral resistance (see
-        // keel.rs's `drag_clr_offset` — pulled toward whichever end carries
-        // more flat-plate keel material, not just where the raw area sits)
-        // — aft-of-centre for a typical skeg/rudder boat => weathervaning.
-        rb.add_force(vector![f_surge.x, f_surge.y], true);
-        let clr = pos + fwd * self.keel.drag_clr_offset;
-        rb.add_force_at_point(vector![f_sway.x, f_sway.y], point![clr.x, clr.y], true);
-
-        // Yaw drag: the same lateral-area profile, but its Cd-weighted
-        // cubic moment — the water resists the hull sweeping around its
-        // own axis more than it resists straight sway, because points far
-        // from the pivot move faster during rotation and drag is quadratic
-        // in speed.
-        let c_yaw_q = yaw_damping_coefficient(self.keel.drag_cubic_moment);
-        rb.add_torque(-(c_yaw_q * w * w.abs() + k_lin_yaw(c_yaw_q) * w), true);
-
-        // Rotation-induced SIDE FORCE (the torque above's inseparable twin):
-        // the strips resisting the spin don't pull symmetrically when the
-        // (Cd-weighted) area is biased fore/aft. A strip at position x
-        // sweeps sideways at w·x, so its drag is ∝ cd(x)·a(x)·(w·x)|w·x|;
-        // summed along the hull the net sway force is
-        // -0.5·ρ·w|w|·∫cd(x)·a(x)·x|x|dx (the profile's signed
-        // drag_swept_moment — no separate Cd factor, already folded in per
-        // station, see keel.rs). For an aft-biased keel spun clockwise the
-        // stern out-drags the bow and shoves the boat to starboard, which
-        // is what puts the effective centre of rotation aft of the centre
-        // of mass. Applied through the centre (the couple component is
-        // already the torque above); sway↔yaw cross terms are neglected,
-        // consistent with the sway/yaw drag split.
-        let f_spin = -side * (0.5 * RHO_WATER * w * w.abs() * self.keel.drag_swept_moment);
-        rb.add_force(vector![f_spin.x, f_spin.y], true);
-
-        // Attached-flow (lifting) lateral force + moment — the OTHER half
-        // of the strip model the three drag terms above belong to; see the
-        // block comment at `AttachedFlow`. Making way AHEAD only — see the
-        // validity-domain note on that struct for why sternway stays on
-        // the separated (drag) half alone. The leading (bow) boundary
-        // enters with m_a = 0 (undisturbed water ahead of the boat
-        // carries no body-imposed momentum), so only the Kutta-cut
-        // boundary survives in the boundary term. Scales with u·V:
-        // identically zero at rest, in pure sway, and in pure yaw — those
-        // regimes belong to the separated (drag) half above.
-        if surge > 0.0 {
-            let p = &self.att_flow;
-            let v_cut = sway + w * p.chi_cut;
-            let y_att = -surge * p.ma_cut * v_cut;
-            let n_att =
-                -surge * p.chi_cut * p.ma_cut * v_cut - surge * (sway * p.j0 + w * p.j1);
-            let f_att = side * y_att;
-            rb.add_force(vector![f_att.x, f_att.y], true);
-            rb.add_torque(n_att, true);
-        }
-
-        // --- Wind load: air moving relative to the hull/superstructure.
-        let ar = env.wind_vel() - v;
-        let a_ax = ar.dot(fwd);
-        let a_lat = ar.dot(side);
-        // a_ax > 0: relative wind moves toward the bow, i.e. it's blowing
-        // FROM astern (a following wind) => the stern meets it first.
-        let cd_air_ax = if a_ax > 0.0 { CD_AIR_STERN } else { CD_AIR_BOW };
-        let f_wax = fwd * (0.5 * RHO_AIR * cd_air_ax * WIND_AREA_FRONT * a_ax * a_ax.abs());
-        let f_wlat = side * (0.5 * RHO_AIR * CD_AIR_LAT * WIND_AREA_LAT * a_lat * a_lat.abs());
-        rb.add_force(vector![f_wax.x, f_wax.y], true);
-        // Lateral windage centre sits forward => the bow falls off downwind.
-        let wc = pos + fwd * WIND_CENTER_OFFSET;
-        rb.add_force_at_point(vector![f_wlat.x, f_wlat.y], point![wc.x, wc.y], true);
+        let boat = hull_frame(rb, env);
+        apply_hull_forces(rb, env, &self.hull, &boat, true);
+        let BoatFrame { pos, fwd, side, w, surge, sway, .. } = boat;
 
         // --- Propulsion: thrust and prop walk at the prop, from the
         // spooled engine response `n` (not the raw telegraph).
@@ -1855,7 +2119,7 @@ impl Sim {
         // --- Mooring lines: the crew's orders, then whatever the ropes
         // already out are pulling. Applied at each line's own fairlead,
         // which is what makes a spring line work with no special case.
-        self.step_lines(input, BoatFrame { pos, fwd, side, v, w, mass });
+        self.step_lines(input, boat);
 
         self.physics_pipeline.step(
             &self.gravity,
@@ -2321,7 +2585,7 @@ mod tests {
         let fwd = Vec2::new(heading.cos(), heading.sin());
         let port = Vec2::new(-heading.sin(), heading.cos());
         let bow = spawn + fwd * Fairlead::PortBow.local().x;
-        let mooring = Anchor { pos: bow + port * 8.0, kind: AnchorKind::Pole };
+        let mooring = Anchor::Shore { pos: bow + port * 8.0, kind: ShoreKind::Pole };
         let line_order = |t: u64| match t {
             100 => Some(LineCommand::MakeFast { fairlead: Fairlead::PortBow, anchor: mooring }),
             // Ids start at 0 and are never recycled, so the first line
@@ -2365,11 +2629,22 @@ mod tests {
             // actually land — check the rope was really out and working
             // before it was let go.
             if t == 1500 {
-                let l = a.lines().first().expect("the scripted line should be fast by now");
+                let l = a
+                    .lines()
+                    .iter()
+                    .find(|l| l.hull == Hull::Player)
+                    .expect("the scripted line should be fast by now");
                 assert!(l.is_fast());
             }
         }
-        assert!(a.lines().is_empty(), "the scripted CastOff should have let it go");
+        assert!(
+            !a.lines().iter().any(|l| l.hull == Hull::Player),
+            "the scripted CastOff should have let it go"
+        );
+        assert!(
+            a.lines().iter().any(|l| matches!(l.hull, Hull::Moored(_))),
+            "casting off the crew's line must not touch the marina's own rigging"
+        );
         assert_eq!(a.lines(), b.lines(), "line state must replay identically too");
         let (pa, ha) = a.boat_pose();
         let (pb, hb) = b.boat_pose();
@@ -2527,8 +2802,10 @@ mod tests {
     fn an_occupied_berth_is_blocked_by_the_moored_boat() {
         // Aim from open water straight down the first moored boat's berth
         // axis (it lies on the outer jetty's SW side, so the approach is
-        // clear): its parked hull is a static collider — it neither
-        // yields nor moves, and the incoming boat fetches up on its end.
+        // clear). Since 2026-08-20 its hull is DYNAMIC, lying to real
+        // ropes — so it gives a little rather than standing like a wall,
+        // but its moorings still stop the intruder, and still put it back
+        // afterwards.
         let mut sim = Sim::new();
         let mb = moored_boats()[0];
         let start = mb.pos + mb.out * 18.0;
@@ -2537,8 +2814,22 @@ mod tests {
         run_input(&mut sim, &Env::CALM, &FULL_AHEAD, 6.0);
         let travel = (sim.boat_pose().0 - start).length();
         assert!(
-            travel < 9.5,
+            travel < 11.0,
             "expected to fetch up on the moored boat ~6.3 m in, travelled {travel} m"
+        );
+        let shoved = sim.moored_poses().next().expect("the fleet is berthed").0;
+        assert!(
+            (shoved - mb.pos).length() > 0.01,
+            "a boat leaned on at full throttle should give on its ropes"
+        );
+        // Back off and let her lie: the ropes bring her home.
+        run_input(&mut sim, &Env::CALM, &FULL_ASTERN, 6.0);
+        run(&mut sim, &Env::CALM, 30.0);
+        let settled = sim.moored_poses().next().unwrap().0;
+        assert!(
+            (settled - mb.pos).length() < 1.0,
+            "her moorings should recover the berth, ended {} m off",
+            (settled - mb.pos).length()
         );
     }
 
@@ -2968,7 +3259,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::line::{
-        Anchor, AnchorKind, LINE_HAUL_RATE, LINE_PASS_SPEED, LINE_REACH_MAX, LINE_SCOPE_MAX,
+        Anchor, ShoreKind, LINE_HAUL_RATE, LINE_PASS_SPEED, LINE_REACH_MAX, LINE_SCOPE_MAX,
         LINE_STRAIN_BREAK,
     };
 
@@ -2987,7 +3278,7 @@ mod tests {
     }
 
     fn cleat(p: Vec2) -> Anchor {
-        Anchor { pos: p, kind: AnchorKind::Cleat }
+        Anchor::Shore { pos: p, kind: ShoreKind::Cleat }
     }
 
     /// Order a line and run until it is fast (or lost). Returns its id
@@ -3078,7 +3369,7 @@ mod tests {
             let l = line_by(&sim, id).expect("a dock line should survive backing onto it");
             peak_tension = peak_tension.max(l.tension);
             peak_dist =
-                peak_dist.max((l.anchor.pos - sim.fairlead_world(Fairlead::PortBow)).length());
+                peak_dist.max((shore_pos(l.anchor) - sim.fairlead_world(Fairlead::PortBow)).length());
         }
         assert!(peak_tension > 1000.0, "backing past the scope only loaded it to {peak_tension} N");
         assert!(
@@ -3245,12 +3536,93 @@ mod tests {
         let carried = line_by(&next, id).expect("the line should still be fast");
         assert_eq!(carried.scope, scope);
         assert!(carried.is_fast());
-        // And a line passed afterwards still gets a fresh id — from a
-        // DIFFERENT handle, since one rope per fairlead is the rule.
+        // And a line passed afterwards still gets a fresh id.
         let mut next = next;
         let bow = next.fairlead_world(Fairlead::StbdBow);
         let (id2, _) = pass_line(&mut next, &Env::CALM, Fairlead::StbdBow, bow + Vec2::new(4.0, 0.0));
         assert_ne!(id2, id);
+    }
+
+
+    // -----------------------------------------------------------------
+    // The moored fleet on its own ropes
+    // -----------------------------------------------------------------
+
+    /// Every berthed boat is rigged the way the reference photos show:
+    /// crossed lines to its pole pair, breast lines to the pontoon face.
+    /// They are ordinary `Line`s — the same struct, the same tension law
+    /// and the same `tick` as the player's.
+    #[test]
+    fn every_berthed_boat_lies_to_four_real_ropes() {
+        let sim = Sim::new();
+        let fleet = moored_boats();
+        assert!(!fleet.is_empty());
+        for (bi, mb) in fleet.iter().enumerate() {
+            let mine: Vec<&Line> = sim
+                .lines()
+                .iter()
+                .filter(|l| l.hull == Hull::Moored(bi as u16))
+                .collect();
+            assert_eq!(mine.len(), 4, "boat {bi} should have two pole lines and two breasts");
+            assert_eq!(
+                mine.iter()
+                    .filter(|l| matches!(l.anchor, Anchor::Shore { kind: ShoreKind::Pole, .. }))
+                    .count(),
+                2
+            );
+            assert!(mine.iter().all(|l| l.is_fast()), "the marina is already tied up");
+            // Made fast at the length it spans: no slack, no invented
+            // pre-tension.
+            for l in mine {
+                assert!(l.scope > 0.5 && l.scope < LINE_SCOPE_MAX);
+                assert!(
+                    shore_pos(l.anchor).distance(mb.pos) < 40.0,
+                    "anchored to its own berth"
+                );
+            }
+        }
+    }
+
+    /// A boat lying to its ropes in a breeze works a little and then
+    /// settles — it does not sail out of its berth, and it does not
+    /// vibrate. (The settling is also what lets Rapier put it to sleep,
+    /// which is what makes ~75 extra hulls affordable.)
+    #[test]
+    fn the_fleet_settles_on_its_ropes_and_stays_in_its_berths() {
+        let breeze = Env { wind_from_deg: 200.0, wind_speed: 12.0, ..Env::CALM };
+        let mut sim = Sim::new();
+        run(&mut sim, &breeze, 60.0);
+        let drift = sim
+            .moored_poses()
+            .zip(moored_boats())
+            .map(|((p, _), mb)| (p - mb.pos).length())
+            .fold(0.0f32, f32::max);
+        assert!(drift > 0.005, "a dynamic fleet should give a little on its ropes");
+        assert!(drift < 1.0, "a boat wandered {drift} m out of its berth");
+        assert!(
+            sim.lines().iter().all(|l| l.tension < LINE_MBL),
+            "a 12 m/s breeze must not part the marina's own moorings"
+        );
+    }
+
+    /// Sleep is an optimisation, and this is the one thing it could
+    /// break: wind and current are knobs the PLAYER turns, so a fleet
+    /// that has dozed off has to be woken when they move.
+    #[test]
+    fn a_change_of_wind_wakes_the_sleeping_fleet() {
+        let calm_ish = Env { wind_from_deg: 200.0, wind_speed: 4.0, ..Env::CALM };
+        let mut sim = Sim::new();
+        run(&mut sim, &calm_ish, 60.0);
+        let settled: Vec<Vec2> = sim.moored_poses().map(|(p, _)| p).collect();
+        // A gale from the other side.
+        let gale = Env { wind_from_deg: 20.0, wind_speed: 22.0, ..Env::CALM };
+        run(&mut sim, &gale, 30.0);
+        let moved = sim
+            .moored_poses()
+            .zip(&settled)
+            .map(|((p, _), &was)| (p - was).length())
+            .fold(0.0f32, f32::max);
+        assert!(moved > 0.02, "the fleet slept through a gale, moving {moved} m");
     }
 
 
@@ -3278,5 +3650,65 @@ mod tests {
                 face_cleats.len()
             );
         }
+    }
+
+    /// A rope made fast to a NEIGHBOUR is a rope at both ends: it hauls
+    /// on her as hard as it hauls on you, at her own fairlead. Rafting
+    /// up, or taking a line to the boat in the next berth while you get
+    /// sorted out.
+    ///
+    /// The claim is a force balance, not a displacement: she is held by
+    /// four ropes of her own, so hauling on her quarter has to show up in
+    /// THEM. Measured against an identical run with no rope out, which is
+    /// the only honest control — the marina shakes down onto its moorings
+    /// over the first half-minute either way, and that motion is far
+    /// bigger than the effect being measured.
+    #[test]
+    fn a_line_to_a_neighbour_hauls_on_the_neighbour_too() {
+        // Her own moorings' peak load while the player backs hard, with
+        // and without a rope made fast to her quarter.
+        let strain_on_her = |with_rope: bool| -> f32 {
+            let mut sim = Sim::new();
+            let mb = moored_boats()[0];
+            let start = mb.pos + mb.out * 10.0;
+            let heading = (-mb.out).y.atan2((-mb.out).x);
+            sim.set_pose(start.x, start.y, heading);
+            if with_rope {
+                let anchor =
+                    Anchor::Boat { hull: Hull::Moored(0), fairlead: Fairlead::PortQuarter };
+                let cmd = LineCommand::MakeFast { fairlead: Fairlead::PortBow, anchor };
+                sim.tick(&Env::CALM, &order(cmd));
+                assert_eq!(
+                    sim.lines().iter().filter(|l| l.hull == Hull::Player).count(),
+                    1,
+                    "a neighbour's fairlead should be a legal place to make fast"
+                );
+            }
+            run(&mut sim, &Env::CALM, 30.0); // let the marina shake down
+            let mut hers: f32 = 0.0;
+            for _ in 0..(20.0 / PHYSICS_DT) as u32 {
+                sim.tick(&Env::CALM, &FULL_ASTERN);
+                hers = hers.max(
+                    sim.lines()
+                        .iter()
+                        .filter(|l| l.hull == Hull::Moored(0))
+                        .map(|l| l.tension)
+                        .fold(0.0f32, f32::max),
+                );
+            }
+            hers
+        };
+        let hauled = strain_on_her(true);
+        let quiet = strain_on_her(false);
+        // Doubled, not tripled: the margin is tight only in the era
+        // BEFORE the damper is capped, where the whole marina rings at
+        // a couple of kN on its own and the control is that noise
+        // rather than her. Measured at the branch tip, where the damper
+        // no longer spikes: 3065 N with the rope on her against 3 N
+        // without.
+        assert!(
+            hauled > quiet * 2.0 + 200.0,
+            "her moorings peaked at {hauled} N with a rope on her, {quiet} N without"
+        );
     }
 }

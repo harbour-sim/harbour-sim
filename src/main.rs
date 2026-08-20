@@ -12,11 +12,10 @@
 //! written directly in css px.
 
 use harbour_sim_core::boat::BoatDesign;
-use harbour_sim_core::line::{Anchor, AnchorKind, LINE_PASS_SPEED};
+use harbour_sim_core::line::{Anchor, Hull, ShoreKind, LINE_PASS_SPEED};
 use harbour_sim_core::sim::{
     Env, HULL_PTS, InputState, JETTY_HALF_W, PHYSICS_DT, POLE_RADIUS, Sim, cleat_positions,
-    head_arc, hill_shore, jetties, marina_shore_len, moored_boats, pole_positions, road_shore,
-    world_bounds,
+    head_arc, hill_shore, jetties, marina_shore_len, pole_positions, road_shore, world_bounds,
 };
 use keel_editor::{EditorAction, EditorLayout, KeelEditor};
 use macroquad::prelude::*;
@@ -232,14 +231,13 @@ async fn main() {
     let jetty_list = jetties();
     let poles = pole_positions();
     let cleats = cleat_positions();
-    let moored = moored_boats();
     // Everything a rope can be belayed to, built once from sim-core's own
     // geometry like the rest of the scenery — what is drawn IS what a
     // line can reach.
     let anchors: Vec<Anchor> = cleats
         .iter()
-        .map(|&pos| Anchor { pos, kind: AnchorKind::Cleat })
-        .chain(poles.iter().map(|&pos| Anchor { pos, kind: AnchorKind::Pole }))
+        .map(|&pos| Anchor::Shore { pos, kind: ShoreKind::Cleat })
+        .chain(poles.iter().map(|&pos| Anchor::Shore { pos, kind: ShoreKind::Pole }))
         .collect();
     let road = road_shore();
     let hill = hill_shore();
@@ -305,6 +303,10 @@ async fn main() {
     // Last frame's INTERPOLATED pose, the companion to `last_cam`: what
     // the player saw when they reached for a fairlead.
     let mut last_boat = (prev_pos, prev_heading);
+    // The moored fleet's live poses, refreshed once a frame into a reused
+    // buffer — they lie to real ropes now, so where they are is sim state
+    // rather than something the renderer can read off `moored_boats()`.
+    let mut moored_poses: Vec<(Vec2, f32)> = sim.moored_poses().collect();
     // Camera pan: an OFFSET from the boat, in world metres (one-finger
     // drag on the water, or a mouse drag — mouse_claim 4). The camera
     // keeps FOLLOWING the boat while panned, displaced by this — watch
@@ -466,6 +468,7 @@ async fn main() {
                 view: View { cam: last_cam, scale: last_scale, sw, sh },
                 boat_pos: last_boat.0,
                 boat_heading: last_boat.1,
+                moored: &moored_poses,
                 anchors: &anchors,
                 lines: sim.lines(),
                 layout: mooring_layout,
@@ -790,6 +793,8 @@ async fn main() {
             }
             input.line = None;
             mooring.prune(sim.lines());
+            moored_poses.clear();
+            moored_poses.extend(sim.moored_poses());
 
             // Cosmetic wake, advanced on the FRAME's dt (it is render
             // state, not physics) and only while the sim is running —
@@ -1003,8 +1008,12 @@ async fn main() {
             draw_circle(sc.x, sc.y, (0.22 * scale).max(1.2), cleat_col);
         }
 
-        // --- Moored boats (static in sim-core) + their mooring lines ------
-        let moor_line = Color::from_rgba(200, 198, 190, 200);
+        // --- Moored boats -------------------------------------------------
+        // Dynamic in sim-core since 2026-08-20, so they are drawn at the
+        // pose the sim gives them rather than at the fixed berth
+        // geometry — a boat you lean on moves, and comes back. Their
+        // mooring lines are real `Line`s and were drawn above with
+        // everyone else's, so there is no decorative rigging left here.
         let moored_line_col = Color::from_rgba(46, 48, 54, 255);
         let moored_fills = [
             Color::from_rgba(226, 222, 208, 255),
@@ -1012,41 +1021,14 @@ async fn main() {
             Color::from_rgba(230, 224, 212, 255),
             Color::from_rgba(206, 200, 188, 255),
         ];
-        for (bi, mb) in moored.iter().enumerate() {
-            if !visible(mb.pos, 16.0) {
+        for (bi, &(mpos, mheading)) in moored_poses.iter().enumerate() {
+            if !visible(mpos, 16.0) {
                 continue;
             }
-            let (mc, ms) = (mb.heading.cos(), mb.heading.sin());
+            let (mc, ms) = (mheading.cos(), mheading.sin());
             let ml = |lx: f32, ly: f32| -> Vec2 {
-                w2s(mb.pos + vec2(lx * mc - ly * ms, lx * ms + ly * mc))
+                w2s(mpos + vec2(lx * mc - ly * ms, lx * ms + ly * mc))
             };
-            let fwd = vec2(mc, ms);
-            let port = vec2(-ms, mc);
-
-            // Crossed lines from the outboard end's quarters to its pole
-            // pair — the classic Swedish pole berth from the photos.
-            let (end_x, quarter_x) = if mb.bow_to_jetty { (-5.9, -5.6) } else { (6.0, 4.2) };
-            let end_c = mb.pos + fwd * end_x;
-            for p in mb.poles {
-                let side_sign = if (p - end_c).dot(port) >= 0.0 { 1.0 } else { -1.0 };
-                let q = ml(quarter_x, -1.5 * side_sign);
-                let pw = w2s(p);
-                draw_line(q.x, q.y, pw.x, pw.y, (0.07 * scale).max(1.0), moor_line);
-            }
-            // Short breast lines from the jetty end's quarters to the face.
-            let jetty_quarter_x = if mb.bow_to_jetty { 4.2 } else { -5.6 };
-            let across = vec2(-mb.out.y, mb.out.x);
-            for side in [1.0f32, -1.0] {
-                let qw = mb.pos
-                    + vec2(
-                        jetty_quarter_x * mc - 1.5 * side * ms,
-                        jetty_quarter_x * ms + 1.5 * side * mc,
-                    );
-                let s = if (qw - mb.jetty_face).dot(across) >= 0.0 { 1.0 } else { -1.0 };
-                let a = w2s(mb.jetty_face + across * (1.3 * s));
-                let q = w2s(qw);
-                draw_line(q.x, q.y, a.x, a.y, (0.07 * scale).max(1.0), moor_line);
-            }
 
             // Hull: same outline as the player's, quieter deck detail.
             let fill = moored_fills[bi % moored_fills.len()];
@@ -1112,11 +1094,12 @@ async fn main() {
             view: View { cam: vec2(cam_x, cam_y), scale, sw, sh },
             boat_pos: pos,
             boat_heading: heading,
+            moored: &moored_poses,
             anchors: &anchors,
             lines: sim.lines(),
             layout: mooring_layout,
         };
-        mooring::draw_ropes(&mooring_ctx, mooring.selected);
+        mooring::draw_ropes(&mooring_ctx, mooring.selected, visible);
 
         // --- Boat --------------------------------------------------------
         let (c, s) = (heading.cos(), heading.sin());
@@ -1419,9 +1402,13 @@ async fn main() {
                     Color::from_rgba(255, 150, 120, 255),
                 );
             } else if let Some(l) = selected {
-                // Both ends from the render pose, or the number
-                // disagrees with the rope that is drawn.
-                let dist = (l.anchor.pos - mooring_ctx.fairlead_world(l.fairlead)).length();
+                // Both ends from the render pose: mixing in the sim's
+                // un-interpolated one makes the number disagree with the
+                // rope that is drawn, and flickers it across the 2 cm
+                // slack threshold between frames.
+                let dist = (mooring_ctx.anchor_pos(l.anchor)
+                    - mooring_ctx.fairlead_of(l.hull, l.fairlead))
+                .length();
                 let slack = l.scope - dist;
                 let state = if !l.is_fast() {
                     "going ashore".to_string()
@@ -1433,7 +1420,7 @@ async fn main() {
                 let label = format!("{} line, {:.1} m - {state}", l.fairlead.label(), l.scope);
                 draw_text(&label, speed_rect.x, speed_rect.y - fs * 0.5, fs * 0.85, text);
             } else {
-                let hint = if sim.lines().is_empty() {
+                let hint = if sim.lines().iter().all(|l| l.hull != Hull::Player) {
                     "drag from a fairlead to a cleat or pole"
                 } else {
                     "tap a rope to haul, slack or cast it off"
