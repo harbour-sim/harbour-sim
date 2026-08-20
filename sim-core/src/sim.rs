@@ -17,7 +17,9 @@
 use crate::boat::{BoatDesign, RudderDesign};
 use crate::keel::{flat_plate_cd, KeelDerived, KeelProfile};
 use crate::line::{
-    line_pull, Anchor, Fairlead, Hull, Line, LineCommand, LineState, ShoreKind, LINE_MBL,
+    anchor_fitting, fitting_broken, line_pull, weakest_link, Anchor, Fairlead, Fitting, Gave,
+    Hull, Line,
+    LineCommand, LineState, ShoreKind,
     LINE_PASS_SPEED, LINE_PASS_SPEED_MAX,
     LINE_PASS_SPEED_MIN, LINE_REACH_MAX, LINE_SCOPE_MAX, LINE_SCOPE_MIN,
 };
@@ -1470,6 +1472,16 @@ pub struct Sim {
     /// The environment the last tick ran with, so a change to it can wake
     /// the sleeping fleet — see the wake block in `tick`.
     last_env: Env,
+    /// Lines that let go during the LAST tick, and what gave way. Cleared
+    /// at the top of every tick, so the frontend can report a failure
+    /// with its real cause instead of noticing a rope has silently
+    /// vanished.
+    failures: Vec<(u32, Hull, Gave)>,
+    /// Fittings torn out so far this run, in the order they went. The
+    /// marina remembers: you cannot re-use the cleat you just pulled off
+    /// the pontoon. A fresh `Sim` (R-reset) repairs everything, which is
+    /// what starting a run again should mean.
+    broken: Vec<Fitting>,
     /// Ticks advanced since spawn.
     pub ticks: u64,
 }
@@ -1522,6 +1534,15 @@ impl Sim {
         // were, so re-tying them is invisible.
         sim.lines.extend(self.lines.iter().filter(|l| l.hull == Hull::Player));
         sim.next_line_id = self.next_line_id;
+        sim.broken.clone_from(&self.broken);
+        // `build` re-rigs the marina knowing nothing about the damage, so
+        // a fleet boat would quietly get a carried-away cleat back while
+        // `broken_fittings()` still has the renderer drawing the holes it
+        // left. A fitting torn out earlier this run stays torn out.
+        sim.lines.retain(|l| {
+            !fitting_broken(&sim.broken, Fitting::Deck(l.hull, l.fairlead))
+                && !anchor_fitting(l.anchor).is_some_and(|f| fitting_broken(&sim.broken, f))
+        });
         {
             let rb = &mut sim.bodies[sim.boat];
             rb.set_translation(vector![pos.x, pos.y], true);
@@ -1772,6 +1793,8 @@ impl Sim {
             lines,
             next_line_id: 0,
             last_env: Env::CALM,
+            failures: Vec::new(),
+            broken: Vec::new(),
             ticks: 0,
         }
     }
@@ -1842,6 +1865,18 @@ impl Sim {
         &self.lines
     }
 
+    /// Fittings torn out so far this run — for the renderer to show as
+    /// wreckage, and for the frontend to stop offering them.
+    pub fn broken_fittings(&self) -> &[Fitting] {
+        &self.broken
+    }
+
+    /// Lines that let go during the last tick, and what gave way — for
+    /// the frontend to report. Empty on almost every tick.
+    pub fn line_failures(&self) -> &[(u32, Hull, Gave)] {
+        &self.failures
+    }
+
     /// The moored fleet's live poses, in `moored_boats()` order — they
     /// lie to real ropes now, so where each one is became sim state
     /// rather than a fixed list the renderer could read off the geometry
@@ -1902,6 +1937,7 @@ impl Sim {
                 &mut self.next_line_id,
                 cmd,
                 pass_speed,
+                &self.broken,
                 |f| world_of(&boat, f),
                 |a| anchor_of(a).0,
             );
@@ -1913,6 +1949,8 @@ impl Sim {
         // that parted. `Vec::new` doesn't allocate, so the usual tick
         // (nothing lost) stays allocation-free.
         let mut lost: Vec<u32> = Vec::new();
+        let failures = &mut self.failures;
+        let broken = &mut self.broken;
         for line in &mut self.lines {
             // Whose rope this is decides which hull it pulls on: the
             // player's boat and the moored fleet lie to the same ropes,
@@ -1972,8 +2010,25 @@ impl Sim {
                     let stretch_rate = -v_pt.dot(dir);
                     let pull = line_pull(line.scope, dist, stretch_rate, frame.mass);
                     line.tension = pull;
-                    if pull >= LINE_MBL {
-                        lost.push(line.id); // parted
+                    // Something in the load path gives before the rest —
+                    // usually a FITTING, not the rope (see `weakest_link`).
+                    let (limit, gave) = weakest_link(line.anchor);
+                    if pull >= limit {
+                        lost.push(line.id);
+                        failures.push((line.id, line.hull, gave));
+                        // ...and what gave is GONE. A parted rope leaves
+                        // both fittings intact; anything else takes one
+                        // with it.
+                        let destroyed = match gave {
+                            Gave::Rope => None,
+                            Gave::Fairlead => Some(Fitting::Deck(line.hull, line.fairlead)),
+                            Gave::Cleat | Gave::Neighbour => anchor_fitting(line.anchor),
+                        };
+                        if let Some(f) = destroyed
+                            && !broken.contains(&f)
+                        {
+                            broken.push(f);
+                        }
                         continue;
                     }
                     let f = dir * pull;
@@ -2013,6 +2068,7 @@ impl Sim {
         // thrust below sees this tick's value deterministically.
         self.engine += (throttle - self.engine) * (PHYSICS_DT / THROTTLE_TAU);
 
+        self.failures.clear();
         // A berthed boat that has settled on its ropes is allowed to
         // SLEEP: Rapier skips it, and so do we. The one thing sleep would
         // otherwise break is that wind and current are knobs the PLAYER
@@ -3259,8 +3315,8 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::line::{
-        Anchor, ShoreKind, LINE_HAUL_RATE, LINE_PASS_SPEED, LINE_REACH_MAX, LINE_SCOPE_MAX,
-        LINE_STRAIN_BREAK,
+        Anchor, ShoreKind, DECK_FITTING_MBL, LINE_HAUL_RATE, LINE_MBL, LINE_PASS_SPEED,
+        LINE_REACH_MAX, LINE_SCOPE_MAX, PONTOON_CLEAT_MBL,
     };
 
     /// An open-water arena with the boat parked at the origin, bow east —
@@ -3355,31 +3411,62 @@ mod tests {
         assert!((sim.boat_pose().0 - start).length() > 1.0, "the boat should be free to close");
         assert!(line_by(&sim, id).unwrap().scope == scope, "scope must not change on its own");
 
-        // Now back away past the scope. Sampled over the whole run, not
-        // at one instant: arriving on a short line at a knot and a half
-        // SNATCHES — peak load runs to a good fraction of the breaking
-        // strain and the boat rebounds forward off it, going slack again
-        // before it settles. That bounce is the behaviour, not an
-        // artefact, so the check is on the envelope: the rope takes real
-        // load, and it never lets her past the stretch it would break at.
-        let mut peak_tension: f32 = 0.0;
-        let mut peak_dist: f32 = 0.0;
-        for _ in 0..(25.0 / PHYSICS_DT) as u32 {
-            sim.tick(&Env::CALM, &FULL_ASTERN);
-            let l = line_by(&sim, id).expect("a dock line should survive backing onto it");
-            peak_tension = peak_tension.max(l.tension);
-            peak_dist =
-                peak_dist.max((shore_pos(l.anchor) - sim.fairlead_world(Fairlead::PortBow)).length());
+        // What happens when she opens out again is two other tests'
+        // business: a steady surge (`lines_hold_the_boat_against_a_gale`)
+        // and a snatch (`backing_hard_onto_a_short_line_tears_it_out`).
+    }
+
+    /// What really happens when you back hard onto a short line: the
+    /// cleat comes off YOUR DECK. A rope is rarely the weak link (see
+    /// `line::weakest_link`), and the difference matters for how the sim
+    /// feels — without it the rope stores the whole snatch and hands it
+    /// back, catapulting the boat away like a slingshot.
+    #[test]
+    fn backing_hard_onto_a_short_line_tears_it_out() {
+        let mut sim = line_arena();
+        let bow = sim.fairlead_world(Fairlead::PortBow);
+        let (id, _) = pass_line(&mut sim, &Env::CALM, Fairlead::PortBow, bow + Vec2::new(5.0, 0.0));
+        // A snatch needs SPEED onto SLACK — a line that is already taut
+        // just loads up to the thrust and holds. Surge some scope out,
+        // gather sternway, and let her come up hard on it.
+        let pay = order(LineCommand::Tend { id, rate: -1.0 });
+        for _ in 0..(8.0 / PHYSICS_DT) as u32 {
+            sim.tick(&Env::CALM, &pay);
         }
-        assert!(peak_tension > 1000.0, "backing past the scope only loaded it to {peak_tension} N");
-        assert!(
-            peak_dist < scope * (1.0 + LINE_STRAIN_BREAK),
-            "a full-astern surge stretched a {scope} m scope to {peak_dist} m"
+        let mut gave = None;
+        let mut peak: f32 = 0.0;
+        let mut ticks = 0;
+        for _ in 0..(30.0 / PHYSICS_DT) as u32 {
+            sim.tick(&Env::CALM, &FULL_ASTERN);
+            ticks += 1;
+            if let Some(l) = line_by(&sim, id) {
+                peak = peak.max(l.tension);
+            }
+            if let Some(&(lost, hull, g)) = sim.line_failures().first() {
+                assert_eq!(lost, id);
+                assert_eq!(hull, Hull::Player);
+                gave = Some(g);
+                break;
+            }
+        }
+        let gave = gave.expect("full astern onto a 5 m scope should carry something away");
+        assert_eq!(
+            gave,
+            Gave::Fairlead,
+            "shore hardware is the sturdier end: what tears out is on the boat"
         );
-        // And she is still tethered: full astern cannot walk her away.
+        assert!(sim.lines().iter().all(|l| l.id != id), "the line should be gone with it");
         assert!(
-            (sim.boat_pose().0 - start).length() < scope + 6.0,
-            "the line should still be holding her"
+            peak < LINE_MBL * 0.6,
+            "it should give way well short of the rope's own breaking load, at {peak} N"
+        );
+        assert!(ticks as f32 * PHYSICS_DT < 20.0, "it should not take all day");
+        // ...and the boat is NOT slingshotted: she was hauled up short
+        // and then let go, not launched.
+        assert!(
+            sim.boat_vel().0.length() < 2.0,
+            "she left at {} m/s — that is a catapult, not a parted mooring",
+            sim.boat_vel().0.length()
         );
     }
 
@@ -3406,8 +3493,8 @@ mod tests {
         assert!(held < 2.0, "moored boat wandered {held} m in a gale");
         assert!(adrift > 20.0 * held, "control drifted {adrift} m vs {held} m moored");
         assert!(
-            sim.lines().iter().all(|l| l.tension < LINE_MBL),
-            "a 20 m/s breeze must not part a dock line"
+            sim.lines().iter().all(|l| l.tension < PONTOON_CLEAT_MBL),
+            "a 20 m/s breeze must not pull the cleats out"
         );
     }
 
@@ -3477,14 +3564,19 @@ mod tests {
         let bow = sim.fairlead_world(Fairlead::PortBow);
         let (id, _) = pass_line(&mut sim, &Env::CALM, Fairlead::PortBow, bow + Vec2::new(0.0, 3.0));
         let (start_pos, start_heading) = sim.boat_pose();
-        run_input(&mut sim, &Env::CALM, &FULL_AHEAD, 20.0);
+        // Moderate power, as you would actually spring off: leaning on a
+        // three-metre spring at FULL throttle tears the pontoon cleat out
+        // (see `line::weakest_link`), which is realistic and is a
+        // different test's business.
+        let ahead = InputState { throttle: 0.6, ..InputState::NEUTRAL };
+        run_input(&mut sim, &Env::CALM, &ahead, 20.0);
         let (pos, heading) = sim.boat_pose();
         let swing = (heading - start_heading).to_degrees();
         let toward = (pos - start_pos).y;
 
         // Same throttle, no line: she just drives off ahead.
         let mut control = line_arena();
-        run_input(&mut control, &Env::CALM, &FULL_AHEAD, 20.0);
+        run_input(&mut control, &Env::CALM, &ahead, 20.0);
         let control_swing = (control.boat_pose().1 - start_heading).to_degrees();
 
         assert!(swing > 45.0, "the spring only swung her {swing}°");
@@ -3600,8 +3692,8 @@ mod tests {
         assert!(drift > 0.005, "a dynamic fleet should give a little on its ropes");
         assert!(drift < 1.0, "a boat wandered {drift} m out of its berth");
         assert!(
-            sim.lines().iter().all(|l| l.tension < LINE_MBL),
-            "a 12 m/s breeze must not part the marina's own moorings"
+            sim.lines().iter().all(|l| l.tension < PONTOON_CLEAT_MBL),
+            "a 12 m/s breeze must not tear the marina's own moorings out"
         );
     }
 
@@ -3670,7 +3762,12 @@ mod tests {
         let strain_on_her = |with_rope: bool| -> f32 {
             let mut sim = Sim::new();
             let mb = moored_boats()[0];
-            let start = mb.pos + mb.out * 10.0;
+            // Clear of her hull: both boats are ~12 m long, so anything
+            // under ~13 m apart spawns them OVERLAPPING and Rapier's
+            // penetration recovery loads her moorings all by itself —
+            // which is what an earlier version of this test was
+            // unwittingly measuring.
+            let start = mb.pos + mb.out * 14.0;
             let heading = (-mb.out).y.atan2((-mb.out).x);
             sim.set_pose(start.x, start.y, heading);
             if with_rope {
@@ -3684,19 +3781,26 @@ mod tests {
                     "a neighbour's fairlead should be a legal place to make fast"
                 );
             }
-            run(&mut sim, &Env::CALM, 30.0); // let the marina shake down
-            let mut hers: f32 = 0.0;
+            // The fleet shakes down out of its spawn overlap over the
+            // first minute; measuring before that is measuring the
+            // shake-down, not the rope.
+            run(&mut sim, &Env::CALM, 90.0);
+            // MEAN load, not peak: her ropes ring briefly as the marina
+            // settles, and a peak is swamped by that transient. A steady
+            // haul on her quarter shows up as a sustained pull.
+            let (mut sum, mut n) = (0.0f64, 0u32);
             for _ in 0..(20.0 / PHYSICS_DT) as u32 {
                 sim.tick(&Env::CALM, &FULL_ASTERN);
-                hers = hers.max(
-                    sim.lines()
-                        .iter()
-                        .filter(|l| l.hull == Hull::Moored(0))
-                        .map(|l| l.tension)
-                        .fold(0.0f32, f32::max),
-                );
+                let hers = sim
+                    .lines()
+                    .iter()
+                    .filter(|l| l.hull == Hull::Moored(0))
+                    .map(|l| l.tension)
+                    .fold(0.0f32, f32::max);
+                sum += f64::from(hers);
+                n += 1;
             }
-            hers
+            (sum / f64::from(n)) as f32
         };
         let hauled = strain_on_her(true);
         let quiet = strain_on_her(false);
@@ -3707,8 +3811,389 @@ mod tests {
         // no longer spikes: 3065 N with the rope on her against 3 N
         // without.
         assert!(
-            hauled > quiet * 2.0 + 200.0,
-            "her moorings peaked at {hauled} N with a rope on her, {quiet} N without"
+            hauled > quiet * 2.0 + 100.0,
+            "her moorings averaged {hauled} N with a rope on her, {quiet} N without"
         );
     }
+
+    /// Measurement harness for the snub numbers quoted on
+    /// `LINE_DAMPING_RATIO`: how much of her way a boat gets back when a
+    /// rope brings her up. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement harness for the damping calibration, not a check"]
+    fn measure_snub_restitution() {
+        use crate::line::line_tension;
+        // A CLEAN snub: pay out real slack first, build sternway, then cut
+        // the engine before the rope comes up, so the only energy in the
+        // system is the boat's own way.
+        let mut sim = line_arena();
+        let bow = sim.fairlead_world(Fairlead::PortBow);
+        let anchor = bow + Vec2::new(8.0, 0.0);
+        let (id, _) = pass_line(&mut sim, &Env::CALM, Fairlead::PortBow, anchor);
+        let pay = order(LineCommand::Tend { id, rate: -1.0 });
+        for _ in 0..(5.0 / PHYSICS_DT) as u32 {
+            sim.tick(&Env::CALM, &pay);
+        }
+        run_input(&mut sim, &Env::CALM, &FULL_ASTERN, 5.0);
+        let mut v_in = 0.0f32;
+        let (mut t_max, mut damp_max, mut elastic_at_damp_max) = (0.0f32, 0.0f32, 0.0f32);
+        let mut in_contact = false;
+        for _ in 0..(60.0 / PHYSICS_DT) as u32 {
+            sim.tick(&Env::CALM, &InputState::NEUTRAL);
+            let Some(l) = line_by(&sim, id) else {
+                println!("line lost");
+                return;
+            };
+            let dist = (l.anchor_pos_for_test() - sim.fairlead_world(Fairlead::PortBow)).length();
+            let elastic = line_tension(l.scope, dist);
+            let damp = l.tension - elastic;
+            let speed = sim.boat_vel().0.length();
+            if l.tension > 0.0 {
+                if !in_contact {
+                    in_contact = true;
+                    v_in = speed;
+                }
+                t_max = t_max.max(l.tension);
+                if damp.abs() > damp_max {
+                    damp_max = damp.abs();
+                    elastic_at_damp_max = elastic;
+                }
+            } else if in_contact {
+                println!(
+                    "snub: in {v_in:.3} m/s -> out {speed:.3} m/s (restitution {:.2}), peak T {t_max:.0} N, peak damping {damp_max:.0} N vs {elastic_at_damp_max:.0} N elastic",
+                    speed / v_in.max(1e-6)
+                );
+                return;
+            }
+        }
+        println!("never came off the line; peak T {t_max:.0} N");
+    }
+
+
+    /// A torn-out fitting stays torn out. Without this the punishment for
+    /// a bad arrival is "throw the same line at the same cleat again",
+    /// which quietly undoes the consequence.
+    #[test]
+    fn a_torn_out_cleat_cannot_be_used_again() {
+        let mut sim = line_arena();
+        let bow = sim.fairlead_world(Fairlead::PortBow);
+        let cleat = bow + Vec2::new(5.0, 0.0);
+        let (id, _) = pass_line(&mut sim, &Env::CALM, Fairlead::PortBow, cleat);
+        let pay = order(LineCommand::Tend { id, rate: -1.0 });
+        for _ in 0..(8.0 / PHYSICS_DT) as u32 {
+            sim.tick(&Env::CALM, &pay);
+        }
+        for _ in 0..(30.0 / PHYSICS_DT) as u32 {
+            sim.tick(&Env::CALM, &FULL_ASTERN);
+            if !sim.broken_fittings().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            sim.broken_fittings(),
+            [Fitting::Deck(Hull::Player, Fairlead::PortBow)],
+            "the fitting that let go should be the one recorded as gone"
+        );
+
+        // That fairlead is gone: it cannot take another line, from any
+        // cleat.
+        let before = sim.lines().len();
+        sim.tick(
+            &Env::CALM,
+            &order(LineCommand::MakeFast {
+                fairlead: Fairlead::PortBow,
+                anchor: Anchor::Shore { pos: cleat, kind: ShoreKind::Cleat },
+            }),
+        );
+        assert_eq!(sim.lines().len(), before, "a fitting that is gone cannot take a line");
+
+        // The handle on the other bow is fine.
+        let bow = sim.fairlead_world(Fairlead::StbdBow);
+        sim.tick(
+            &Env::CALM,
+            &order(LineCommand::MakeFast {
+                fairlead: Fairlead::StbdBow,
+                anchor: Anchor::Shore {
+                    pos: bow + Vec2::new(4.0, 0.0),
+                    kind: ShoreKind::Cleat,
+                },
+            }),
+        );
+        assert_eq!(sim.lines().len(), before + 1, "the next cleat along still works");
+
+        // And the damage survives a keel change, like the ropes do.
+        let next = sim.new_continuing(&BoatDesign::alajuela_38());
+        assert_eq!(next.broken_fittings(), [Fitting::Deck(Hull::Player, Fairlead::PortBow)]);
+    }
+
+    /// Every rope in the marina ends on a stud the renderer draws. The
+    /// fleet's breast lines used to be belayed a free 1.3 m either side
+    /// of the berth centre, which is about half a cleat spacing — so
+    /// they finished on bare planking, and a fitting torn out there was
+    /// recorded at a position no cleat had ever occupied (CodeRabbit
+    /// review, 2026-08-21). Exact equality is the point: `Fitting`
+    /// identifies a shore cleat BY its position.
+    #[test]
+    fn every_fleet_cleat_is_a_cleat_the_renderer_draws() {
+        let sim = Sim::new();
+        let studs = cleat_positions();
+        let mut checked = 0;
+        for l in sim.lines() {
+            if let Anchor::Shore { pos, kind: ShoreKind::Cleat } = l.anchor {
+                assert!(
+                    studs.contains(&pos),
+                    "a fleet breast line ends at {pos:?}, where no cleat is drawn"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 2 * moored_boats().len(), "every berth has two breast lines");
+    }
+
+    /// A keel change must not repair the marina. `build` re-rigs the
+    /// fleet from scratch and knows nothing about the damage, so without
+    /// pruning, a boat whose cleat tore out got it back while
+    /// `broken_fittings()` still had the renderer drawing the holes
+    /// (CodeRabbit review, 2026-08-21).
+    #[test]
+    fn a_keel_change_does_not_re_rig_a_fitting_that_tore_out() {
+        let mut sim = Sim::new();
+        // Take the marina's own first breast line and declare its cleat
+        // gone, exactly as a tear-out would.
+        let (hull, fairlead, gone) = sim
+            .lines()
+            .iter()
+            .find_map(|l| match l.anchor {
+                Anchor::Shore { pos, kind: ShoreKind::Cleat } => Some((l.hull, l.fairlead, pos)),
+                _ => None,
+            })
+            .expect("the fleet lies to pontoon cleats");
+        sim.broken.push(Fitting::Shore(gone));
+        sim.lines.retain(|l| l.anchor != (Anchor::Shore { pos: gone, kind: ShoreKind::Cleat }));
+
+        let next = sim.new_continuing(&BoatDesign::alajuela_38());
+        assert!(
+            next.broken_fittings().contains(&Fitting::Shore(gone)),
+            "the damage survives a keel change"
+        );
+        assert!(
+            !next.lines().iter().any(|l| l.anchor
+                == (Anchor::Shore { pos: gone, kind: ShoreKind::Cleat })),
+            "nothing may be re-rigged to a cleat that is gone"
+        );
+        // The rest of that boat's moorings are untouched — she is short
+        // one rope, not cast adrift.
+        assert!(
+            next.lines().iter().any(|l| l.hull == hull && l.fairlead != fairlead),
+            "her other lines are still on"
+        );
+    }
+
+    /// What the weather can do to the marina's own moorings, and at which
+    /// cleat limit. Run with `--ignored --nocapture`.
+    ///
+    /// This exists because of an owner report that a severe wind change
+    /// broke a cleat on a random berthed boat, and it is worth knowing
+    /// which part of that is true. Re-measured 2026-08-21 against the
+    /// CORRECTED fitting ordering (a boat's own 14 kN deck fitting is
+    /// the weakest link, not a 9 kN pontoon cleat — see
+    /// `DECK_FITTING_MBL`), so the earlier figures here, which had
+    /// fittings going by the dozen, no longer describe this sim:
+    ///
+    /// - A STEP of wind — calm to 50 knots in one tick, which is what
+    ///   slamming the dial over does — peaks at 4.8-5.8 kN and breaks
+    ///   nothing, settled marina or not. Suddenness is not the problem.
+    /// - The wind DIRECTION swept round is harsher than any step, and
+    ///   the resonance band is plain: 12.4 kN at 6 s per revolution,
+    ///   against 10.0 kN at 4 s and 7.8 kN at 45 s. That band is the
+    ///   mooring system's own natural period (taut short lines against
+    ///   8.5 t) — a lightly-damped oscillator driven at resonance, real
+    ///   physics from weather that cannot exist. Note the implication
+    ///   for any "smooth the dial" fix: slowing a fast sweep moves it
+    ///   TOWARD the dangerous band, not away from it. Nothing is lost at
+    ///   any period — the worst of them sits at 89% of what holds it.
+    /// - Max wind AND max current together: 14 kN and 191 fittings, the
+    ///   only case in this harness that costs anything. Also correct —
+    ///   water is ~800x denser than air, so 5 kn of cross-current
+    ///   dwarfs 50 kn of wind — and also a marina that would never have
+    ///   been built.
+    #[test]
+    #[ignore = "measurement harness for mooring loads, not a check"]
+    fn measure_mooring_loads() {
+        let calm = Env { wind_from_deg: 200.0, wind_speed: 4.0, ..Env::CALM };
+        let settled = |secs: f32| {
+            let mut sim = Sim::new();
+            run(&mut sim, &calm, secs);
+            sim
+        };
+        let report = |label: String, sim: &mut Sim, env: &dyn Fn(f32) -> Env, secs: f32| {
+            let (mut worst, mut broke) = (0.0f32, 0usize);
+            for i in 0..(secs / PHYSICS_DT) as u32 {
+                sim.tick(&env(i as f32 * PHYSICS_DT), &InputState::NEUTRAL);
+                worst = worst.max(fleet_peak(sim));
+                broke += sim.line_failures().len();
+            }
+            println!("{label:>34}: peak {worst:7.0} N, fittings lost {broke}");
+        };
+
+        let gale = Env { wind_from_deg: 20.0, wind_speed: 25.0, ..Env::CALM };
+        for s in [0.0f32, 90.0] {
+            let mut sim = settled(s);
+            report(format!("step to 25 m/s after {s:.0} s"), &mut sim, &|_| gale, 60.0);
+        }
+        for period in [4.0f32, 6.0, 8.0, 10.0, 14.0, 20.0, 45.0] {
+            let mut sim = settled(90.0);
+            report(
+                format!("direction swept, {period:.0} s/turn"),
+                &mut sim,
+                &move |t| Env { wind_from_deg: 200.0 + 360.0 * t / period, ..gale },
+                90.0,
+            );
+        }
+        let mut sim = settled(90.0);
+        let both = Env { current_to_deg: 110.0, current_speed: 2.5, ..gale };
+        report("max wind + max current".to_string(), &mut sim, &|_| both, 60.0);
+    }
+
+    fn fleet_peak(sim: &Sim) -> f32 {
+        sim.lines()
+            .iter()
+            .filter(|l| matches!(l.hull, Hull::Moored(_)))
+            .map(|l| l.tension)
+            .fold(0.0f32, f32::max)
+    }
+
+
+    /// Companion to `measure_mooring_loads`: how hard the fleet is lying
+    /// BEFORE anything changes, and what a reversal then costs. Run with
+    /// `--ignored --nocapture`.
+    ///
+    /// Measured 2026-08-20, steady wind on the beam. A berth's four
+    /// ropes are not alike: the two crossed to the poles run through no
+    /// shore fitting at all (the line goes round the pole), the two
+    /// breast lines go to a pontoon cleat. Since shore hardware is the
+    /// sturdier end, though, BOTH groups are limited by the same thing —
+    /// the berthed boat's own 14 kN deck fitting. Per group, p90 / max:
+    ///
+    /// | wind | breast lines | pole lines |
+    /// |------|--------------|------------|
+    /// | 18 m/s | 4.9 / 5.1 kN | 4.3 / 4.9 kN |
+    /// | 22 m/s | 6.7 / 6.7 kN | 6.0 / 7.1 kN |
+    /// | 25 m/s | 7.8 / 8.0 kN | 6.9 / 8.5 kN |
+    ///
+    /// At `WIND_MAX` that is 57 % of what holds them, and a slammed
+    /// SE→NW reversal peaks at 10.8 kN and costs nothing. It used to
+    /// cost 63 fittings, every one a harbour cleat, when those breast
+    /// lines were limited by a 9 kN pontoon cleat instead — see the
+    /// ordering note on `DECK_FITTING_MBL`.
+    ///
+    /// The spread is wide (median across all ropes 2.1 kN against a p90
+    /// of 7.7) because a pole berth's crossed lines meet a beam load at
+    /// poor angles and multiply it — real, and the reason a boat in a
+    /// pole berth leans on its neighbours in a blow. In calm the whole
+    /// marina rests at under 10 N: it does not chafe at itself.
+    ///
+    #[test]
+    #[ignore = "measurement harness for mooring loads, not a check"]
+    fn measure_resting_mooring_loads() {
+        let group = |sim: &Sim, pole: bool| {
+            let mut t: Vec<f32> = sim
+                .lines()
+                .iter()
+                .filter(|l| matches!(l.hull, Hull::Moored(_)))
+                .filter(|l| {
+                    matches!(l.anchor, Anchor::Shore { kind: ShoreKind::Pole, .. }) == pole
+                })
+                .map(|l| l.tension)
+                .collect();
+            t.sort_by(f32::total_cmp);
+            (t.len(), t[(t.len() - 1) * 9 / 10], t[t.len() - 1])
+        };
+        for speed in [12.0f32, 18.0, 22.0, 25.0] {
+            let mut sim = Sim::new();
+            run(&mut sim, &Env { wind_from_deg: 135.0, wind_speed: speed, ..Env::CALM }, 90.0);
+            let (np, p90p, maxp) = group(&sim, true);
+            let (nc, p90c, maxc) = group(&sim, false);
+            println!("{speed:4.0} m/s steady:");
+            println!(
+                "   breast lines (shore cleat {PONTOON_CLEAT_MBL:.0} N, so limited by her own {DECK_FITTING_MBL:.0} N): {nc} ropes, p90 {p90c:5.0}, max {maxc:5.0}"
+            );
+            println!(
+                "   pole lines   (no shore fitting, ditto):                          {np} ropes, p90 {p90p:5.0}, max {maxp:5.0}"
+            );
+        }
+        // ...and the reversal that started this, at each strength.
+        for hold in [12.0f32, 18.0, 25.0] {
+            let mut sim = Sim::new();
+            run(&mut sim, &Env { wind_from_deg: 135.0, wind_speed: hold, ..Env::CALM }, 90.0);
+            let (mut worst, mut cleat, mut deck, mut rope) = (0.0f32, 0, 0, 0);
+            for _ in 0..(60.0 / PHYSICS_DT) as u32 {
+                let env = Env { wind_from_deg: 315.0, wind_speed: hold, ..Env::CALM };
+                sim.tick(&env, &InputState::NEUTRAL);
+                worst = worst.max(fleet_peak(&sim));
+                for (_, _, g) in sim.line_failures() {
+                    match g {
+                        Gave::Cleat => cleat += 1,
+                        Gave::Fairlead => deck += 1,
+                        _ => rope += 1,
+                    }
+                }
+            }
+            println!(
+                "{hold:4.0} m/s slammed SE->NW: peak {worst:7.0} N, harbour cleats {cleat}, boat fittings {deck}, ropes {rope}"
+            );
+        }
+    }
+
+
+
+    /// How hard she has to arrive on a line before a fitting lets go.
+    /// Run with `--ignored --nocapture`. Measured 2026-08-20 against
+    /// `DECK_FITTING_MBL` = 14 kN, backing onto a 5 m scope with slack
+    /// surged out first (a snatch needs speed onto slack):
+    ///
+    /// | arrives at | peak | fitting |
+    /// |-----------|------|---------|
+    /// | 2.3 kn | 11.6 kN | holds |
+    /// | 3.2 kn | 13.5 kN | holds |
+    /// | 3.8 kn | 14.0 kN | **torn out** |
+    /// | 4.6 kn | 14.0 kN | **torn out** |
+    ///
+    /// So the threshold is a arrival of about three and a half knots —
+    /// a genuinely bad one for eight and a half tonnes.
+    #[test]
+    #[ignore = "measurement harness for the snap threshold, not a check"]
+    fn measure_snap_threshold() {
+        for pay_secs in [2.0f32, 4.0, 6.0, 8.0, 10.0] {
+            let mut sim = line_arena();
+            let bow = sim.fairlead_world(Fairlead::PortBow);
+            let (id, _) =
+                pass_line(&mut sim, &Env::CALM, Fairlead::PortBow, bow + Vec2::new(5.0, 0.0));
+            let pay = order(LineCommand::Tend { id, rate: -1.0 });
+            for _ in 0..(pay_secs / PHYSICS_DT) as u32 {
+                sim.tick(&Env::CALM, &pay);
+            }
+            let mut v_in = 0.0f32;
+            let (mut peak, mut broke) = (0.0f32, false);
+            let mut touched = false;
+            for _ in 0..(40.0 / PHYSICS_DT) as u32 {
+                sim.tick(&Env::CALM, &FULL_ASTERN);
+                if let Some(l) = line_by(&sim, id) {
+                    if l.tension > 0.0 && !touched {
+                        touched = true;
+                        v_in = sim.boat_vel().0.length();
+                    }
+                    peak = peak.max(l.tension);
+                } else {
+                    broke = true;
+                    break;
+                }
+            }
+            println!(
+                "{pay_secs:4.0}s of scope paid out -> arrives at {:.2} m/s ({:.1} kn): peak {peak:6.0} N, fitting {}",
+                v_in, v_in / 0.5144, if broke { "TORN OUT" } else { "held" }
+            );
+        }
+    }
+
 }

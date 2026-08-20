@@ -12,7 +12,7 @@
 //! written directly in css px.
 
 use harbour_sim_core::boat::BoatDesign;
-use harbour_sim_core::line::{Anchor, Hull, ShoreKind, LINE_PASS_SPEED};
+use harbour_sim_core::line::{Anchor, Fitting, Hull, ShoreKind, LINE_PASS_SPEED};
 use harbour_sim_core::sim::{
     Env, HULL_PTS, InputState, JETTY_HALF_W, PHYSICS_DT, POLE_RADIUS, Sim, cleat_positions,
     head_arc, hill_shore, jetties, marina_shore_len, pole_positions, road_shore, world_bounds,
@@ -482,6 +482,7 @@ async fn main() {
                 moored: &moored_poses,
                 anchors: &anchors,
                 lines: sim.lines(),
+                broken: sim.broken_fittings(),
                 layout: mooring_layout,
             };
 
@@ -833,6 +834,7 @@ async fn main() {
                     input.line = mooring.next_command(sim.lines());
                     input.line_pass_speed = settings.line_pass_speed;
                     sim.tick(&env, &input);
+                    mooring.report_failures(sim.line_failures());
                     (cur_pos, cur_heading) = sim.boat_pose();
                     accum -= PHYSICS_DT;
                 }
@@ -1051,7 +1053,14 @@ async fn main() {
                 continue;
             }
             let sc = w2s(*c);
-            draw_circle(sc.x, sc.y, (0.22 * scale).max(1.2), cleat_col);
+            let r = (0.22 * scale).max(1.2);
+            // One that has been pulled off the pontoon leaves its holes
+            // behind, and is not offered as an anchor any more.
+            if sim.broken_fittings().contains(&Fitting::Shore(*c)) {
+                draw_circle_lines(sc.x, sc.y, r * 1.6, 2.0, mooring::TORN_OUT);
+            } else {
+                draw_circle(sc.x, sc.y, r, cleat_col);
+            }
         }
 
         // --- Moored boats -------------------------------------------------
@@ -1143,6 +1152,7 @@ async fn main() {
             moored: &moored_poses,
             anchors: &anchors,
             lines: sim.lines(),
+            broken: sim.broken_fittings(),
             layout: mooring_layout,
         };
         mooring::draw_ropes(&mooring_ctx, mooring.selected, visible);
