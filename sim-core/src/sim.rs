@@ -16,6 +16,10 @@
 
 use crate::boat::{BoatDesign, RudderDesign};
 use crate::keel::{flat_plate_cd, KeelDerived, KeelProfile};
+use crate::line::{
+    line_pull, Fairlead, Line, LineCommand, LineState, LINE_MBL, LINE_PASS_SPEED, LINE_PASS_SPEED_MAX,
+    LINE_PASS_SPEED_MIN, LINE_REACH_MAX, LINE_SCOPE_MAX, LINE_SCOPE_MIN,
+};
 use glam::Vec2;
 use rapier2d::prelude::*;
 
@@ -280,6 +284,53 @@ pub fn pole_positions() -> Vec<Vec2> {
     poles
 }
 
+/// Along-jetty spacing of pontoon cleats. Half a berth width, so every
+/// berth has a cleat at each end AND one at its middle: enough choice to
+/// lead a spring somewhere useful rather than only square across
+/// (widened from one cleat per berth boundary, owner request
+/// 2026-08-20).
+pub const CLEAT_SPACING: f32 = POLE_SPACING * 0.5;
+
+/// Every cleat on every pontoon face, in jetty/side/station order —
+/// marching the full length of each face from the root clearance to the
+/// tip, both sides. Pure geometry, shared with the renderer like
+/// everything else here, so a stud you can see is a stud you can reach.
+pub fn cleat_positions() -> Vec<Vec2> {
+    let mut cleats = Vec::new();
+    for j in jetties() {
+        for side_sign in [-1.0f32, 1.0] {
+            for k in 0..=cleat_station_count(j.len) {
+                cleats.push(cleat_point(&j, side_sign, k));
+            }
+        }
+    }
+    cleats
+}
+
+/// Cleats sit HALF a spacing off the pole stations, so every berth gets
+/// a pair straddling its centre — where a breast line actually wants to
+/// land — instead of one stud dead centre and one out at the berth
+/// boundary, where a pole already stands.
+const CLEAT_PHASE: f32 = CLEAT_SPACING * 0.5;
+
+/// How many cleat stations one face of a jetty carries.
+fn cleat_station_count(len: f32) -> usize {
+    ((len - POLE_ROOT_CLEARANCE - CLEAT_PHASE) / CLEAT_SPACING) as usize
+}
+
+/// The world point of the k-th cleat on one face of a jetty — the ONE
+/// generator behind both `cleat_positions` and the moored fleet's own
+/// breast lines. Shared rather than re-derived because a torn-out
+/// fitting is identified by its POSITION: a rope made fast to "the
+/// cleat" has to land on the very point the renderer draws a stud at,
+/// bit for bit, or the marina ends up with wreckage in one place and a
+/// usable cleat in another.
+fn cleat_point(j: &Jetty, side_sign: f32, k: usize) -> Vec2 {
+    let face = j.side() * (side_sign * JETTY_HALF_W);
+    let d = POLE_ROOT_CLEARANCE + CLEAT_PHASE + k as f32 * CLEAT_SPACING;
+    j.root + j.dir * d + face
+}
+
 /// A boat parked in a berth (a static collider in the Sim). Everything
 /// the renderer needs to draw it and its mooring lines is precomputed
 /// here, so it never has to go searching for poles or jetty faces.
@@ -289,8 +340,15 @@ pub struct MooredBoat {
     pub heading: f32,
     /// Unit berth axis: from the jetty face toward the pole pair.
     pub out: Vec2,
-    /// Where its inboard breast lines land on the jetty face.
+    /// The berth's own point on the jetty face — its inboard end lies
+    /// off here.
     pub jetty_face: Vec2,
+    /// The two pontoon cleats its breast lines are made fast to — the
+    /// studs straddling its own berth centre, from `cleat_point`, so the
+    /// ropes end where the renderer draws one. Ordered along the boat's
+    /// own `across` axis, so the rigging picks a side without
+    /// re-deriving the geometry.
+    pub breast_cleats: [Vec2; 2],
     /// The pole pair its outboard end is tied between.
     pub poles: [Vec2; 2],
     /// Most boats lie bow-to-jetty like the photos; a few moor bow-out.
@@ -349,6 +407,15 @@ pub fn moored_boats() -> Vec<MooredBoat> {
                     heading: bow_dir.y.atan2(bow_dir.x) + yaw,
                     out,
                     jetty_face: j.root + j.dir * mid + out * JETTY_HALF_W,
+                    // The pair straddling this berth's centre: with the
+                    // grid phased half a spacing, stations 2k and 2k+1
+                    // fall 1.25 m either side of it.
+                    breast_cleats: {
+                        let (a, b) =
+                            (cleat_point(j, side_sign, 2 * k), cleat_point(j, side_sign, 2 * k + 1));
+                        let across = Vec2::new(-out.y, out.x);
+                        if (b - a).dot(across) >= 0.0 { [a, b] } else { [b, a] }
+                    },
                     poles: [
                         j.root + j.dir * stations[k] + row,
                         j.root + j.dir * stations[k + 1] + row,
@@ -581,7 +648,7 @@ fn hull_length() -> f32 {
 /// points (see the array's own layout: bow, CCW around the port side to
 /// the stern point, then back up the starboard side). Reads the hull's
 /// real beam curve instead of assuming a flat average.
-fn hull_half_beam(x: f32) -> f32 {
+pub(crate) fn hull_half_beam(x: f32) -> f32 {
     let upper = &HULL_PTS[..5];
     let (bow_x, bow_b) = upper[0];
     let (stern_x, stern_b) = upper[upper.len() - 1];
@@ -1126,15 +1193,46 @@ pub struct InputState {
     /// Helm, -1 ..= 1. POSITIVE = the boat turns to STARBOARD (helm "to
     /// starboard"); the rudder blade itself deflects the other way.
     pub rudder: f32,
+    /// This tick's mooring-line order, if the crew is giving one — pass a
+    /// line, work one, or let one go. The LINES themSELVES are sim state
+    /// (like the engine spool); only the orders ride the input stream, so
+    /// a recording replays them exactly. One per tick is all a pair of
+    /// hands can issue at 120 Hz.
+    pub line: Option<LineCommand>,
+    /// Configuration: how fast a line goes ashore, m/s of connection
+    /// distance (see `line::LINE_PASS_SPEED`). A player setting rather
+    /// than a constant of the world, carried here so a recording replays
+    /// with the crew speed it was made at. Clamped in `tick`.
+    pub line_pass_speed: f32,
 }
 
 impl InputState {
-    pub const NEUTRAL: InputState = InputState { throttle: 0.0, rudder: 0.0 };
+    pub const NEUTRAL: InputState = InputState {
+        throttle: 0.0,
+        rudder: 0.0,
+        line: None,
+        line_pass_speed: LINE_PASS_SPEED,
+    };
 }
 
 // ---------------------------------------------------------------------------
 // Sim
 // ---------------------------------------------------------------------------
+
+/// The boat's kinematic state for one tick, as `tick` has already
+/// unpacked it — passed on to `step_lines` so the line code doesn't have
+/// to re-derive the frame (or re-borrow the body) to find its fairleads.
+#[derive(Clone, Copy)]
+struct BoatFrame {
+    pos: Vec2,
+    /// Bow direction (local +x) and port direction (local +y), world.
+    fwd: Vec2,
+    side: Vec2,
+    /// Hull velocity and yaw rate.
+    v: Vec2,
+    w: f32,
+    mass: f32,
+}
 
 pub struct Sim {
     bodies: RigidBodySet,
@@ -1177,6 +1275,12 @@ pub struct Sim {
     /// `THROTTLE_TAU`. Sim state (not input) — advanced only inside `tick`,
     /// reset for free by the fresh-`Sim`-per-run rule.
     engine: f32,
+    /// The mooring lines currently out, in the order they were passed.
+    /// Sim state on exactly the same footing as `engine`: the input
+    /// stream carries orders (`InputState::line`), `tick` owns the lines.
+    lines: Vec<Line>,
+    /// Next line id. Monotonic, never recycled — see `Line::id`.
+    next_line_id: u32,
     /// Ticks advanced since spawn.
     pub ticks: u64,
 }
@@ -1222,6 +1326,10 @@ impl Sim {
         let (vel, angvel) = self.boat_vel();
         let engine = self.engine;
         let mut sim = Self::build(design, true);
+        // Lines come across too: opening the keel editor while lying to
+        // your ropes must not quietly cast them all off.
+        sim.lines.clone_from(&self.lines);
+        sim.next_line_id = self.next_line_id;
         {
             let rb = &mut sim.bodies[sim.boat];
             rb.set_translation(vector![pos.x, pos.y], true);
@@ -1381,6 +1489,8 @@ impl Sim {
             att_flow,
             rudder,
             engine: 0.0,
+            lines: Vec::new(),
+            next_line_id: 0,
             ticks: 0,
         }
     }
@@ -1444,6 +1554,109 @@ impl Sim {
         rb.set_linvel(vector![rot.re * u, rot.im * u], true);
     }
 
+    /// The mooring lines currently out — read-only, for the HUD and the
+    /// renderer (which draws each one from this, so what is drawn IS
+    /// what pulls).
+    pub fn lines(&self) -> &[Line] {
+        &self.lines
+    }
+
+    /// World position of one of the boat's fairleads, at the sim's own
+    /// (un-interpolated) pose. The renderer transforms `Fairlead::local`
+    /// by its INTERPOLATED pose instead, so lines don't judder between
+    /// ticks; this is for tests and for anything wanting the true pose.
+    pub fn fairlead_world(&self, f: Fairlead) -> Vec2 {
+        let (pos, heading) = self.boat_pose();
+        let (c, s) = (heading.cos(), heading.sin());
+        let l = f.local();
+        pos + Vec2::new(l.x * c - l.y * s, l.x * s + l.y * c)
+    }
+
+    /// One tick of the mooring lines: apply this tick's order, run the
+    /// passing timers out, and pull on whatever is made fast. Split out
+    /// of `tick` only for readability — it is part of the same tick and
+    /// obeys the same rule (nothing here may be called from outside).
+    fn step_lines(&mut self, input: &InputState, boat: BoatFrame) {
+        let BoatFrame { pos, fwd, side, v, w, mass } = boat;
+        let to_world = |f: Fairlead| {
+            let l = f.local();
+            pos + fwd * l.x + side * l.y
+        };
+        if let Some(cmd) = input.line {
+            // Clamped defensively, like throttle and rudder: a corrupt
+            // recording must not be able to set a super-physical crew.
+            let pass_speed =
+                input.line_pass_speed.clamp(LINE_PASS_SPEED_MIN, LINE_PASS_SPEED_MAX);
+            crate::line::apply_command(
+                &mut self.lines,
+                &mut self.next_line_id,
+                cmd,
+                pass_speed,
+                to_world,
+            );
+        }
+        if self.lines.is_empty() {
+            return;
+        }
+        // Lines that leave this tick: a throw that fell short, or one
+        // that parted. `Vec::new` doesn't allocate, so the usual tick
+        // (nothing lost) stays allocation-free.
+        let mut lost: Vec<u32> = Vec::new();
+        let rb = &mut self.bodies[self.boat];
+        for line in &mut self.lines {
+            let p = to_world(line.fairlead);
+            let to_anchor = line.anchor.pos - p;
+            let dist = to_anchor.length();
+            match line.state {
+                LineState::Passing { elapsed, total } => {
+                    line.tension = 0.0;
+                    let elapsed = elapsed + PHYSICS_DT;
+                    if elapsed < total {
+                        line.state = LineState::Passing { elapsed, total };
+                    } else if dist > LINE_REACH_MAX {
+                        // The boat drifted away while the line was in the
+                        // air: it falls short, into the water.
+                        lost.push(line.id);
+                    } else {
+                        // Made fast at the length it turned out to be
+                        // when it landed — NOT the length it was thrown
+                        // at. Everything after this is hauling and
+                        // surging from here.
+                        line.scope = dist.clamp(LINE_SCOPE_MIN, LINE_SCOPE_MAX);
+                        line.state = LineState::Fast;
+                    }
+                }
+                LineState::Fast => {
+                    if dist <= line.scope {
+                        line.tension = 0.0; // slack: no pull at all
+                        continue;
+                    }
+                    let dir = to_anchor / dist;
+                    // Velocity of the fairlead itself (the hull's, plus
+                    // the yaw sweep at its own offset) — a line at the
+                    // quarter feels the stern's swing, not the COM's
+                    // motion.
+                    let r = p - pos;
+                    let v_pt = v + Vec2::new(-w * r.y, w * r.x);
+                    // The line stretches when its fairlead moves AWAY
+                    // from the anchor.
+                    let stretch_rate = -v_pt.dot(dir);
+                    let pull = line_pull(line.scope, dist, stretch_rate, mass);
+                    line.tension = pull;
+                    if pull >= LINE_MBL {
+                        lost.push(line.id); // parted
+                        continue;
+                    }
+                    let f = dir * pull;
+                    rb.add_force_at_point(vector![f.x, f.y], point![p.x, p.y], true);
+                }
+            }
+        }
+        if !lost.is_empty() {
+            self.lines.retain(|l| !lost.contains(&l.id));
+        }
+    }
+
     /// Advance one fixed step under the given environment and helm/engine
     /// inputs. All forces are recomputed here from the boat state + `env` +
     /// `input` — nothing outside `tick` may touch the physics (the Pegasus
@@ -1468,6 +1681,7 @@ impl Sim {
         let pos = Vec2::new(rb.translation().x, rb.translation().y);
         let v = Vec2::new(rb.linvel().x, rb.linvel().y);
         let w = rb.angvel();
+        let mass = rb.mass();
 
         // --- Hydrodynamic drag: the hull moving RELATIVE TO THE WATER.
         // A uniform current is just "the water moves"; the same formula
@@ -1499,7 +1713,7 @@ impl Sim {
         // 1-3 kn, Fn~0.05-0.15, so this doesn't disturb the friction fix's
         // own benchmark).
         let froude = surge.abs() / (G_EARTH * self.hull_length).sqrt();
-        let f_wave = rb.mass() * G_EARTH * wave_resistance_coefficient(froude) * surge.signum();
+        let f_wave = mass * G_EARTH * wave_resistance_coefficient(froude) * surge.signum();
         let f_surge = -fwd * (f_friction + f_wave);
         let f_sway = -side
             * (0.5 * RHO_WATER * self.keel.drag_area * sway * sway.abs()
@@ -1638,6 +1852,11 @@ impl Sim {
         let f_wash = side * (-K_WASH * thrust.max(0.0) * delta.sin());
         rb.add_force_at_point(vector![f_wash.x, f_wash.y], point![rud_pt.x, rud_pt.y], true);
 
+        // --- Mooring lines: the crew's orders, then whatever the ropes
+        // already out are pulling. Applied at each line's own fairlead,
+        // which is what makes a spring line work with no special case.
+        self.step_lines(input, BoatFrame { pos, fwd, side, v, w, mass });
+
         self.physics_pipeline.step(
             &self.gravity,
             &self.integration_params,
@@ -1675,8 +1894,8 @@ mod tests {
         }
     }
 
-    const FULL_AHEAD: InputState = InputState { throttle: 1.0, rudder: 0.0 };
-    const FULL_ASTERN: InputState = InputState { throttle: -1.0, rudder: 0.0 };
+    const FULL_AHEAD: InputState = InputState { throttle: 1.0, rudder: 0.0, ..InputState::NEUTRAL };
+    const FULL_ASTERN: InputState = InputState { throttle: -1.0, rudder: 0.0, ..InputState::NEUTRAL };
 
     // -----------------------------------------------------------------
     // Open-water performance benchmarks
@@ -1721,7 +1940,7 @@ mod tests {
             // Positive rudder = turn to starboard = heading (CCW+) falls,
             // so positive error/rate need positive helm to cancel.
             let rudder = (2.0 * h + 4.0 * w).clamp(-1.0, 1.0);
-            sim.tick(&Env::CALM, &InputState { throttle: 1.0, rudder });
+            sim.tick(&Env::CALM, &InputState { throttle: 1.0, rudder, ..InputState::NEUTRAL });
         }
         sim.boat_vel().0.length() / KN
     }
@@ -1760,7 +1979,7 @@ mod tests {
         let (_, mut last_h) = sim.boat_pose();
         for t in 0..(90.0 / PHYSICS_DT) as u32 {
             let ramp = (t as f32 * PHYSICS_DT / 2.0).min(1.0);
-            sim.tick(&Env::CALM, &InputState { throttle, rudder: ramp });
+            sim.tick(&Env::CALM, &InputState { throttle, rudder: ramp, ..InputState::NEUTRAL });
             dist += sim.boat_vel().0.length() * PHYSICS_DT;
             let (_, h) = sim.boat_pose();
             let mut dh = h - last_h;
@@ -1970,7 +2189,7 @@ mod tests {
         // water toward the hill shore — a starboard turn's ~20 m radius
         // arc sweeps into it without reaching anything.
         sim.set_forward_speed(1.29);
-        let turn = InputState { throttle: 0.0, rudder: 1.0 };
+        let turn = InputState { throttle: 0.0, rudder: 1.0, ..InputState::NEUTRAL };
         let mut dist = 0.0f32;
         let mut dpsi = 0.0f32;
         let (_, mut last_h) = sim.boat_pose();
@@ -2090,19 +2309,38 @@ mod tests {
 
     #[test]
     fn same_input_sequence_is_bit_identical() {
-        // Fresh sim + same input stream (env AND helm/engine) => bit-exact
-        // trajectory. This is the property future replays/verification will
-        // rely on; the engine spool state must not break it.
+        // Fresh sim + same input stream (env AND helm/engine AND the
+        // crew's line orders) => bit-exact trajectory. This is the
+        // property future replays/verification will rely on; neither the
+        // engine spool nor the lines-out state may break it.
+        // A pole 8 m abeam of the spawned boat's bow — derived from the
+        // pose, never hardcoded, for the same reason every other
+        // direction-sensitive test here is (the harbour's orientation
+        // has moved before).
+        let (spawn, heading) = start_pose();
+        let fwd = Vec2::new(heading.cos(), heading.sin());
+        let port = Vec2::new(-heading.sin(), heading.cos());
+        let bow = spawn + fwd * Fairlead::PortBow.local().x;
+        let mooring = Anchor { pos: bow + port * 8.0, kind: AnchorKind::Pole };
+        let line_order = |t: u64| match t {
+            100 => Some(LineCommand::MakeFast { fairlead: Fairlead::PortBow, anchor: mooring }),
+            // Ids start at 0 and are never recycled, so the first line
+            // passed in a fresh sim is id 0.
+            300..=900 => Some(LineCommand::Tend { id: 0, rate: 1.0 }),
+            1100..=1400 => Some(LineCommand::Tend { id: 0, rate: -1.0 }),
+            1800 => Some(LineCommand::CastOff { id: 0 }),
+            _ => None,
+        };
         let script = |t: u64| {
             if t < 600 {
                 (
                     Env { wind_from_deg: 200.0, wind_speed: 9.0, ..Env::CALM },
-                    InputState { throttle: 1.0, rudder: 0.0 },
+                    InputState { throttle: 1.0, rudder: 0.0, ..InputState::NEUTRAL },
                 )
             } else if t < 1200 {
                 (
                     Env { wind_from_deg: 200.0, wind_speed: 9.0, ..Env::CALM },
-                    InputState { throttle: 0.5, rudder: 0.7 },
+                    InputState { throttle: 0.5, rudder: 0.7, ..InputState::NEUTRAL },
                 )
             } else {
                 (
@@ -2112,17 +2350,27 @@ mod tests {
                         current_to_deg: 90.0,
                         current_speed: 0.8,
                     },
-                    InputState { throttle: -0.8, rudder: -0.3 },
+                    InputState { throttle: -0.8, rudder: -0.3, ..InputState::NEUTRAL },
                 )
             }
         };
         let mut a = Sim::new();
         let mut b = Sim::new();
         for t in 0..2400 {
-            let (env, input) = script(t);
+            let (env, base) = script(t);
+            let input = InputState { line: line_order(t), ..base };
             a.tick(&env, &input);
             b.tick(&env, &input);
+            // The line orders above are only worth scripting if they
+            // actually land — check the rope was really out and working
+            // before it was let go.
+            if t == 1500 {
+                let l = a.lines().first().expect("the scripted line should be fast by now");
+                assert!(l.is_fast());
+            }
         }
+        assert!(a.lines().is_empty(), "the scripted CastOff should have let it go");
+        assert_eq!(a.lines(), b.lines(), "line state must replay identically too");
         let (pa, ha) = a.boat_pose();
         let (pb, hb) = b.boat_pose();
         assert_eq!(pa.x.to_bits(), pb.x.to_bits());
@@ -2435,7 +2683,7 @@ mod tests {
             let mut sim = Sim::new();
             let h0 = sim.boat_pose().1;
             sim.set_forward_speed(2.5);
-            let input = InputState { throttle: 0.0, rudder };
+            let input = InputState { throttle: 0.0, rudder, ..InputState::NEUTRAL };
             run_input(&mut sim, &Env::CALM, &input, 1.5);
             sim.boat_pose().1 - h0
         };
@@ -2456,7 +2704,7 @@ mod tests {
         // remains.
         let turn = |throttle: f32, rudder: f32| {
             let mut sim = Sim::new();
-            run_input(&mut sim, &Env::CALM, &InputState { throttle, rudder }, 2.0);
+            run_input(&mut sim, &Env::CALM, &InputState { throttle, rudder, ..InputState::NEUTRAL }, 2.0);
             sim.boat_pose().1
         };
         let ahead_authority = turn(1.0, 1.0) - turn(1.0, -1.0);
@@ -2519,7 +2767,7 @@ mod tests {
         let initial_rate = |rudder: f32| {
             let mut sim = Sim::new();
             sim.set_forward_speed(3.0);
-            let input = InputState { throttle: 0.0, rudder };
+            let input = InputState { throttle: 0.0, rudder, ..InputState::NEUTRAL };
             for _ in 0..12 {
                 sim.tick(&Env::CALM, &input);
             }
@@ -2614,7 +2862,7 @@ mod tests {
             let mut sim = Sim::new();
             let h0 = sim.boat_pose().1;
             sim.set_forward_speed(u);
-            let input = InputState { throttle: 0.0, rudder: 1.0 };
+            let input = InputState { throttle: 0.0, rudder: 1.0, ..InputState::NEUTRAL };
             run_input(&mut sim, &Env::CALM, &input, 1.5);
             sim.boat_pose().1 - h0
         };
@@ -2713,5 +2961,322 @@ mod tests {
         assert_ne!(keel_a, keel_b, "keel coefficients must change with the new design");
         let expected = design_b.keel.derive();
         assert_eq!(keel_b, expected, "keel must match the new design's derived values");
+    }
+
+    // -----------------------------------------------------------------
+    // Mooring lines
+    // -----------------------------------------------------------------
+
+    use crate::line::{
+        Anchor, AnchorKind, LINE_HAUL_RATE, LINE_PASS_SPEED, LINE_REACH_MAX, LINE_SCOPE_MAX,
+        LINE_STRAIN_BREAK,
+    };
+
+    /// An open-water arena with the boat parked at the origin, bow east —
+    /// no harbour to collide with, so a line is the only thing holding
+    /// it. `set_pose` before the first tick is an initial condition, not
+    /// a mid-run teleport (same rule as the turning-circle tests).
+    fn line_arena() -> Sim {
+        let mut sim = Sim::new_open_water(&BoatDesign::hallberg_rassy_38());
+        sim.set_pose(0.0, 0.0, 0.0);
+        sim
+    }
+
+    fn order(cmd: LineCommand) -> InputState {
+        InputState { line: Some(cmd), ..InputState::NEUTRAL }
+    }
+
+    fn cleat(p: Vec2) -> Anchor {
+        Anchor { pos: p, kind: AnchorKind::Cleat }
+    }
+
+    /// Order a line and run until it is fast (or lost). Returns its id
+    /// and how many ticks the pass took.
+    fn pass_line(sim: &mut Sim, env: &Env, fairlead: Fairlead, at: Vec2) -> (u32, u32) {
+        sim.tick(env, &order(LineCommand::MakeFast { fairlead, anchor: cleat(at) }));
+        let id = sim.lines().last().expect("the order was refused").id;
+        let mut ticks = 1;
+        while sim.lines().iter().any(|l| l.id == id && !l.is_fast()) {
+            sim.tick(env, &InputState::NEUTRAL);
+            ticks += 1;
+        }
+        (id, ticks)
+    }
+
+    fn line_by(sim: &Sim, id: u32) -> Option<&Line> {
+        sim.lines().iter().find(|l| l.id == id)
+    }
+
+    /// Getting a line ashore takes time, and a long throw takes longer
+    /// than a short one — that is what makes closing the distance before
+    /// you reach for the rope worth doing. The setting doubles the crew's
+    /// speed and halves the time.
+    #[test]
+    fn passing_a_line_takes_time_proportional_to_the_distance() {
+        let bow = line_arena().fairlead_world(Fairlead::PortBow);
+        let short = pass_line(&mut line_arena(), &Env::CALM, Fairlead::PortBow, bow + Vec2::new(3.0, 0.0)).1;
+        let long = pass_line(&mut line_arena(), &Env::CALM, Fairlead::PortBow, bow + Vec2::new(9.0, 0.0)).1;
+        let ratio = long as f32 / short as f32;
+        assert!((ratio - 3.0).abs() < 0.1, "9 m took {ratio}x as long as 3 m, expected 3x");
+        assert!(
+            (short as f32 * PHYSICS_DT - 3.0 / LINE_PASS_SPEED).abs() < 0.05,
+            "a 3 m pass should take 3 m / {LINE_PASS_SPEED} m/s"
+        );
+
+        // The crew's speed is a setting, not a constant of the world.
+        let mut fast_crew = line_arena();
+        let anchor = cleat(bow + Vec2::new(9.0, 0.0));
+        let cmd = LineCommand::MakeFast { fairlead: Fairlead::PortBow, anchor };
+        let input = InputState {
+            line: Some(cmd),
+            line_pass_speed: LINE_PASS_SPEED * 2.0,
+            ..InputState::NEUTRAL
+        };
+        fast_crew.tick(&Env::CALM, &input);
+        let mut ticks = 1;
+        while !fast_crew.lines()[0].is_fast() {
+            fast_crew.tick(&Env::CALM, &InputState::NEUTRAL);
+            ticks += 1;
+        }
+        let ratio = long as f32 / ticks as f32;
+        assert!((ratio - 2.0).abs() < 0.1, "doubling the setting changed the pass by {ratio}x");
+    }
+
+    /// A line is made fast at whatever length it turned out to be when it
+    /// landed, and from then on it is SLACK until that length is used up:
+    /// closing on the anchor does nothing at all, opening away from it
+    /// eventually brings the rope up hard.
+    #[test]
+    fn a_line_holds_at_the_length_it_was_made_fast_at_and_is_slack_inside_it() {
+        let mut sim = line_arena();
+        let bow = sim.fairlead_world(Fairlead::PortBow);
+        let anchor = bow + Vec2::new(5.0, 0.0);
+        let (id, _) = pass_line(&mut sim, &Env::CALM, Fairlead::PortBow, anchor);
+        let scope = line_by(&sim, id).unwrap().scope;
+        assert!((scope - 5.0).abs() < 0.02, "made fast at {scope} m, threw at 5 m");
+
+        // Motor AT the anchor: the line just goes slack, never a pull.
+        let start = sim.boat_pose().0;
+        for _ in 0..(4.0 / PHYSICS_DT) as u32 {
+            sim.tick(&Env::CALM, &FULL_AHEAD);
+            assert_eq!(line_by(&sim, id).unwrap().tension, 0.0, "a closing line must not pull");
+        }
+        assert!((sim.boat_pose().0 - start).length() > 1.0, "the boat should be free to close");
+        assert!(line_by(&sim, id).unwrap().scope == scope, "scope must not change on its own");
+
+        // Now back away past the scope. Sampled over the whole run, not
+        // at one instant: arriving on a short line at a knot and a half
+        // SNATCHES — peak load runs to a good fraction of the breaking
+        // strain and the boat rebounds forward off it, going slack again
+        // before it settles. That bounce is the behaviour, not an
+        // artefact, so the check is on the envelope: the rope takes real
+        // load, and it never lets her past the stretch it would break at.
+        let mut peak_tension: f32 = 0.0;
+        let mut peak_dist: f32 = 0.0;
+        for _ in 0..(25.0 / PHYSICS_DT) as u32 {
+            sim.tick(&Env::CALM, &FULL_ASTERN);
+            let l = line_by(&sim, id).expect("a dock line should survive backing onto it");
+            peak_tension = peak_tension.max(l.tension);
+            peak_dist =
+                peak_dist.max((l.anchor.pos - sim.fairlead_world(Fairlead::PortBow)).length());
+        }
+        assert!(peak_tension > 1000.0, "backing past the scope only loaded it to {peak_tension} N");
+        assert!(
+            peak_dist < scope * (1.0 + LINE_STRAIN_BREAK),
+            "a full-astern surge stretched a {scope} m scope to {peak_dist} m"
+        );
+        // And she is still tethered: full astern cannot walk her away.
+        assert!(
+            (sim.boat_pose().0 - start).length() < scope + 6.0,
+            "the line should still be holding her"
+        );
+    }
+
+    /// Two lines out and a gale on the beam: the boat works on its ropes
+    /// but stays put. Without them the same wind walks it away.
+    #[test]
+    fn lines_hold_the_boat_against_a_gale() {
+        // Wind FROM the north pushes south; the anchors are north (to
+        // port of a boat lying bow-east), so the ropes take the load.
+        let gale = Env { wind_from_deg: 0.0, wind_speed: 20.0, ..Env::CALM };
+        let mut sim = line_arena();
+        for f in [Fairlead::PortBow, Fairlead::PortQuarter] {
+            let p = sim.fairlead_world(f);
+            pass_line(&mut sim, &gale, f, p + Vec2::new(0.0, 4.0));
+        }
+        let start = sim.boat_pose().0;
+        run(&mut sim, &gale, 60.0);
+        let held = (sim.boat_pose().0 - start).length();
+
+        let mut control = line_arena();
+        run(&mut control, &gale, 60.0);
+        let adrift = (control.boat_pose().0 - Vec2::ZERO).length();
+
+        assert!(held < 2.0, "moored boat wandered {held} m in a gale");
+        assert!(adrift > 20.0 * held, "control drifted {adrift} m vs {held} m moored");
+        assert!(
+            sim.lines().iter().all(|l| l.tension < LINE_MBL),
+            "a 20 m/s breeze must not part a dock line"
+        );
+    }
+
+    /// Hauling warps the boat up to the cleat — but only while the line
+    /// is light. It stalls when the load reaches what a person can hold,
+    /// which is the whole reason springs and the engine exist.
+    #[test]
+    fn hauling_in_warps_the_boat_toward_the_cleat() {
+        let mut sim = line_arena();
+        let waist = sim.fairlead_world(Fairlead::PortWaist);
+        let anchor = waist + Vec2::new(0.0, 6.0);
+        let (id, _) = pass_line(&mut sim, &Env::CALM, Fairlead::PortWaist, anchor);
+        let start = (anchor - sim.fairlead_world(Fairlead::PortWaist)).length();
+        let haul = order(LineCommand::Tend { id, rate: 1.0 });
+        for _ in 0..(40.0 / PHYSICS_DT) as u32 {
+            sim.tick(&Env::CALM, &haul);
+        }
+        let now = (anchor - sim.fairlead_world(Fairlead::PortWaist)).length();
+        assert!(now < start - 2.0, "hauling moved the boat only {} m", start - now);
+        // Against a gale off the cleat, the same haul gets nowhere: the
+        // line is already carrying more than a pair of hands can pull.
+        let gale = Env { wind_from_deg: 0.0, wind_speed: 20.0, ..Env::CALM };
+        let mut pinned = line_arena();
+        let waist = pinned.fairlead_world(Fairlead::PortWaist);
+        let (id, _) = pass_line(&mut pinned, &gale, Fairlead::PortWaist, waist + Vec2::new(0.0, 6.0));
+        run(&mut pinned, &gale, 10.0); // let it take up the load
+        let before = line_by(&pinned, id).unwrap().scope;
+        let haul = order(LineCommand::Tend { id, rate: 1.0 });
+        for _ in 0..(20.0 / PHYSICS_DT) as u32 {
+            pinned.tick(&gale, &haul);
+        }
+        let gathered = before - line_by(&pinned, id).unwrap().scope;
+        assert!(
+            gathered < 20.0 * LINE_HAUL_RATE * 0.05,
+            "hauled {gathered} m of a loaded line — that is a winch, not a crew"
+        );
+    }
+
+    /// Surging out in a controlled manner: the boat drops back down the
+    /// line at the pay-out rate rather than being let go.
+    #[test]
+    fn paying_out_eases_the_boat_off_under_control() {
+        let gale = Env { wind_from_deg: 0.0, wind_speed: 20.0, ..Env::CALM };
+        let mut sim = line_arena();
+        let waist = sim.fairlead_world(Fairlead::PortWaist);
+        let (id, _) = pass_line(&mut sim, &gale, Fairlead::PortWaist, waist + Vec2::new(0.0, 4.0));
+        run(&mut sim, &gale, 5.0);
+        let start = sim.boat_pose().0;
+        let pay = order(LineCommand::Tend { id, rate: -1.0 });
+        for _ in 0..(6.0 / PHYSICS_DT) as u32 {
+            sim.tick(&gale, &pay);
+        }
+        let moved = (sim.boat_pose().0 - start).length();
+        assert!(moved > 1.0, "paying out should let the boat fall back, moved {moved} m");
+        assert!(moved < 12.0, "paying out is controlled, not a release: moved {moved} m");
+        assert!(line_by(&sim, id).unwrap().scope <= LINE_SCOPE_MAX);
+    }
+
+    /// THE reason line forces are applied at the fairlead rather than at
+    /// the centre of mass: a line made fast forward, with the engine
+    /// ahead against it, pivots the boat about that fairlead and swings
+    /// her alongside. No spring-line mechanism exists in the code — this
+    /// falls out of the force acting where the rope actually is.
+    #[test]
+    fn a_spring_line_swings_the_boat_alongside() {
+        let mut sim = line_arena();
+        let bow = sim.fairlead_world(Fairlead::PortBow);
+        let (id, _) = pass_line(&mut sim, &Env::CALM, Fairlead::PortBow, bow + Vec2::new(0.0, 3.0));
+        let (start_pos, start_heading) = sim.boat_pose();
+        run_input(&mut sim, &Env::CALM, &FULL_AHEAD, 20.0);
+        let (pos, heading) = sim.boat_pose();
+        let swing = (heading - start_heading).to_degrees();
+        let toward = (pos - start_pos).y;
+
+        // Same throttle, no line: she just drives off ahead.
+        let mut control = line_arena();
+        run_input(&mut control, &Env::CALM, &FULL_AHEAD, 20.0);
+        let control_swing = (control.boat_pose().1 - start_heading).to_degrees();
+
+        assert!(swing > 45.0, "the spring only swung her {swing}°");
+        assert!(swing > control_swing.abs() * 3.0, "prop walk alone gave {control_swing}°");
+        assert!(toward > 0.5, "she should end up alongside the cleat, moved {toward} m");
+        assert!(line_by(&sim, id).is_some(), "the spring should hold, not part");
+    }
+
+    #[test]
+    fn casting_off_lets_the_boat_go() {
+        let gale = Env { wind_from_deg: 0.0, wind_speed: 20.0, ..Env::CALM };
+        let mut sim = line_arena();
+        let bow = sim.fairlead_world(Fairlead::PortBow);
+        let (id, _) = pass_line(&mut sim, &gale, Fairlead::PortBow, bow + Vec2::new(0.0, 4.0));
+        run(&mut sim, &gale, 10.0);
+        let held = sim.boat_pose().0;
+        sim.tick(&gale, &order(LineCommand::CastOff { id }));
+        assert!(sim.lines().is_empty());
+        run(&mut sim, &gale, 30.0);
+        assert!(
+            (sim.boat_pose().0 - held).length() > 5.0,
+            "cast off, she should blow away"
+        );
+    }
+
+    /// A throw that the boat drifts out from under falls in the water.
+    #[test]
+    fn a_line_that_falls_short_is_lost() {
+        let mut sim = line_arena();
+        let bow = sim.fairlead_world(Fairlead::PortBow);
+        let anchor = cleat(bow + Vec2::new(LINE_REACH_MAX - 0.5, 0.0));
+        let cmd = LineCommand::MakeFast { fairlead: Fairlead::PortBow, anchor };
+        sim.tick(&Env::CALM, &InputState { line: Some(cmd), ..FULL_ASTERN });
+        assert_eq!(sim.lines().len(), 1, "the order was in reach when given");
+        run_input(&mut sim, &Env::CALM, &FULL_ASTERN, 5.0);
+        assert!(sim.lines().is_empty(), "the boat backed out of reach; the line should be lost");
+    }
+
+    /// Changing the keel design while lying to your ropes must not cast
+    /// them off — `new_continuing` carries them across like the pose and
+    /// the engine spool.
+    #[test]
+    fn lines_survive_a_design_change() {
+        let mut sim = line_arena();
+        let bow = sim.fairlead_world(Fairlead::PortBow);
+        let (id, _) = pass_line(&mut sim, &Env::CALM, Fairlead::PortBow, bow + Vec2::new(4.0, 0.0));
+        let scope = line_by(&sim, id).unwrap().scope;
+        let next = sim.new_continuing(&BoatDesign::alajuela_38());
+        let carried = line_by(&next, id).expect("the line should still be fast");
+        assert_eq!(carried.scope, scope);
+        assert!(carried.is_fast());
+        // And a line passed afterwards still gets a fresh id — from a
+        // DIFFERENT handle, since one rope per fairlead is the rule.
+        let mut next = next;
+        let bow = next.fairlead_world(Fairlead::StbdBow);
+        let (id2, _) = pass_line(&mut next, &Env::CALM, Fairlead::StbdBow, bow + Vec2::new(4.0, 0.0));
+        assert_ne!(id2, id);
+    }
+
+
+    /// Cleats march the whole length of both faces, so there is one at
+    /// each end of a berth and one at its middle — and every one of them
+    /// is on the pontoon the renderer draws.
+    #[test]
+    fn cleats_line_both_faces_of_every_jetty() {
+        let cleats = cleat_positions();
+        let jetties = jetties();
+        assert!(cleats.len() > jetties.len() * 2 * 5);
+        for j in &jetties {
+            let face_cleats: Vec<&Vec2> = cleats
+                .iter()
+                .filter(|c| {
+                    let d = (**c - j.root).dot(j.dir);
+                    let off = (**c - j.root).dot(j.side()).abs();
+                    (0.0..=j.len).contains(&d) && (off - JETTY_HALF_W).abs() < 1e-3
+                })
+                .collect();
+            assert!(
+                face_cleats.len() >= 2 * (j.len / CLEAT_SPACING) as usize - 4,
+                "jetty of {} m carries only {} cleats",
+                j.len,
+                face_cleats.len()
+            );
+        }
     }
 }
