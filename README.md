@@ -49,10 +49,14 @@ enough to take a line (a rope to your neighbour hauls on her too). Drag from a f
 to one of them — or tap the fairlead, then tap the anchor — and the crew
 passes the line, which takes a moment longer the further it has to go.
 Tap a rope already out to HAUL it in, let it SLACK, or CAST OFF. Hauling
-only works while the line is light: a loaded rope will not come in by
-hand, which is what springs and the engine are for. How quickly the crew works is a setting — the
-gear button (or O) opens the settings menu, where LINE HANDLING trades
-rope work for boat handling.
+only works while the line is light: ten kilos, by default, is what a
+pair of hands can pull, and a loaded rope will not come in by hand —
+that is what springs and the engine are for. What the crew can do is up
+to you: the gear button (or O) opens the settings menu, with LINE
+HANDLING (how fast they get a line ashore), HAUL FORCE (how much they
+can pull, in place of that default) and
+LINE REACH (how far they can throw — 4 m by default, so you have to
+bring her alongside first).
 
 **Keyboard**:
 

@@ -17,11 +17,8 @@
 use crate::boat::{BoatDesign, RudderDesign};
 use crate::keel::{flat_plate_cd, KeelDerived, KeelProfile};
 use crate::line::{
-    anchor_fitting, fitting_broken, line_pull, weakest_link, Anchor, Fairlead, Fitting, Gave,
-    Hull, Line,
-    LineCommand, LineState, ShoreKind,
-    LINE_PASS_SPEED, LINE_PASS_SPEED_MAX,
-    LINE_PASS_SPEED_MIN, LINE_REACH_MAX, LINE_SCOPE_MAX, LINE_SCOPE_MIN,
+    anchor_fitting, fitting_broken, line_pull, weakest_link, Anchor, CrewLimits, Fairlead,
+    Fitting, Gave, Hull, Line, LineCommand, LineState, ShoreKind, LINE_SCOPE_MAX, LINE_SCOPE_MIN,
 };
 use glam::Vec2;
 use rapier2d::prelude::*;
@@ -919,7 +916,7 @@ const C_WAVE_K: f32 = 0.248;
 /// (deliberately zero, this is a top-down sim with no vertical dynamics).
 /// This is the real-world constant Froude number and hull-speed weight
 /// (`mass · G_EARTH`) are defined against.
-const G_EARTH: f32 = 9.81;
+pub(crate) const G_EARTH: f32 = 9.81;
 
 /// Wave-making resistance coefficient vs. Froude number — see the module
 /// comment above for the derivation. `Fn <= 0` (dead stop) correctly gives
@@ -1202,11 +1199,12 @@ pub struct InputState {
     /// a recording replays them exactly. One per tick is all a pair of
     /// hands can issue at 120 Hz.
     pub line: Option<LineCommand>,
-    /// Configuration: how fast a line goes ashore, m/s of connection
-    /// distance (see `line::LINE_PASS_SPEED`). A player setting rather
-    /// than a constant of the world, carried here so a recording replays
-    /// with the crew speed it was made at. Clamped in `tick`.
-    pub line_pass_speed: f32,
+    /// Configuration: what the crew can do with a rope — how fast they
+    /// get one ashore, how hard they can haul, how far they can throw
+    /// (see `line::CrewLimits`). Player settings rather than constants
+    /// of the world, carried here so a recording replays with the crew
+    /// it was made with. Clamped in `tick`.
+    pub crew: CrewLimits,
 }
 
 impl InputState {
@@ -1214,7 +1212,7 @@ impl InputState {
         throttle: 0.0,
         rudder: 0.0,
         line: None,
-        line_pass_speed: LINE_PASS_SPEED,
+        crew: CrewLimits::DEFAULT,
     };
 }
 
@@ -1927,16 +1925,15 @@ impl Sim {
                 }
             }
         };
+        // Clamped defensively, like throttle and rudder: a corrupt
+        // recording must not be able to set a super-physical crew.
+        let crew = input.crew.clamped();
         if let Some(cmd) = input.line {
-            // Clamped defensively, like throttle and rudder: a corrupt
-            // recording must not be able to set a super-physical crew.
-            let pass_speed =
-                input.line_pass_speed.clamp(LINE_PASS_SPEED_MIN, LINE_PASS_SPEED_MAX);
             crate::line::apply_command(
                 &mut self.lines,
                 &mut self.next_line_id,
                 cmd,
-                pass_speed,
+                crew,
                 &self.broken,
                 |f| world_of(&boat, f),
                 |a| anchor_of(a).0,
@@ -1975,12 +1972,12 @@ impl Sim {
             let to_anchor = anchor_at - p;
             let dist = to_anchor.length();
             match line.state {
-                LineState::Passing { elapsed, total } => {
+                LineState::Passing { elapsed, total, reach } => {
                     line.tension = 0.0;
                     let elapsed = elapsed + PHYSICS_DT;
                     if elapsed < total {
-                        line.state = LineState::Passing { elapsed, total };
-                    } else if dist > LINE_REACH_MAX {
+                        line.state = LineState::Passing { elapsed, total, reach };
+                    } else if dist > reach {
                         // The boat drifted away while the line was in the
                         // air: it falls short, into the water.
                         lost.push(line.id);
@@ -2678,7 +2675,11 @@ mod tests {
         let mut b = Sim::new();
         for t in 0..2400 {
             let (env, base) = script(t);
-            let input = InputState { line: line_order(t), ..base };
+            // The crew's limits ride the input stream like the helm, so
+            // the script sets them away from their defaults: a longer
+            // reach (the pole is 8 m off the bow) and a stronger pull.
+            let crew = CrewLimits { pass_speed: 3.0, haul_kg: 25.0, reach: 12.0 };
+            let input = InputState { line: line_order(t), crew, ..base };
             a.tick(&env, &input);
             b.tick(&env, &input);
             // The line orders above are only worth scripting if they
@@ -3315,8 +3316,9 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::line::{
-        Anchor, ShoreKind, DECK_FITTING_MBL, LINE_HAUL_RATE, LINE_MBL, LINE_PASS_SPEED,
-        LINE_REACH_MAX, LINE_SCOPE_MAX, PONTOON_CLEAT_MBL,
+        Anchor, CrewLimits, ShoreKind, DECK_FITTING_MBL, LINE_HAUL_RATE, LINE_MBL,
+        LINE_PASS_SPEED, LINE_PASS_SPEED_MIN, LINE_REACH, LINE_REACH_MAX, LINE_SCOPE_MAX,
+        PONTOON_CLEAT_MBL,
     };
 
     /// An open-water arena with the boat parked at the origin, bow east —
@@ -3333,6 +3335,19 @@ mod tests {
         InputState { line: Some(cmd), ..InputState::NEUTRAL }
     }
 
+    /// The same order from a crew who can throw as far as the setting
+    /// allows. The shipped reach is deliberately short — you have to
+    /// bring her alongside — but plenty of tests here are about what a
+    /// rope DOES once it is out, and a test can wind the setting up
+    /// exactly the way a player can.
+    fn order_far(cmd: LineCommand) -> InputState {
+        InputState {
+            line: Some(cmd),
+            crew: CrewLimits { reach: LINE_REACH_MAX, ..CrewLimits::DEFAULT },
+            ..InputState::NEUTRAL
+        }
+    }
+
     fn cleat(p: Vec2) -> Anchor {
         Anchor::Shore { pos: p, kind: ShoreKind::Cleat }
     }
@@ -3340,7 +3355,7 @@ mod tests {
     /// Order a line and run until it is fast (or lost). Returns its id
     /// and how many ticks the pass took.
     fn pass_line(sim: &mut Sim, env: &Env, fairlead: Fairlead, at: Vec2) -> (u32, u32) {
-        sim.tick(env, &order(LineCommand::MakeFast { fairlead, anchor: cleat(at) }));
+        sim.tick(env, &order_far(LineCommand::MakeFast { fairlead, anchor: cleat(at) }));
         let id = sim.lines().last().expect("the order was refused").id;
         let mut ticks = 1;
         while sim.lines().iter().any(|l| l.id == id && !l.is_fast()) {
@@ -3361,22 +3376,22 @@ mod tests {
     #[test]
     fn passing_a_line_takes_time_proportional_to_the_distance() {
         let bow = line_arena().fairlead_world(Fairlead::PortBow);
-        let short = pass_line(&mut line_arena(), &Env::CALM, Fairlead::PortBow, bow + Vec2::new(3.0, 0.0)).1;
-        let long = pass_line(&mut line_arena(), &Env::CALM, Fairlead::PortBow, bow + Vec2::new(9.0, 0.0)).1;
+        let short = pass_line(&mut line_arena(), &Env::CALM, Fairlead::PortBow, bow + Vec2::new(1.0, 0.0)).1;
+        let long = pass_line(&mut line_arena(), &Env::CALM, Fairlead::PortBow, bow + Vec2::new(3.0, 0.0)).1;
         let ratio = long as f32 / short as f32;
-        assert!((ratio - 3.0).abs() < 0.1, "9 m took {ratio}x as long as 3 m, expected 3x");
+        assert!((ratio - 3.0).abs() < 0.1, "3 m took {ratio}x as long as 1 m, expected 3x");
         assert!(
-            (short as f32 * PHYSICS_DT - 3.0 / LINE_PASS_SPEED).abs() < 0.05,
+            (long as f32 * PHYSICS_DT - 3.0 / LINE_PASS_SPEED).abs() < 0.05,
             "a 3 m pass should take 3 m / {LINE_PASS_SPEED} m/s"
         );
 
         // The crew's speed is a setting, not a constant of the world.
         let mut fast_crew = line_arena();
-        let anchor = cleat(bow + Vec2::new(9.0, 0.0));
+        let anchor = cleat(bow + Vec2::new(3.0, 0.0));
         let cmd = LineCommand::MakeFast { fairlead: Fairlead::PortBow, anchor };
         let input = InputState {
             line: Some(cmd),
-            line_pass_speed: LINE_PASS_SPEED * 2.0,
+            crew: CrewLimits { pass_speed: LINE_PASS_SPEED * 2.0, ..CrewLimits::DEFAULT },
             ..InputState::NEUTRAL
         };
         fast_crew.tick(&Env::CALM, &input);
@@ -3607,9 +3622,18 @@ mod tests {
     fn a_line_that_falls_short_is_lost() {
         let mut sim = line_arena();
         let bow = sim.fairlead_world(Fairlead::PortBow);
-        let anchor = cleat(bow + Vec2::new(LINE_REACH_MAX - 0.5, 0.0));
+        let anchor = cleat(bow + Vec2::new(LINE_REACH - 0.5, 0.0));
         let cmd = LineCommand::MakeFast { fairlead: Fairlead::PortBow, anchor };
-        sim.tick(&Env::CALM, &InputState { line: Some(cmd), ..FULL_ASTERN });
+        // A slow crew, so she has time to back out from under the throw
+        // before it lands — the whole point of the check.
+        sim.tick(
+            &Env::CALM,
+            &InputState {
+                line: Some(cmd),
+                crew: CrewLimits { pass_speed: LINE_PASS_SPEED_MIN, ..CrewLimits::DEFAULT },
+                ..FULL_ASTERN
+            },
+        );
         assert_eq!(sim.lines().len(), 1, "the order was in reach when given");
         run_input(&mut sim, &Env::CALM, &FULL_ASTERN, 5.0);
         assert!(sim.lines().is_empty(), "the boat backed out of reach; the line should be lost");
@@ -3774,7 +3798,7 @@ mod tests {
                 let anchor =
                     Anchor::Boat { hull: Hull::Moored(0), fairlead: Fairlead::PortQuarter };
                 let cmd = LineCommand::MakeFast { fairlead: Fairlead::PortBow, anchor };
-                sim.tick(&Env::CALM, &order(cmd));
+                sim.tick(&Env::CALM, &order_far(cmd));
                 assert_eq!(
                     sim.lines().iter().filter(|l| l.hull == Hull::Player).count(),
                     1,

@@ -202,9 +202,11 @@ already solves structurally, the same way Publish Pages does.
   HUD's touch claims. Opened by the gear button (bottom row, left of
   LINES) or **O**; closed by CLOSE, Escape, O again, or a tap on the
   dimmed scrim. Adding a setting is a row in `ROWS` plus an arm in
-  both `value` and `value_mut` (`draw` reads through the former). Currently holds one: LINE HANDLING, the crew's
-  line-passing speed, which the frame loop feeds to
-  `InputState::line_pass_speed` (so it still rides the recorded input
+  both `value` and `value_mut` (`draw` reads through the former). Currently holds three, all of
+  them the CREW rather than the world: LINE HANDLING (how fast a line
+  goes ashore), HAUL FORCE (what a pair of hands can pull, in kilos) and
+  LINE REACH (how far a line can be got ashore). The frame loop bundles
+  them into `InputState::crew` (so they still ride the recorded input
   stream — see Mooring lines).
   **Gotcha (found live, 2026-08-20)**: the key press or button tap that
   OPENS an overlay is still "pressed" when that overlay's own input runs
@@ -548,24 +550,40 @@ like Pegasus.
   - **Getting a line ashore takes time, proportional to the distance**
     (`LineState::Passing`): `dist / pass_speed`, so a metre off the
     pontoon is a step and a turn on the cleat while a full-reach throw is
-    ~3 s. A line is made fast at the length it turns out to be WHEN IT
-    LANDS, not when it was thrown, and if the boat has drifted past
-    `LINE_REACH_MAX` (12 m) by then the throw falls short and is lost.
-    Everything after that is hauling and surging from that length — which
-    is why a line goes visibly slack the moment you close on the cleat.
-  - **Pass speed is a SETTING, not a constant of the world**
-    (`InputState::line_pass_speed`, clamped 1–20 m/s in `tick` like
-    throttle and rudder): a player knob for how much of the game is rope
-    work, set in the settings menu (`src/settings.rs`) and carried in the
-    input stream rather than on the `Sim`, so a recording replays with
-    the crew speed it was made at.
+    a second or so. A line is made fast at the length it turns out to be
+    WHEN IT LANDS, not when it was thrown, and if the boat has drifted
+    out of reach by then the throw falls short and is lost. Everything
+    after that is hauling and surging from that length — which is why a
+    line goes visibly slack the moment you close on the cleat.
+    **The reach is checked at exactly two moments, both in sim-core**:
+    when the order is given (`apply_command`, against the distance right
+    then) and when the line LANDS (`step_lines`, at the `Passing → Fast`
+    transition). Never in between, and never once it is fast — after
+    that the scope is fixed and the rope simply stretches. The landing
+    check uses the reach the throw was made under, carried on
+    `LineState::Passing`, not the live setting: winding the knob down
+    while a line is in the air must not retroactively lose it.
+  - **The crew's limits are SETTINGS, not constants of the world**
+    (`CrewLimits { pass_speed, haul_kg, reach }` on `InputState`,
+    `clamped()` at the top of `tick` exactly like throttle and rudder):
+    how fast a line goes ashore (1–20 m/s), what a pair of hands can
+    pull (1–150 kg, default 10) and how far a line can be thrown
+    (1–25 m, **default 4** — owner call 2026-08-21: short enough that
+    you have to bring her alongside, rather than mooring by rope from
+    half a berth away). Player knobs for how much of the game is rope
+    work, set in the settings menu (`src/settings.rs`) and carried in
+    the input stream rather than on the `Sim`, so a recording would
+    replay with the crew it was made with. One struct rather than three loose
+    fields, so `apply_command` doesn't grow a parameter per knob.
   - **Tending is force-limited one way and not the other.** Hauling in
-    derates linearly to zero as the line's own tension approaches
-    `LINE_HAUL_FORCE_MAX` (700 N, about what a person can hold), so you
-    cannot winch 8.5 t up to the pontoon against a breeze by hand — you
-    rig a spring and use the engine, and the crew gathers the slack you
-    make. Surging out isn't limited (a turn round a cleat, let it run)
-    but stops at `LINE_SCOPE_MAX`, the end of the rope.
+    derates linearly to zero as the line's own tension approaches what
+    the crew can pull — `CrewLimits::haul_kg`, **10 kg by default**
+    (owner call, 2026-08-21), expressed in kilos because that is how
+    anyone talks about what they can hold on a rope. So you cannot winch
+    8.5 t up to the pontoon against a breeze by hand — you rig a spring
+    and use the engine, and the crew gathers the slack you make. Surging
+    out isn't limited (a turn round a cleat, let it run) but stops at
+    `LINE_SCOPE_MAX`, the end of the rope.
   - **Fairleads are read off `HULL_PTS`** (the shoulder vertex, the
     waist, midway along the aft run — the outline's own half-beam at each
     station), so a fairlead is always exactly on the hull the renderer

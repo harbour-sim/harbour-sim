@@ -19,7 +19,7 @@
 
 use harbour_sim_core::line::{
     anchor_fitting, fitting_broken, Anchor, Fairlead, Fitting, Gave, Hull, Line, LineCommand,
-    LineState, ShoreKind, LINE_COUNT_MAX, LINE_MBL, LINE_REACH_MAX,
+    LineState, ShoreKind, LINE_COUNT_MAX, LINE_MBL,
 };
 use macroquad::prelude::*;
 use std::collections::VecDeque;
@@ -318,9 +318,9 @@ impl MooringUi {
                 // likely thing that just happened, and silence there is
                 // what makes the limit feel like a broken control.
                 let out = (cx.view.s2w(p) - cx.fairlead_world(f)).length();
-                if out > LINE_REACH_MAX {
+                if out > cx.reach {
                     self.say(&format!(
-                        "too far to throw - {out:.0} m, reach is {LINE_REACH_MAX:.0} m"
+                        "too far to throw - {out:.0} m, reach is {:.0} m", cx.reach
                     ));
                 }
                 self.armed = None;
@@ -336,8 +336,8 @@ impl MooringUi {
     fn order_pass(&mut self, fairlead: Fairlead, anchor: Anchor, cx: &Ctx) {
         let reach = (cx.anchor_pos(anchor) - cx.fairlead_world(fairlead)).length();
         let mine = cx.lines.iter().filter(|l| l.hull == Hull::Player);
-        if reach > LINE_REACH_MAX {
-            self.say(&format!("too far to throw - {reach:.0} m, reach is {LINE_REACH_MAX:.0} m"));
+        if reach > cx.reach {
+            self.say(&format!("too far to throw - {reach:.0} m, reach is {:.0} m", cx.reach));
         } else if cx.lines.iter().any(|l| l.hull == Hull::Player && l.fairlead == fairlead) {
             self.say(&format!("the {} already has a line on it", fairlead.label()));
         } else if mine.count() >= LINE_COUNT_MAX {
@@ -365,7 +365,7 @@ impl MooringUi {
         let from = cx.fairlead_world(f);
         cx.reachable()
             .into_iter()
-            .filter(|a| ((cx.anchor_pos(*a) - from).length() <= LINE_REACH_MAX) == within)
+            .filter(|a| ((cx.anchor_pos(*a) - from).length() <= cx.reach) == within)
             .map(|a| (a, (cx.view.w2s(cx.anchor_pos(a)) - p).length()))
             .filter(|(_, d)| *d <= r)
             .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -391,6 +391,10 @@ pub struct Ctx<'a> {
     /// Fittings torn out this run — no longer offered, and drawn as the
     /// wreckage they are.
     pub broken: &'a [Fitting],
+    /// The crew's LIVE reach (m) — a player setting, so the ring on the
+    /// water, the refusal messages and the anchors offered all have to
+    /// read it rather than a constant.
+    pub reach: f32,
     pub layout: MooringLayout,
 }
 
@@ -428,7 +432,7 @@ impl Ctx<'_> {
     /// held in a list because they MOVE — and only for hulls near
     /// enough to matter, which is a handful at most.
     pub fn reachable(&self) -> Vec<Anchor> {
-        let near = LINE_REACH_MAX + 14.0;
+        let near = self.reach + 14.0;
         let mut v: Vec<Anchor> = self
             .anchors
             .iter()
@@ -648,7 +652,7 @@ pub fn draw_handles(ui: &MooringUi, cx: &Ctx) {
     // everything a fairlead could actually make.
     for a in cx.reachable() {
         let at = cx.anchor_pos(a);
-        if !Fairlead::ALL.iter().any(|&f| (at - cx.fairlead_world(f)).length() <= LINE_REACH_MAX) {
+        if !Fairlead::ALL.iter().any(|&f| (at - cx.fairlead_world(f)).length() <= cx.reach) {
             continue;
         }
         let s = cx.view.w2s(at);
@@ -688,9 +692,9 @@ pub fn draw_handles(ui: &MooringUi, cx: &Ctx) {
     if let Some(f) = ui.armed {
         let at = cx.fairlead_world(f);
         let c = cx.view.w2s(at);
-        draw_circle_lines(c.x, c.y, LINE_REACH_MAX * scale, 1.5, REACH_RING);
+        draw_circle_lines(c.x, c.y, cx.reach * scale, 1.5, REACH_RING);
         if let Some(Grab::Pass(_, p)) = ui.grab {
-            let over = (p - c).length() > LINE_REACH_MAX * scale;
+            let over = (p - c).length() > cx.reach * scale;
             draw_line(c.x, c.y, p.x, p.y, if over { 3.0 } else { 2.0 },
                       if over { TOO_FAR } else { ARMED });
         }

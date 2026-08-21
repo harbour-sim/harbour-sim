@@ -248,8 +248,24 @@ pub fn weakest_link(anchor: Anchor) -> (f32, Gave) {
 /// How far a line can be got ashore, metres. A heaving line goes further
 /// than this in real life; this is the game constraint that stops rope
 /// from substituting for boat handling — you have to bring the boat
-/// within a berth's width of the cleat before you can use it.
-pub const LINE_REACH_MAX: f32 = 12.0;
+/// alongside before you can use it.
+///
+/// A DEFAULT, not a constant of the world: the live value is a player
+/// setting (`CrewLimits::reach`). At 4 m she has to be close enough to
+/// step ashore, which is the point.
+pub const LINE_REACH: f32 = 4.0;
+
+/// Range the reach setting is clamped to: from arm's length to the
+/// length of the rope itself. The top end is DERIVED from
+/// `LINE_SCOPE_MAX` rather than picked, because you cannot get a line
+/// ashore further than the rope reaches: a line made fast beyond it
+/// would be born longer than its own rope, and the first surge order
+/// would then clamp the scope back and shorten it by metres in a single
+/// tick — several kN of tension and a likely torn-out fitting, from a
+/// PAY-OUT order (CodeRabbit review, 2026-08-21; the two constants were
+/// 25 m and 20 m and could drift apart).
+pub const LINE_REACH_MIN: f32 = 1.0;
+pub const LINE_REACH_MAX: f32 = LINE_SCOPE_MAX;
 
 /// Default rate at which a line goes ashore (m/s of connection
 /// distance). Getting a line on takes TIME, proportional to how far it
@@ -275,12 +291,64 @@ pub const LINE_PASS_SPEED_MAX: f32 = 20.0;
 /// Free-running haul-in rate (m/s), hand over hand.
 pub const LINE_HAUL_RATE: f32 = 0.6;
 
-/// Pull (N) at which hauling stops dead — roughly what one person can
-/// hold on a line. Haul rate derates linearly to zero as the line's own
-/// tension approaches it, which is the real limit this models: you cannot
-/// winch 8.5 tonnes up to the pontoon against a breeze by hand. You rig a
-/// spring and use the engine, and the line takes up the slack you make.
-pub const LINE_HAUL_FORCE_MAX: f32 = 700.0;
+/// What the crew can pull, in KILOS — the weight they could hold hanging
+/// on the rope, which is how anyone actually talks about this. Hauling
+/// derates linearly to zero as the line's own tension approaches it, and
+/// that is the real limit being modelled: you cannot winch 8.5 tonnes up
+/// to the pontoon against a breeze by hand. You rig a spring and use the
+/// engine, and the crew gathers the slack you make.
+///
+/// A DEFAULT, not a constant of the world: the live value is a player
+/// setting (`CrewLimits::haul_kg`).
+pub const LINE_HAUL_KG: f32 = 10.0;
+
+/// Range the setting is clamped to: a child on the foredeck at one end,
+/// two strong people tailing at the other.
+pub const LINE_HAUL_KG_MIN: f32 = 1.0;
+pub const LINE_HAUL_KG_MAX: f32 = 150.0;
+
+/// The crew's own limits, as opposed to the rope's or the boat's. Player
+/// SETTINGS, carried in the input stream rather than held on the `Sim`,
+/// so a recording replays with the crew it was made with — the same
+/// split as the helm and the engine telegraph.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CrewLimits {
+    /// How fast a line goes ashore, m/s of connection distance.
+    pub pass_speed: f32,
+    /// What one pair of hands can hold, kilos.
+    pub haul_kg: f32,
+    /// How far a line can be got ashore, metres.
+    pub reach: f32,
+}
+
+impl CrewLimits {
+    pub const DEFAULT: CrewLimits =
+        CrewLimits { pass_speed: LINE_PASS_SPEED, haul_kg: LINE_HAUL_KG, reach: LINE_REACH };
+
+    /// Every field brought inside its published range. Applied once at
+    /// the top of `tick`, exactly like the throttle and helm clamps: a
+    /// corrupt recording must not be able to command a super-physical
+    /// crew.
+    pub fn clamped(self) -> CrewLimits {
+        CrewLimits {
+            pass_speed: self.pass_speed.clamp(LINE_PASS_SPEED_MIN, LINE_PASS_SPEED_MAX),
+            haul_kg: self.haul_kg.clamp(LINE_HAUL_KG_MIN, LINE_HAUL_KG_MAX),
+            reach: self.reach.clamp(LINE_REACH_MIN, LINE_REACH_MAX),
+        }
+    }
+
+    /// The haul limit as a FORCE (N), which is what the tension it is
+    /// compared against is measured in.
+    pub fn haul_force(self) -> f32 {
+        self.haul_kg * crate::sim::G_EARTH
+    }
+}
+
+impl Default for CrewLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 /// Surging rate (m/s) when paying out — a turn round a cleat, let it run.
 /// Faster than hauling: gravity and load are helping.
@@ -390,8 +458,10 @@ pub enum LineState {
     /// Being passed ashore — the heaving line is in the air, or the crew
     /// is stepping off with the eye. Nothing holds yet. `total` is how
     /// long the pass takes end to end, so the renderer can show it
-    /// running out.
-    Passing { elapsed: f32, total: f32 },
+    /// running out; `reach` is the throw's OWN limit, carried from the
+    /// moment it left the hand so that winding the reach setting while a
+    /// line is in the air cannot retroactively lose it.
+    Passing { elapsed: f32, total: f32, reach: f32 },
     /// Made fast, working.
     Fast,
 }
@@ -432,7 +502,7 @@ impl Line {
     /// Fraction of the pass completed, 0..1 (1 once fast).
     pub fn pass_progress(&self) -> f32 {
         match self.state {
-            LineState::Passing { elapsed, total } => (elapsed / total.max(1e-3)).clamp(0.0, 1.0),
+            LineState::Passing { elapsed, total, .. } => (elapsed / total.max(1e-3)).clamp(0.0, 1.0),
             LineState::Fast => 1.0,
         }
     }
@@ -487,7 +557,7 @@ pub(crate) fn apply_command(
     lines: &mut Vec<Line>,
     next_id: &mut u32,
     cmd: LineCommand,
-    pass_speed: f32,
+    crew: CrewLimits,
     broken: &[Fitting],
     fairlead_world: impl Fn(Fairlead) -> Vec2,
     anchor_world: impl Fn(Anchor) -> Vec2,
@@ -526,7 +596,7 @@ pub(crate) fn apply_command(
                 return;
             }
             let dist = (anchor_world(anchor) - fairlead_world(fairlead)).length();
-            if dist > LINE_REACH_MAX {
+            if dist > crew.reach {
                 return; // nobody can get a line that far
             }
             let id = *next_id;
@@ -539,7 +609,8 @@ pub(crate) fn apply_command(
                 scope: dist,
                 state: LineState::Passing {
                     elapsed: 0.0,
-                    total: (dist / pass_speed).max(PHYSICS_DT),
+                    total: (dist / crew.pass_speed).max(PHYSICS_DT),
+                    reach: crew.reach,
                 },
                 tension: 0.0,
             });
@@ -552,7 +623,7 @@ pub(crate) fn apply_command(
                 if rate > 0.0 {
                     // Hauling in: what you can gather is what the line
                     // isn't already holding.
-                    let slip = (1.0 - l.tension / LINE_HAUL_FORCE_MAX).clamp(0.0, 1.0);
+                    let slip = (1.0 - l.tension / crew.haul_force()).clamp(0.0, 1.0);
                     l.scope = (l.scope - rate * LINE_HAUL_RATE * slip * PHYSICS_DT)
                         .max(LINE_SCOPE_MIN);
                 } else if rate < 0.0 {
@@ -714,7 +785,7 @@ mod tests {
             &mut slack,
             &mut id,
             LineCommand::Tend { id: 1, rate: 1.0 },
-            LINE_PASS_SPEED,
+            CrewLimits::DEFAULT,
             &[],
             |_| Vec2::new(10.0, 0.0),
             shore_at,
@@ -722,17 +793,96 @@ mod tests {
         let gathered = 10.0 - slack[0].scope;
         assert!((gathered - LINE_HAUL_RATE * PHYSICS_DT).abs() < 1e-6);
 
-        let mut loaded = fast_line(10.0, LINE_HAUL_FORCE_MAX);
+        let mut loaded = fast_line(10.0, CrewLimits::DEFAULT.haul_force());
         crate::line::apply_command(
             &mut loaded,
             &mut id,
             LineCommand::Tend { id: 1, rate: 1.0 },
-            LINE_PASS_SPEED,
+            CrewLimits::DEFAULT,
             &[],
             |_| Vec2::new(10.0, 0.0),
             shore_at,
         );
         assert_eq!(loaded[0].scope, 10.0, "a fully loaded line should not come in");
+    }
+
+    /// A line can never be born longer than its own rope. The reach
+    /// setting's ceiling is derived from `LINE_SCOPE_MAX` for exactly
+    /// this: at the top of the knob, a throw at maximum range still
+    /// makes fast within the rope, so the first surge order cannot clamp
+    /// the scope back and snatch metres out of it (CodeRabbit review,
+    /// 2026-08-21).
+    #[test]
+    fn a_line_is_never_made_fast_longer_than_the_rope() {
+        let mut lines = Vec::new();
+        let mut id = 0;
+        let crew = CrewLimits { reach: LINE_REACH_MAX, ..CrewLimits::DEFAULT };
+        // A throw at the very limit of the longest reach the knob allows.
+        let far = |_: Anchor| Vec2::new(crew.clamped().reach, 0.0);
+        crate::line::apply_command(
+            &mut lines,
+            &mut id,
+            LineCommand::MakeFast {
+                fairlead: Fairlead::PortBow,
+                anchor: Anchor::Shore { pos: Vec2::ZERO, kind: ShoreKind::Cleat },
+            },
+            crew,
+            &[],
+            |_| Vec2::ZERO,
+            far,
+        );
+        let scope = lines[0].scope;
+        assert!(
+            scope <= LINE_SCOPE_MAX,
+            "made fast at {scope} m on a {LINE_SCOPE_MAX} m rope"
+        );
+        // ...and surging out therefore cannot shorten it.
+        let line_id = lines[0].id;
+        lines[0].state = LineState::Fast;
+        crate::line::apply_command(
+            &mut lines,
+            &mut id,
+            LineCommand::Tend { id: line_id, rate: -1.0 },
+            crew,
+            &[],
+            |_| Vec2::ZERO,
+            far,
+        );
+        assert!(
+            lines[0].scope >= scope,
+            "a pay-out order shortened the line from {scope} m to {}",
+            lines[0].scope
+        );
+    }
+
+    /// How hard the crew can pull is a SETTING, not a constant of the
+    /// world: the same tension that stops a weak crew dead is nothing to
+    /// a strong one. Ten kilos is the default — a rope, not a winch.
+    #[test]
+    fn what_the_crew_can_pull_is_a_setting() {
+        // A load a 10 kg crew cannot move at all, being their whole limit.
+        let load = CrewLimits::DEFAULT.haul_force();
+        let gathered = |haul_kg: f32| -> f32 {
+            let mut lines = fast_line(10.0, load);
+            let mut id = 9;
+            crate::line::apply_command(
+                &mut lines,
+                &mut id,
+                LineCommand::Tend { id: 1, rate: 1.0 },
+                CrewLimits { haul_kg, ..CrewLimits::DEFAULT },
+                &[],
+                |_| Vec2::new(10.0, 0.0),
+                shore_at,
+            );
+            10.0 - lines[0].scope
+        };
+        assert_eq!(gathered(LINE_HAUL_KG), 0.0, "their own limit stops the default crew dead");
+        let strong = gathered(LINE_HAUL_KG * 4.0);
+        assert!(strong > 0.0, "four times the crew should still be gathering, got {strong} m");
+        assert!(
+            strong < LINE_HAUL_RATE * PHYSICS_DT,
+            "but still derated by the load, not hauling free"
+        );
     }
 
     /// Surging out is not force-limited (a turn round a cleat, let it
@@ -746,7 +896,7 @@ mod tests {
                 &mut lines,
                 &mut id,
                 LineCommand::Tend { id: 1, rate: -1.0 },
-                LINE_PASS_SPEED,
+                CrewLimits::DEFAULT,
                 &[],
                 |_| Vec2::new(10.0, 0.0),
                 shore_at,
@@ -761,11 +911,11 @@ mod tests {
         let mut id = 0;
         let cmd = LineCommand::MakeFast {
             fairlead: Fairlead::PortBow,
-            anchor: Anchor::Shore { pos: Vec2::new(LINE_REACH_MAX + 1.0, 0.0),
+            anchor: Anchor::Shore { pos: Vec2::new(LINE_REACH + 1.0, 0.0),
                 kind: ShoreKind::Pole,
             },
         };
-        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, &[], |_| Vec2::ZERO, shore_at);
+        crate::line::apply_command(&mut lines, &mut id, cmd, CrewLimits::DEFAULT, &[], |_| Vec2::ZERO, shore_at);
         assert!(lines.is_empty());
         assert_eq!(id, 0, "a refused order must not burn an id");
     }
@@ -779,20 +929,20 @@ mod tests {
         let mut id = 0;
         let cmd = LineCommand::MakeFast {
             fairlead: Fairlead::PortBow,
-            anchor: Anchor::Shore { pos: Vec2::new(5.0, 0.0), kind: ShoreKind::Cleat },
+            anchor: Anchor::Shore { pos: Vec2::new(3.0, 0.0), kind: ShoreKind::Cleat },
         };
-        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, &[], |_| Vec2::ZERO, shore_at);
+        crate::line::apply_command(&mut lines, &mut id, cmd, CrewLimits::DEFAULT, &[], |_| Vec2::ZERO, shore_at);
         let first = lines[0].id;
         crate::line::apply_command(
             &mut lines,
             &mut id,
             LineCommand::CastOff { id: first },
-            LINE_PASS_SPEED,
+            CrewLimits::DEFAULT,
             &[],
             |_| Vec2::ZERO,
             shore_at,
         );
-        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, &[], |_| Vec2::ZERO, shore_at);
+        crate::line::apply_command(&mut lines, &mut id, cmd, CrewLimits::DEFAULT, &[], |_| Vec2::ZERO, shore_at);
         assert_ne!(lines[0].id, first);
     }
 
@@ -811,8 +961,8 @@ mod tests {
         };
         // Any anchor resolves 5 m off the bow here — near enough to
         // reach, so only the hull check can refuse it.
-        let near = |_: Anchor| Vec2::new(5.0, 0.0);
-        crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, &[], |_| Vec2::ZERO, near);
+        let near = |_: Anchor| Vec2::new(3.0, 0.0);
+        crate::line::apply_command(&mut lines, &mut id, cmd, CrewLimits::DEFAULT, &[], |_| Vec2::ZERO, near);
         assert!(lines.is_empty(), "she cannot haul on herself");
         // A rope to the boat in the next berth is still fine.
         let neighbour = LineCommand::MakeFast {
@@ -823,7 +973,7 @@ mod tests {
             &mut lines,
             &mut id,
             neighbour,
-            LINE_PASS_SPEED,
+            CrewLimits::DEFAULT,
             &[],
             |_| Vec2::ZERO,
             near,
@@ -837,18 +987,18 @@ mod tests {
         let mut id = 0;
         let cmd = LineCommand::MakeFast {
             fairlead: Fairlead::PortBow,
-            anchor: Anchor::Shore { pos: Vec2::new(5.0, 0.0), kind: ShoreKind::Cleat },
+            anchor: Anchor::Shore { pos: Vec2::new(3.0, 0.0), kind: ShoreKind::Cleat },
         };
         for _ in 0..4 {
-            crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, &[], |_| Vec2::ZERO, shore_at);
+            crate::line::apply_command(&mut lines, &mut id, cmd, CrewLimits::DEFAULT, &[], |_| Vec2::ZERO, shore_at);
         }
         assert_eq!(lines.len(), 1, "a fumbled second gesture must not double the line");
         // ...and a different handle is still free.
         let other = LineCommand::MakeFast {
             fairlead: Fairlead::StbdBow,
-            anchor: Anchor::Shore { pos: Vec2::new(5.0, 0.0), kind: ShoreKind::Cleat },
+            anchor: Anchor::Shore { pos: Vec2::new(3.0, 0.0), kind: ShoreKind::Cleat },
         };
-        crate::line::apply_command(&mut lines, &mut id, other, LINE_PASS_SPEED, &[], |_| Vec2::ZERO, shore_at);
+        crate::line::apply_command(&mut lines, &mut id, other, CrewLimits::DEFAULT, &[], |_| Vec2::ZERO, shore_at);
         assert_eq!(lines.len(), 2);
     }
 
@@ -861,9 +1011,9 @@ mod tests {
         for f in Fairlead::ALL.iter().chain(Fairlead::ALL.iter()) {
             let cmd = LineCommand::MakeFast {
                 fairlead: *f,
-                anchor: Anchor::Shore { pos: Vec2::new(5.0, 0.0), kind: ShoreKind::Cleat },
+                anchor: Anchor::Shore { pos: Vec2::new(3.0, 0.0), kind: ShoreKind::Cleat },
             };
-            crate::line::apply_command(&mut lines, &mut id, cmd, LINE_PASS_SPEED, &[], |_| Vec2::ZERO, shore_at);
+            crate::line::apply_command(&mut lines, &mut id, cmd, CrewLimits::DEFAULT, &[], |_| Vec2::ZERO, shore_at);
         }
         assert_eq!(lines.len(), Fairlead::ALL.len().min(LINE_COUNT_MAX));
     }
