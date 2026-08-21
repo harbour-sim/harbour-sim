@@ -12,7 +12,7 @@
 //! written directly in css px.
 
 use harbour_sim_core::boat::BoatDesign;
-use harbour_sim_core::line::{Anchor, Fitting, Hull, ShoreKind, LINE_PASS_SPEED};
+use harbour_sim_core::line::{Anchor, Fitting, Hull, ShoreKind};
 use harbour_sim_core::sim::{
     Env, HULL_PTS, InputState, JETTY_HALF_W, PHYSICS_DT, POLE_RADIUS, Sim, cleat_positions,
     head_arc, hill_shore, jetties, marina_shore_len, pole_positions, road_shore, world_bounds,
@@ -298,7 +298,7 @@ async fn main() {
     // hauling, the speed setting) — they are mutually exclusive by hand.
     let mut mooring = MooringUi::new();
     // Configuration lives in its own menu, not in the play HUD.
-    let mut settings = SettingsMenu::new(LINE_PASS_SPEED);
+    let mut settings = SettingsMenu::new();
     let mut mooring_touch: Option<(u64, Vec2)> = None;
     // Last frame's camera centre, the companion to `last_scale`: input
     // runs before the camera block, so world↔screen hit-testing uses the
@@ -483,6 +483,7 @@ async fn main() {
                 anchors: &anchors,
                 lines: sim.lines(),
                 broken: sim.broken_fittings(),
+                reach: settings.reach,
                 layout: mooring_layout,
             };
 
@@ -832,7 +833,7 @@ async fn main() {
                     // queued one-shots first, then a held HAUL/SLACK repeated
                     // for as long as it is held.
                     input.line = mooring.next_command(sim.lines());
-                    input.line_pass_speed = settings.line_pass_speed;
+                    input.crew = settings.crew();
                     sim.tick(&env, &input);
                     mooring.report_failures(sim.line_failures());
                     (cur_pos, cur_heading) = sim.boat_pose();
@@ -1153,6 +1154,7 @@ async fn main() {
             anchors: &anchors,
             lines: sim.lines(),
             broken: sim.broken_fittings(),
+            reach: settings.reach,
             layout: mooring_layout,
         };
         mooring::draw_ropes(&mooring_ctx, mooring.selected, visible);

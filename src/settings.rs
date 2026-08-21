@@ -12,7 +12,10 @@
 //! `value_mut` — `draw` reads through the former, so a row with only the
 //! latter panics on the first frame the menu is open.
 
-use harbour_sim_core::line::{LINE_PASS_SPEED_MAX, LINE_PASS_SPEED_MIN};
+use harbour_sim_core::line::{
+    CrewLimits, LINE_HAUL_KG, LINE_HAUL_KG_MAX, LINE_HAUL_KG_MIN, LINE_PASS_SPEED,
+    LINE_PASS_SPEED_MAX, LINE_PASS_SPEED_MIN, LINE_REACH, LINE_REACH_MAX, LINE_REACH_MIN,
+};
 use macroquad::prelude::*;
 
 /// One adjustable value: a labelled slider with a line of explanation,
@@ -28,21 +31,52 @@ struct Row {
     step: f32,
 }
 
-const ROWS: [Row; 1] = [Row {
-    label: "LINE HANDLING",
-    note: "how fast the crew gets a line ashore",
-    unit: "m/s",
-    min: LINE_PASS_SPEED_MIN,
-    max: LINE_PASS_SPEED_MAX,
-    step: 0.5,
-}];
+const ROWS: [Row; 3] = [
+    Row {
+        label: "LINE HANDLING",
+        note: "how fast the crew gets a line ashore",
+        unit: "m/s",
+        min: LINE_PASS_SPEED_MIN,
+        max: LINE_PASS_SPEED_MAX,
+        step: 0.5,
+    },
+    Row {
+        label: "HAUL FORCE",
+        note: "what the crew can pull, hand over hand",
+        unit: "kg",
+        min: LINE_HAUL_KG_MIN,
+        max: LINE_HAUL_KG_MAX,
+        step: 1.0,
+    },
+    Row {
+        label: "LINE REACH",
+        note: "how far a line can be got ashore",
+        unit: "m",
+        min: LINE_REACH_MIN,
+        max: LINE_REACH_MAX,
+        step: 0.5,
+    },
+];
+
+/// A row without a value would panic on the first frame the menu is
+/// drawn, so the count is checked here instead: add a row and this stops
+/// compiling until `value` and `value_mut` grow an arm to match
+/// (CodeRabbit review, 2026-08-21 — the module note above was the only
+/// thing enforcing it).
+const _: () = assert!(
+    ROWS.len() == 3,
+    "every ROWS entry needs an arm in both `value` and `value_mut`",
+);
 
 pub struct SettingsMenu {
     pub active: bool,
-    /// Rate at which a line goes ashore (m/s of connection distance) —
-    /// fed to `InputState::line_pass_speed`, which is where it becomes
-    /// part of the recorded input stream. See `line::LINE_PASS_SPEED`.
+    /// What the crew can do with a rope: how fast they get one ashore,
+    /// how hard they can haul, how far they can throw. Fed to
+    /// `InputState::crew`, which is where these become part of the
+    /// recorded input stream. See `line::CrewLimits`.
     pub line_pass_speed: f32,
+    pub haul_kg: f32,
+    pub reach: f32,
     /// Which row's slider a press owns, and the finger holding it — the
     /// same one-claim-per-control rule as the HUD.
     grab: Option<usize>,
@@ -70,7 +104,11 @@ impl SettingsLayout {
     pub fn centred(sw: f32, sh: f32, fs: f32) -> SettingsLayout {
         let pad = fs * 1.2;
         let w = (sw * 0.86).min(fs * 26.0);
-        let row_h = fs * 3.4;
+        // A row spans from its label (0.45 fs above the track) to its
+        // note (0.95 fs below it), about 3.8 fs all told — the pitch has
+        // to clear that or one row's note lands on the next row's label,
+        // which is exactly what happened when the menu grew past one row.
+        let row_h = fs * 4.4;
         let h = pad * 2.0 + fs * 2.2 + ROWS.len() as f32 * row_h + fs * 2.6;
         let panel = Rect::new((sw - w) * 0.5, (sh - h) * 0.5, w, h);
         let mut tracks = [Rect::new(0.0, 0.0, 0.0, 0.0); ROWS.len()];
@@ -94,10 +132,12 @@ impl SettingsLayout {
 }
 
 impl SettingsMenu {
-    pub fn new(line_pass_speed: f32) -> SettingsMenu {
+    pub fn new() -> SettingsMenu {
         SettingsMenu {
             active: false,
-            line_pass_speed,
+            line_pass_speed: LINE_PASS_SPEED,
+            haul_kg: LINE_HAUL_KG,
+            reach: LINE_REACH,
             grab: None,
             touch: None,
             prev_touch_ids: Vec::new(),
@@ -117,15 +157,19 @@ impl SettingsMenu {
     fn value_mut(&mut self, row: usize) -> &mut f32 {
         match row {
             0 => &mut self.line_pass_speed,
+            1 => &mut self.haul_kg,
+            2 => &mut self.reach,
             _ => unreachable!("every row has a value"),
         }
     }
 
     fn value(&self, row: usize) -> f32 {
-        match row {
-            0 => self.line_pass_speed,
-            _ => unreachable!("every row has a value"),
-        }
+        [self.line_pass_speed, self.haul_kg, self.reach][row]
+    }
+
+    /// The settings as sim-core wants them, ready for `InputState::crew`.
+    pub fn crew(&self) -> CrewLimits {
+        CrewLimits { pass_speed: self.line_pass_speed, haul_kg: self.haul_kg, reach: self.reach }
     }
 
     fn set_from(&mut self, row: usize, x: f32, layout: &SettingsLayout) {
