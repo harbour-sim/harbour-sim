@@ -166,8 +166,13 @@ already solves structurally, the same way Publish Pages does.
   to their pole pairs and breast lines to the jetty, rounded silt-ringed
   bay head NE, open sea SW with a skerry chain at the world's edge — and
   the player's boat), HUD
-  (wind/current dials, throttle/rudder sliders, SOG readout, key help),
-  keel design editor overlay (`E`). All static scenery (jetty list, poles,
+  (conditions panel, throttle/rudder sliders, SOG readout, key help),
+  keel design editor overlay (`E`), scenario modal (`V`, see
+  `src/scenario.rs`). All in-game touch/mouse claims and the pan/pinch
+  gestures live in ONE `HudInput` struct, because every overlay
+  transition has to reset all of them at once
+  (`HudInput::overlay_transition`) and copies of that reset scattered
+  over six call sites went stale one field at a time. All static scenery (jetty list, poles,
   moored fleet, both shore polylines, world bounds) is fetched from
   sim-core ONCE before the loop; curved shores render via
   `offset_polyline` + `draw_strip` (quad strips between polylines), and
@@ -220,6 +225,30 @@ already solves structurally, the same way Publish Pages does.
   lever arm that turns sway force into yaw moment. When adjustable mass
   distribution lands (Roadmap), the marker must read the design instead
   of this constant.
+- `src/scenario.rs` — the **scenario modal** (2026-08-21): wind and
+  current used to be two draggable dials pinned in the HUD's top
+  corners; they are SETTINGS of the run rather than controls flown
+  during it, so they moved behind a modal (`V`, or tap the conditions
+  panel) that freezes physics like the keel editor does. Owns everything
+  env-facing in the UI: the `Dial` struct (moved here verbatim with the
+  settings it drives), `WIND_MAX`/`CURRENT_MAX` and the keyboard rates,
+  the modal's own layout/input/draw, AND the HUD's read-only conditions
+  panel (`hud_panel_rect`/`draw_hud_panel`, top-left, sized from the
+  actual label strings) — the panel and the modal share one `draw_face`
+  helper so the small indicator and the big dial can't drift apart. The
+  modal edits a COPY of `Env`: Apply (button, Enter, or the V that
+  opened it) hands it back to `main`, Cancel (button, Esc) drops it.
+  Four **condition presets** (Calm / Onshore / Offshore / Wind v tide,
+  keys 1-4) are written RELATIVE to the marina's down-channel bearing,
+  which `main` reads off `road_shore()` — same derive-it-from-the-
+  geometry rule the direction-sensitive sim-core tests follow, so a
+  preset labelled "onshore" still blows onto the dock row if the harbour
+  is ever re-laid or re-mirrored. Its two button rows carry a MINIMUM
+  height in css px (32/40) on top of the shared `ui` scaling, and the
+  card grows by whatever those minimums add: at the small end of `ui` a
+  purely proportional row is ~17 px tall, and on a phone this modal is
+  the only way to set the conditions at all. Frontend-only, like the
+  keel editor — nothing here touches physics.
 - `index.html` — web wrapper: boot guard (standalone script ahead of the
   bundle that paints script errors on screen), loading overlay,
   `__GIT_REVISION__` placeholder (deploy-time sed → wasm `?v=` cache-buster),
@@ -257,7 +286,8 @@ already solves structurally, the same way Publish Pages does.
   that silently kills the whole inline script. Pick distinct names.
   **Gotcha (2026-08-03)**: `canvas.onmouseup` (and `onmousedown`/
   `onmousemove`) is wired to the canvas element only, not `window`. Click a
-  draggable HUD control (e.g. a wind/current dial), drag the pointer outside
+  draggable HUD control (e.g. the throttle slider, or a dial in the
+  scenario modal), drag the pointer outside
   the *browser window*, and release there: no `mouseup` DOM event fires
   anywhere, so miniquad's button-down state sticks `true` forever and
   `is_mouse_button_down` never goes false — the drag claim in `main.rs`
@@ -957,21 +987,29 @@ like Pegasus.
   A CENTER button (twin of the C key) appears left of KEEL ONLY while
   the offset is >0.5 m; C, CENTER, R-reset and editor Apply all zero it
   (zoom persists throughout).
-- **Touch controls**: the two HUD compass indicators are draggable **dials**
-  (`Dial` struct) — drag direction from the dial centre = the flow's TOWARD
-  direction (wind label still displays the mariners' FROM convention:
-  from = to + 180°), drag distance = speed (rim = `WIND_MAX`/`CURRENT_MAX`,
-  centre dead-zone = calm). The helm/engine are **sliders** (`Slider`
-  struct) on the mid-left (throttle, vertical, up = ahead) and mid-right
-  (rudder, horizontal, right = starboard helm) edges — the two-thumb zone;
-  both HOLD where left (a real single-lever control / helm with friction —
-  agreed in review, no spring-return) with a 10% centre detent and the
-  dials' 1/20 quantisation, centred at `0.56·sh` to clear the dials+labels
+- **Touch controls**: the helm/engine are **sliders** (`Slider` struct) on
+  the mid-left (throttle, vertical, up = ahead) and mid-right (rudder,
+  horizontal, right = starboard helm) edges — the two-thumb zone; both
+  HOLD where left (a real single-lever control / helm with friction —
+  agreed in review, no spring-return) with a 10% centre detent and a
+  1/20 quantisation, centred at `0.56·sh` to clear the conditions panel
   above and the buttons below down to ~360 px min-dim. A RESET button
-  (bottom-right) twins the R key. Mouse drives the same controls via
-  press/drag (`mouse_claim` discriminants: 0 wind, 1 current, 2 throttle,
-  3 rudder). `simulate_mouse_with_touch(false)` at startup so touches
-  don't double as mouse presses. **Touch claims are by
+  (bottom-right) twins the R key; tapping the top-left **conditions
+  panel** opens the scenario modal (the touch twin of V — without it
+  there'd be no way to set wind and current on a touch-only device, the
+  same parity rule that put the KEEL button on screen). The draggable
+  wind/current **dials** are inside that modal now (`Dial` struct, moved
+  to `src/scenario.rs`): drag direction from the dial centre = the
+  flow's TOWARD direction (the wind label still displays the mariners'
+  FROM convention: from = to + 180°), drag distance = speed (rim =
+  `WIND_MAX`/`CURRENT_MAX`, centre dead-zone = calm). Mouse drives the
+  same controls via press/drag (`HudInput::mouse_claim` discriminants:
+  0 throttle, 1 rudder, 2 pan; the modal keeps its own 0 wind / 1
+  current). `simulate_mouse_with_touch(false)` at startup so touches
+  don't double as mouse presses. The SOG/STW readout is centred in what
+  the conditions panel leaves free, not in the window: on a phone the
+  panel reaches past the centre line, which the narrow wind dial it
+  replaced did not. **Touch claims are by
   id-not-seen-last-frame, NOT `TouchPhase::Started`** — touchstart
   collapses into the following touchmove whenever touch events outpace
   the frame loop (the hard-won Pegasus phase-collapse lesson; a `Started`
@@ -998,20 +1036,27 @@ like Pegasus.
   boil forward along the quarters astern; the rudder blade itself is drawn
   BEFORE the hull fill (root under the counter), swinging by the same
   blade-angle formula sim-core uses.
-- Controls: touch/mouse = drag the dials/sliders + RESET/KEEL buttons
-  (+ CENTER while panned), pinch = zoom, one-finger/mouse drag on the
-  water = pan, scroll wheel / +/- keys = zoom and C = centre (desktop
-  twins);
+- Controls: touch/mouse = drag the sliders + tap the conditions panel /
+  RESET / KEEL buttons (+ CENTER while panned), pinch = zoom,
+  one-finger/mouse drag on the water = pan, scroll wheel / +/- keys =
+  zoom and C = centre (desktop twins);
   keyboard = **the boat has the primary keys** (agreed 2026-08-03: driving
   is the main activity): W/S throttle up/down, A/D helm port/starboard
-  (continuous `is_key_down`×dt like the env keys), Space = engine to
-  neutral (edge-triggered). Wind keeps ←/→ dir + ↑/↓ speed; current sits
-  on the IJKL "second arrows" cluster (J/L dir, I/K speed) — which is why
-  the keel editor moved from K to **E** (K = current speed down now). R
+  (continuous `is_key_down`×dt), Space = engine to neutral
+  (edge-triggered). **V opens the scenario modal** (2026-08-21 — S and C,
+  the obvious mnemonics, are throttle-down and centre-camera), and the
+  wind/current keys live INSIDE it: ←/→ wind dir + ↑/↓ wind speed, the
+  IJKL "second arrows" cluster for the current (J/L dir, I/K speed),
+  1-4 for the condition presets, Enter = Apply, Esc = Cancel; closing
+  with V keeps the edits. Those keys being env keys is still why the
+  keel editor sits on **E** rather than K. Each overlay key is guarded
+  against the other (`E` is ignored while the modal is open and vice
+  versa) — one overlay at a time. R
   reset (reset = `respawn(&design)`, a fresh `Sim::new_with_design`,
   never an in-place teleport; env is kept but **helm/engine reset to
   `InputState::NEUTRAL`** — a fresh boat doesn't inherit a live
-  telegraph), E keel design editor (freezes physics — all input and the
+  telegraph; the scenario's conditions are kept too), E keel design
+  editor (freezes physics — all input and the
   physics tick, not just rendering — while open; Apply builds a fresh
   `Sim` via `Sim::new_continuing` which keeps position, heading,
   velocity, engine spool, and helm/engine input — the user sees the
@@ -1053,7 +1098,9 @@ like Pegasus.
 - **Ropes**: placeable mooring lines (bow/stern/springs) — each a constraint
   or spring force between a hull fairlead and a quay bollard, applied inside
   `tick` from an extended `InputState`. Then: scenarios (approach, spring
-  off a lee quay, …), recordings/replays (the Pegasus hybrid format),
+  off a lee quay, …) — the scenario modal (`src/scenario.rs`) is where a
+  named scenario would be chosen; today it holds the conditions half of
+  one (wind, current, four presets) and nothing else, recordings/replays (the Pegasus hybrid format),
   scoring. (Touch controls and engine/rudder are done — see Frontend
   conventions and Simulation model above.)
 
