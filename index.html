@@ -264,7 +264,7 @@
     // Stuck-drag fix — see CLAUDE.md. The vendored bundle wires mouseup to
     // the canvas only, so a release that happens after the pointer has left
     // the browser window never reaches miniquad: its button-down state
-    // sticks forever and a drag claim (e.g. a HUD dial) stays "grabbed" on
+    // sticks forever and a drag claim (e.g. a HUD slider) stays "grabbed" on
     // return. Primary fix: Pointer Capture — once set on pointerdown, the
     // browser is spec-required to keep delivering pointerup/pointermove to
     // `canvas` even while the pointer is outside the window (verified in
