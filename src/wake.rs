@@ -29,7 +29,7 @@
 //! are computed from water-relative motion throughout.
 
 use harbour_sim_core::boat::BoatDesign;
-use harbour_sim_core::sim::{Env, HULL_PTS, Sim, hull_com_x, waterline_extent};
+use harbour_sim_core::sim::{Env, HULL_PTS, Sim, hull_com_x, prop_station, waterline_extent};
 use macroquad::prelude::*;
 
 /// Hull stations sampled for shed turbulence, spread over the design's
@@ -175,10 +175,12 @@ impl Wake {
 
         for i in 0..STATIONS + 1 {
             let prop = i == STATIONS;
-            // The prop churns at the blade's own station — the blade
-            // stands in the race, so that is where the race is.
+            // The race is shed at the PROP's own station, which sits
+            // `PROP_AHEAD_OF_RUDDER` forward of the blade — read from
+            // sim-core so the churn appears where `tick` actually
+            // applies thrust, not half a metre abaft it.
             let x = if prop {
-                design.rudder.x
+                prop_station(design.rudder.x)
             } else {
                 aft + (fore - aft) * (i as f32 + 0.5) / STATIONS as f32
             };

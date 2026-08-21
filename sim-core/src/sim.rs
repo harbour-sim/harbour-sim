@@ -922,6 +922,16 @@ const U_PROP_RACE: f32 = 6.0;
 /// instead of being a constant that silently ends up abaft a
 /// forward-mounted spade.
 const PROP_AHEAD_OF_RUDDER: f32 = 0.5;
+
+/// The propeller's station along the hull (local x, m) for a blade at
+/// `rudder_x` — see [`PROP_AHEAD_OF_RUDDER`]. `tick` applies thrust, prop
+/// walk and the wash here; `pub` so the renderer sheds the prop race's
+/// churned water from the same place rather than re-deriving it (the
+/// single-source-of-truth rule that already covers the harbour geometry
+/// and `HULL_PTS` — what's drawn IS what acts).
+pub fn prop_station(rudder_x: f32) -> f32 {
+    rudder_x + PROP_AHEAD_OF_RUDDER
+}
 /// First-order engine spool time constant (s): the delivered thrust chases
 /// the telegraph, it doesn't step. Sim state (`Sim::engine`), advanced only
 /// inside `tick` — deterministic.
@@ -1578,7 +1588,7 @@ impl Sim {
             let adv = surge * n.signum() / (n.abs() * U_PROP_RACE);
             t_max * n * n.abs() * (1.0 - adv * adv.abs()).clamp(-1.0, 2.0)
         };
-        let prop = pos + fwd * (self.rudder.x + PROP_AHEAD_OF_RUDDER);
+        let prop = pos + fwd * prop_station(self.rudder.x);
         let f_thrust = fwd * thrust;
         rb.add_force_at_point(vector![f_thrust.x, f_thrust.y], point![prop.x, prop.y], true);
         // Prop walk (right-handed prop): at heading 0, `side` = port (+y).

@@ -456,7 +456,12 @@ like Pegasus.
   real geometry on every reference boat has the prop just forward of its
   rudder, and it's load-bearing: the prop-wash steering term assumes the
   blade stands in the race, which is only true if the prop leads it
-  whatever design is active. `Sim.engine` is the
+  whatever design is active. Exposed as `sim::prop_station(rudder_x)`
+  (2026-08-21, CodeRabbit review on PR #29) so the renderer's wake sheds
+  the race where `tick` actually applies thrust — it had re-derived the
+  station as the blade's own `x` and put the churn half a metre abaft
+  the prop. Same single-source-of-truth rule as the harbour geometry and
+  `HULL_PTS`. `Sim.engine` is the
   telegraph filtered by a first-order lag (`THROTTLE_TAU` 0.4 s) — sim
   STATE, not input, advanced only inside `tick` and reset for free by the
   fresh-`Sim`-per-run rule (`engine_spools_rather_than_steps`). Thrust =
