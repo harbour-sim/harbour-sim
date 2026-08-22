@@ -92,7 +92,14 @@ pub struct MooringUi {
     /// Ids of lines that were still going ashore last frame, so one that
     /// vanishes can be reported as a throw that fell short.
     passing: Vec<u32>,
+    /// Set when a fitting gave this frame, so `prune` doesn't mistake a
+    /// rope that went with it for a throw that fell short.
+    fitting_news: bool,
 }
+
+/// A handle keeps presses inside this fraction of the grab radius even
+/// when a rope made fast to it measures marginally nearer — see `press`.
+const HANDLE_OWN: f32 = 0.45;
 
 /// How long a note stays up.
 const NOTE_SECS: f64 = 2.6;
@@ -114,6 +121,7 @@ impl MooringUi {
             queue: VecDeque::new(),
             note: None,
             passing: Vec::new(),
+            fitting_news: false,
         }
     }
 
@@ -155,6 +163,13 @@ impl MooringUi {
     /// the kind of silence the notes exist to prevent. Called once per
     /// physics tick, and almost always with an empty slice.
     pub fn report_failures(&mut self, failures: &[(u32, Hull, Gave)]) {
+        if !failures.is_empty() {
+            // A fitting going takes every line that was on it, so some of
+            // this frame's vanished ropes never "fell short" — they lost
+            // what they were tied to. `prune` runs after us and must not
+            // overwrite the accurate message with its guess.
+            self.fitting_news = true;
+        }
         // The player's own ropes first — but a mooring parting on a
         // berthed boat is worth hearing about too, because she is now
         // lying to one rope fewer and it is very likely your fault.
@@ -179,10 +194,13 @@ impl MooringUi {
             self.selected = None;
         }
         // A line that was in the air and is now gone never landed: the
-        // boat drifted out of reach while it was being passed.
-        if self.passing.iter().any(|id| !lines.iter().any(|l| l.id == *id)) {
+        // boat drifted out of reach while it was being passed. Unless a
+        // fitting gave this frame — then it was taken with whatever it
+        // was tied to, and `report_failures` has already said so.
+        if !self.fitting_news && self.passing.iter().any(|id| !lines.iter().any(|l| l.id == *id)) {
             self.say("the line fell short - she drifted out of reach");
         }
+        self.fitting_news = false;
         self.passing.clear();
         self.passing
             .extend(lines.iter().filter(|l| l.hull == Hull::Player && !l.is_fast()).map(|l| l.id));
@@ -209,6 +227,7 @@ impl MooringUi {
         self.queue.clear();
         self.passing.clear();
         self.note = None;
+        self.fitting_news = false;
     }
 
     /// Try to take a fresh press. Returns true if it belongs to us — the
@@ -260,7 +279,17 @@ impl MooringUi {
         // stops that stealing presses meant for a handle.
         let rope = nearest_line(p, cx, r * 1.4);
         match (handle, rope) {
-            (Some((f, df)), Some((_, dr))) if df <= dr => {
+            // Nearest wins, EXCEPT inside a handle's own tight footprint,
+            // which it keeps. A rope's inboard end is exactly its
+            // fairlead and `dist_to_rope` measures to the nearest point
+            // on the rope, so for any press displaced along it the rope
+            // is nearer by a hair — without this exception a fairlead
+            // that already has a rope could never be armed for a second
+            // one, which is the point of allowing several (2026-08-21).
+            // The footprint is deliberately much tighter than the full
+            // grab radius, so ropes stay selectable everywhere else near
+            // the boat: that is the bug nearest-wins exists to fix.
+            (Some((f, df)), Some((_, dr))) if df <= dr || df <= r * HANDLE_OWN => {
                 self.arm(f, p);
                 true
             }
@@ -338,8 +367,15 @@ impl MooringUi {
         let mine = cx.lines.iter().filter(|l| l.hull == Hull::Player);
         if reach > cx.reach {
             self.say(&format!("too far to throw - {reach:.0} m, reach is {:.0} m", cx.reach));
-        } else if cx.lines.iter().any(|l| l.hull == Hull::Player && l.fairlead == fairlead) {
-            self.say(&format!("the {} already has a line on it", fairlead.label()));
+        } else if cx
+            .lines
+            .iter()
+            .any(|l| l.hull == Hull::Player && l.fairlead == fairlead && l.anchor == anchor)
+        {
+            // Several ropes off one fairlead, or several onto one cleat,
+            // are ordinary mooring practice and allowed. The same rope
+            // twice is not: it would lie on top of the first.
+            self.say(&format!("the {} already has a line to there", fairlead.label()));
         } else if mine.count() >= LINE_COUNT_MAX {
             self.say("no line left to spare - cast one off first");
         } else {

@@ -17,8 +17,9 @@
 use crate::boat::{BoatDesign, RudderDesign};
 use crate::keel::{flat_plate_cd, KeelDerived, KeelProfile};
 use crate::line::{
-    anchor_fitting, fitting_broken, line_pull, weakest_link, Anchor, CrewLimits, Fairlead,
-    Fitting, Gave, Hull, Line, LineCommand, LineState, ShoreKind, LINE_SCOPE_MAX, LINE_SCOPE_MIN,
+    anchor_fitting, line_on_broken_fitting, line_pull, weakest_link, Anchor,
+    CrewLimits, Fairlead, Fitting, Gave, Hull, Line, LineCommand, LineState, ShoreKind,
+    LINE_SCOPE_MAX, LINE_SCOPE_MIN,
 };
 use glam::Vec2;
 use rapier2d::prelude::*;
@@ -1537,10 +1538,7 @@ impl Sim {
         // a fleet boat would quietly get a carried-away cleat back while
         // `broken_fittings()` still has the renderer drawing the holes it
         // left. A fitting torn out earlier this run stays torn out.
-        sim.lines.retain(|l| {
-            !fitting_broken(&sim.broken, Fitting::Deck(l.hull, l.fairlead))
-                && !anchor_fitting(l.anchor).is_some_and(|f| fitting_broken(&sim.broken, f))
-        });
+        sim.lines.retain(|l| !line_on_broken_fitting(&sim.broken, l));
         {
             let rb = &mut sim.bodies[sim.boat];
             rb.set_translation(vector![pos.x, pos.y], true);
@@ -2047,7 +2045,15 @@ impl Sim {
             }
         }
         if !lost.is_empty() {
-            self.lines.retain(|l| !lost.contains(&l.id));
+            // What gave takes every line that depended on it, not only
+            // the one that overloaded it: a cleat torn off the pontoon
+            // cannot still be holding its neighbour's rope, and a deck
+            // fitting that has left the boat cannot still be holding a
+            // second rope led from the same fairlead. Only the line that
+            // actually overloaded is reported in `failures` — the others
+            // did not fail, they lost what they were tied to.
+            self.lines
+                .retain(|l| !lost.contains(&l.id) && !line_on_broken_fitting(&self.broken, l));
         }
     }
 
@@ -3482,6 +3488,67 @@ mod tests {
             sim.boat_vel().0.length() < 2.0,
             "she left at {} m/s — that is a catapult, not a parted mooring",
             sim.boat_vel().0.length()
+        );
+    }
+
+    /// A fitting takes EVERY rope that was on it, not just the one that
+    /// overloaded it. Doubling up (allowed since 2026-08-21) makes this
+    /// reachable on a deck fitting: two ropes off one fairlead, and when
+    /// the fitting leaves the boat both go with it. Leaving the second
+    /// attached would have it pulling on hardware that is no longer
+    /// there, while the renderer already draws the fairlead as a torn
+    /// stub. The second rope here is deliberately SLACK — it contributes
+    /// nothing to the load and still goes, which is the whole point.
+    #[test]
+    fn a_fitting_that_tears_out_takes_every_rope_that_was_on_it() {
+        let mut sim = line_arena();
+        let bow = sim.fairlead_world(Fairlead::PortBow);
+        // Both off the SAME handle, led to two different cleats.
+        let (taut, _) =
+            pass_line(&mut sim, &Env::CALM, Fairlead::PortBow, bow + Vec2::new(5.0, 0.0));
+        let (slack, _) =
+            pass_line(&mut sim, &Env::CALM, Fairlead::PortBow, bow + Vec2::new(5.0, 3.0));
+        assert_ne!(taut, slack, "a second rope from the same fairlead should be allowed");
+        // Surge the second one right out so it is hanging in a bight and
+        // carries no load at all, then give the first the slack a snatch
+        // needs.
+        let pay = |id| order(LineCommand::Tend { id, rate: -1.0 });
+        for _ in 0..(30.0 / PHYSICS_DT) as u32 {
+            sim.tick(&Env::CALM, &pay(slack));
+        }
+        for _ in 0..(8.0 / PHYSICS_DT) as u32 {
+            sim.tick(&Env::CALM, &pay(taut));
+        }
+        assert_eq!(
+            line_by(&sim, slack).map(|l| l.tension),
+            Some(0.0),
+            "the second rope should be hanging slack, carrying nothing"
+        );
+        let mut gave = None;
+        for _ in 0..(30.0 / PHYSICS_DT) as u32 {
+            sim.tick(&Env::CALM, &FULL_ASTERN);
+            if let Some(&(lost, _, g)) = sim.line_failures().first() {
+                assert_eq!(lost, taut, "the loaded rope is the one that overloaded");
+                gave = Some(g);
+                break;
+            }
+        }
+        assert_eq!(
+            gave,
+            Some(Gave::Fairlead),
+            "backing hard onto a short rope should carry the deck fitting away"
+        );
+        // Exactly ONE rope is reported as having failed — the other did
+        // not fail, it lost what it was tied to.
+        assert_eq!(sim.line_failures().len(), 1, "only the overloaded rope failed");
+        // ...but BOTH are gone.
+        assert!(
+            sim.lines().iter().all(|l| l.id != taut && l.id != slack),
+            "the slack rope on the same fitting should have gone with it"
+        );
+        assert!(
+            sim.broken_fittings().contains(&Fitting::Deck(Hull::Player, Fairlead::PortBow)),
+            "the fairlead should be recorded as carried away"
         );
     }
 

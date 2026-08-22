@@ -646,7 +646,21 @@ like Pegasus.
     and `MakeFast` refuses either end if its fitting is gone. Identified
     by POSITION rather than index because the marina's cleats are
     generated geometry with no identity of their own. A parted ROPE
-    leaves both fittings intact; anything else takes one with it.
+    leaves both fittings intact; anything else takes one with it — and
+    the fitting takes EVERY rope that was on it, not just the one that
+    overloaded it (`line_on_broken_fitting`, shared with
+    `new_continuing` so the live rule and the carry-across rule cannot
+    drift; `a_fitting_that_tears_out_takes_every_rope_that_was_on_it`).
+    A cleat torn off the pontoon cannot still be holding its
+    neighbour's rope. This was already reachable through a shore cleat
+    (two fairleads could always share one) and allowing ropes to share a
+    fairlead made it reachable on deck fittings too. Only the rope that
+    actually overloaded is reported in `line_failures` — the others did
+    not fail, they lost what they were tied to, so the HUD still names
+    one thing. Frontend consequence: `report_failures` sets a flag that
+    stops `prune` reporting a rope taken with its fitting as a throw
+    that "fell short", which would otherwise overwrite the accurate
+    message in the same frame.
     `new_continuing` carries the damage across (a keel change does not
     repair the marina) — and PRUNES the fresh rigging to match, because
     `build` re-rigs the fleet knowing nothing about it and a boat would
@@ -689,11 +703,30 @@ like Pegasus.
     nearest-handle picker ambiguous exactly where you most want to be
     sure which side you are leading from — and a bow line off the stem is
     barely a different rope from one off the port bow.
-  - **One rope per fairlead.** Doubling up is real seamanship, but a
-    second line from a handle that already has one is almost always a
-    fumbled gesture, and it would sit exactly on top of the first where
-    nothing could select it (`a_fairlead_carries_only_one_rope`). With
-    six handles the count cap and the handle count now coincide.
+  - **Not the same connection twice** (owner call, 2026-08-21,
+    REPLACING the one-rope-per-fairlead rule of 2026-08-20). Doubling up
+    is real seamanship and is now allowed: several ropes off one
+    fairlead, several onto one cleat, on the boat's fittings and the
+    harbour's alike. What is still refused is a second rope between the
+    SAME fairlead and the SAME anchor — the fumbled gesture the old rule
+    was really aimed at, and the one case that would sit exactly on top
+    of the first where nothing could select it
+    (`a_fairlead_may_carry_several_ropes_but_not_the_same_one_twice`).
+    Anchor identity is by VALUE, and a shore anchor carries its position,
+    so this leans on the same exact-float identity `Fitting::Shore` does
+    — sound for the same reason: every cleat position comes from the one
+    generator (`cleat_point`). `LINE_COUNT_MAX` no longer coincides with
+    the handle count: six ropes is now a real cap rather than an
+    arithmetic accident.
+    **Open question this raises, deliberately NOT decided here**: a
+    fitting is checked against each rope on it SEPARATELY, so two ropes
+    off one fairlead let that fitting hold 2×`DECK_FITTING_MBL` before it
+    gives. Spreading a load over two fittings genuinely does strengthen a
+    mooring; doubling onto ONE fitting does not, so the honest quantity
+    is the SUM per fitting. Not implemented because it is a physics
+    change with its own feel implications (it makes mooring harsher) and
+    a per-tick cost to think about over ~300 ropes — the naive grouping
+    is a sort or an O(n²) scan every tick, against a 113 µs budget.
   - **A line can be made fast to another BOAT** (2026-08-20):
     `Anchor::Boat { hull, fairlead }` alongside `Anchor::Shore`, so
     rafting up — or taking a line to your neighbour while you get sorted
@@ -1386,16 +1419,18 @@ like Pegasus.
     bulges off to one side, so tapping the rope you can see was missing
     it entirely. A rope gets the more generous radius of the two (it is a
     long thin target; a handle is a fat round one), which nearest-wins
-    keeps honest. A pleasant consequence: pressing a fairlead that is
-    already made fast selects ITS rope, so an occupied handle can't even
-    be asked to double up.
+    keeps honest. Ties go to the HANDLE (`df <= dr`), which is what
+    makes doubling up reachable now that sim-core allows it: a press
+    right ON an occupied fairlead arms it for a second rope, while a
+    press further along the rope selects the rope.
   - **Refusals say why.** An order that silently does nothing is the
     worst kind, and the reach limit in particular is invisible until
     something mentions it. While a fairlead is armed its REACH is drawn
     as a ring on the water and the rubber band turns red the moment the
-    pointer leaves it; a release outside it, a handle that already has a
-    rope, and no line left to spare each put a short note in the status
-    line (`MooringUi::note`, ~2.6 s). A line that vanishes while still
+    pointer leaves it; a release outside it, a rope that would repeat one
+    already there ("the stbd waist already has a line to there"), and no
+    line left to spare each put a short note in the status line
+    (`MooringUi::note`, ~2.6 s). A line that vanishes while still
     `Passing` reports itself as a throw that fell short. The frontend
     re-checks the same three rules sim-core enforces — not to enforce
     them, which is `tick`'s job, but so the refusal has a reason
