@@ -551,6 +551,16 @@ pub fn fitting_broken(broken: &[Fitting], f: Fitting) -> bool {
     broken.contains(&f)
 }
 
+/// Whether either end of `l` hangs on a fitting that has been carried
+/// away. A fitting takes EVERY line that depended on it, not just the
+/// one that overloaded it — a cleat torn off the pontoon cannot still be
+/// holding its neighbour's rope. Shared by `tick` and `new_continuing`
+/// so the live rule and the carry-across rule cannot drift apart.
+pub fn line_on_broken_fitting(broken: &[Fitting], l: &Line) -> bool {
+    fitting_broken(broken, Fitting::Deck(l.hull, l.fairlead))
+        || anchor_fitting(l.anchor).is_some_and(|f| fitting_broken(broken, f))
+}
+
 /// Apply one order to the line set. `boat` maps a fairlead to its world
 /// position, so this stays independent of how the caller stores the pose.
 pub(crate) fn apply_command(
@@ -569,12 +579,25 @@ pub(crate) fn apply_command(
             if lines.iter().filter(|l| l.hull == Hull::Player).count() >= LINE_COUNT_MAX {
                 return;
             }
-            // One rope per fairlead. Doubling up is real seamanship, but
-            // in a game a second line from a handle that already has one
-            // is almost always a fumbled gesture rather than an intent
-            // (owner call, 2026-08-20) — and it would sit exactly on top
-            // of the first, unselectable.
-            if lines.iter().any(|l| l.hull == Hull::Player && l.fairlead == fairlead) {
+            // Not the SAME connection twice. Doubling up is real
+            // seamanship and is allowed — several ropes off one fairlead,
+            // several onto one cleat (owner call, 2026-08-21, revising
+            // the original one-rope-per-fairlead rule of 2026-08-20).
+            // What is refused is a second rope between the same two
+            // points, which is the fumbled gesture the old rule was
+            // really aimed at: it would lie exactly on top of the first,
+            // where nothing could select it.
+            //
+            // Anchor identity is by VALUE, and a shore anchor carries its
+            // position — the same exact-float identity `Fitting::Shore`
+            // relies on, and sound for the same reason: every cleat
+            // position in the game comes from the one generator
+            // (`cleat_point`), so two orders naming one cleat carry bit
+            // -identical coordinates.
+            if lines
+                .iter()
+                .any(|l| l.hull == Hull::Player && l.fairlead == fairlead && l.anchor == anchor)
+            {
                 return;
             }
             // A fitting that has been torn out stays torn out: you
@@ -982,39 +1005,63 @@ mod tests {
     }
 
     #[test]
-    fn a_fairlead_carries_only_one_rope() {
+    fn a_fairlead_may_carry_several_ropes_but_not_the_same_one_twice() {
         let mut lines = Vec::new();
         let mut id = 0;
-        let cmd = LineCommand::MakeFast {
-            fairlead: Fairlead::PortBow,
-            anchor: Anchor::Shore { pos: Vec2::new(3.0, 0.0), kind: ShoreKind::Cleat },
+        let cleat = Anchor::Shore { pos: Vec2::new(3.0, 0.0), kind: ShoreKind::Cleat };
+        let further = Anchor::Shore { pos: Vec2::new(3.0, 1.0), kind: ShoreKind::Cleat };
+        let make = |fairlead, anchor| LineCommand::MakeFast { fairlead, anchor };
+        let order = |lines: &mut Vec<Line>, id: &mut u32, cmd| {
+            crate::line::apply_command(
+                lines,
+                id,
+                cmd,
+                CrewLimits::DEFAULT,
+                &[],
+                |_| Vec2::ZERO,
+                shore_at,
+            );
         };
+        // The same rope four times over is one rope: a repeated gesture
+        // would lie exactly on top of the first, where nothing could
+        // select it.
         for _ in 0..4 {
-            crate::line::apply_command(&mut lines, &mut id, cmd, CrewLimits::DEFAULT, &[], |_| Vec2::ZERO, shore_at);
+            order(&mut lines, &mut id, make(Fairlead::PortBow, cleat));
         }
-        assert_eq!(lines.len(), 1, "a fumbled second gesture must not double the line");
-        // ...and a different handle is still free.
-        let other = LineCommand::MakeFast {
-            fairlead: Fairlead::StbdBow,
-            anchor: Anchor::Shore { pos: Vec2::new(3.0, 0.0), kind: ShoreKind::Cleat },
-        };
-        crate::line::apply_command(&mut lines, &mut id, other, CrewLimits::DEFAULT, &[], |_| Vec2::ZERO, shore_at);
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 1, "the same connection twice must not double the line");
+        // A second rope from the SAME handle to somewhere else is real
+        // seamanship, and allowed.
+        order(&mut lines, &mut id, make(Fairlead::PortBow, further));
+        assert_eq!(lines.len(), 2, "a fairlead may carry a second rope led elsewhere");
+        // ...as is a second rope onto the same cleat from another handle.
+        order(&mut lines, &mut id, make(Fairlead::StbdBow, cleat));
+        assert_eq!(lines.len(), 3, "a cleat may carry a rope from another fairlead");
+        // Every one of them is its own line with its own id.
+        let ids: Vec<u32> = lines.iter().map(|l| l.id).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
     }
 
     #[test]
     fn the_boat_carries_a_finite_number_of_lines() {
         let mut lines = Vec::new();
         let mut id = 0;
-        // Every fairlead, then some: with one rope per handle the count
-        // cap and the number of handles coincide, and both hold.
-        for f in Fairlead::ALL.iter().chain(Fairlead::ALL.iter()) {
+        // Every fairlead, then some -- each to its OWN cleat, so no
+        // order is refused as a repeat of an earlier connection and the
+        // count cap is the only thing that can stop them. (Doubling up
+        // onto one fairlead is now allowed, so leading every order to
+        // the SAME cleat would have exercised that refusal instead of
+        // this one -- the cap and the handle count no longer coincide
+        // by construction, see `LINE_COUNT_MAX`.)
+        for (i, f) in Fairlead::ALL.iter().chain(Fairlead::ALL.iter()).enumerate() {
             let cmd = LineCommand::MakeFast {
                 fairlead: *f,
-                anchor: Anchor::Shore { pos: Vec2::new(3.0, 0.0), kind: ShoreKind::Cleat },
+                anchor: Anchor::Shore {
+                    pos: Vec2::new(3.0, i as f32 * 0.1),
+                    kind: ShoreKind::Cleat,
+                },
             };
             crate::line::apply_command(&mut lines, &mut id, cmd, CrewLimits::DEFAULT, &[], |_| Vec2::ZERO, shore_at);
         }
-        assert_eq!(lines.len(), Fairlead::ALL.len().min(LINE_COUNT_MAX));
+        assert_eq!(lines.len(), LINE_COUNT_MAX);
     }
 }
