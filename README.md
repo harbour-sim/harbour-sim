@@ -7,10 +7,17 @@ occupied, a rounded bay head at the top and an open run out to the sea at
 the bottom — with wind and current to fight. Engine and rudder are fully
 modeled — prop walk, prop wash over the rudder, rudder stall and all — so
 real close-quarters technique works: back and fill, kick the bow round with
-a burst of ahead power, feel the stern walk to port going astern. The plan
-is to grow this into a game about mooring manoeuvres — placing ropes
-(springs, breast lines, bow/stern lines) to make the boat move the way you
-want under different conditions. No ropes yet.
+a burst of ahead power, feel the stern walk to port going astern. Mooring lines are in: lead a rope from any
+fairlead to a pontoon cleat or a mooring pole, and it is made fast at the
+length it lands at — then haul it in or surge it out to work the boat
+alongside. The ropes are elastic nylon, they only pull, and they go visibly
+slack when you close on the cleat. Snatch one hard and a fitting carries
+away — the cleat comes off your own deck long before good nylon parts,
+which is how it goes in life — and what tore out stays torn out for the
+rest of the run.
+A line made fast forward with the engine ahead against it springs the boat
+alongside, because the pull acts where the rope really is. Still to come:
+scenarios and scoring.
 
 **▶ Play it at <https://harbour-sim.github.io/harbour-sim/>**
 
@@ -35,6 +42,22 @@ snap the view back onto the boat. The
 RESET button returns the boat to its fairway start, engine to neutral,
 helm amidships.
 
+The LINES button opens mooring mode: six fairleads appear along the hull
+and everything within throwing range is ringed — cleats along the
+pontoons, mooring poles, and the fairleads of any boat lying close
+enough to take a line (a rope to your neighbour hauls on her too). Drag from a fairlead
+to one of them — or tap the fairlead, then tap the anchor — and the crew
+passes the line, which takes a moment longer the further it has to go.
+Tap a rope already out to HAUL it in, let it SLACK, or CAST OFF. Hauling
+only works while the line is light: ten kilos, by default, is what a
+pair of hands can pull, and a loaded rope will not come in by hand —
+that is what springs and the engine are for. What the crew can do is up
+to you: the gear button (or O) opens the settings menu, with LINE
+HANDLING (how fast they get a line ashore), HAUL FORCE (how much they
+can pull, in place of that default) and
+LINE REACH (how far they can throw — 4 m by default, so you have to
+bring her alongside first).
+
 **Keyboard**:
 
 | Keys | Effect |
@@ -48,6 +71,8 @@ helm amidships.
 | I / K | Current speed |
 | + / - | Zoom in / out (also mouse wheel) |
 | C | Centre the camera back on the boat |
+| T | Mooring lines mode |
+| O | Settings menu |
 | R | Reset the boat to its fairway start |
 | E | Keel design editor |
 

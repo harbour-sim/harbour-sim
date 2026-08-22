@@ -10,8 +10,8 @@ boat lying to it). Supporting other small-vessel types alongside the
 sailboat (see Roadmap) is the agreed direction, not yet built — nothing in
 `sim-core` or the renderer should be read as a permanent sailboat-only
 decision. The goal is mooring manoeuvres with placeable ropes (bow/stern
-lines, springs) under different conditions; ropes, scenarios and scoring are
-future work.
+lines, springs) under different conditions. Ropes are in (2026-08-20 —
+see Mooring lines below); scenarios and scoring are future work.
 
 Boilerplate and pipeline are copied from **dannyrhubarb/pegasus** (2026-08) —
 when in doubt about a pattern or a CI gotcha, that repo's CLAUDE.md is the
@@ -131,13 +131,20 @@ already solves structurally, the same way Publish Pages does.
   any nondeterminism**; it uses `glam` (pinned to the version macroquad
   0.4.15 re-exports, so `Vec2` unifies across the boundary) + `rapier2d`.
   - `sim-core/src/sim.rs` — `Sim` (Rapier world: the marina's boundary
-    polyline, jetties, mooring poles and moored fleet, plus the boat),
+    polyline, jetties, mooring poles, the moored fleet — DYNAMIC bodies
+    on their own mooring lines since 2026-08-20 — plus the boat),
     `Env` (wind/current), all physics constants, harbour geometry
     constants, unit tests.
   - `sim-core/src/keel.rs` — `KeelProfile` (piecewise-linear underwater
     lateral-area-per-length curve along the hull) and `KeelDerived` (area,
     centre of lateral resistance, yaw damping integral — derived from the
     curve by integration, see Simulation model below).
+  - `sim-core/src/line.rs` — mooring lines (2026-08-20): the nylon
+    load-elongation curve, `Fairlead` (deck positions read off
+    `HULL_PTS`), `Anchor`, `Line`/`LineState`, the crew's `LineCommand`
+    orders, and the handling constants (reach, pass speed, haul/pay
+    rates). Pure functions + a command applier; the forces themselves
+    are applied by `sim.rs`'s `tick`. See Mooring lines below.
   - `sim-core/src/boat.rs` — `BoatDesign` (2026-08-04): the parameter
     bundle the keel editor edits and `Sim::new_with_design` consumes — a
     `KeelProfile`, a `RudderDesign` (blade position/dimensions/end-plate
@@ -162,8 +169,10 @@ already solves structurally, the same way Publish Pages does.
 - `src/main.rs` — macroquad frontend: input, fixed-timestep loop with render
   interpolation, top-down rendering (water/ripples, the Hinsholmen scenery —
   grass/tree road shore with quay apron NW, wooded rocky hill shore SE,
-  plank pontoons, mooring poles, moored boats with crossed stern lines out
-  to their pole pairs and breast lines to the jetty, rounded silt-ringed
+  plank pontoons, mooring poles, moored boats drawn at the LIVE poses
+  sim-core gives them, with their crossed stern lines and breast lines
+  drawn by the same rope path as the player's (they are the same
+  `Line`s), rounded silt-ringed
   bay head NE, open sea SW with a skerry chain at the world's edge — and
   the player's boat), HUD
   (wind/current dials, throttle/rudder sliders, SOG readout, key help),
@@ -176,6 +185,44 @@ already solves structurally, the same way Publish Pages does.
   only a stretch is ever on screen. Scenery scatter (trees) uses the same
   deterministic hash idiom as the ripples, minus the time term — cosmetic
   only, like everything render-side.
+- `src/mooring.rs` — the LINES mode frontend (2026-08-20): mode state,
+  the one-grab-at-a-time gesture machine (lead a line / haul / drag the
+  pass-speed setting), world-space hit-testing for fairleads, anchors
+  and ropes, and all the rope drawing (slack bights, load colouring, a
+  line still going ashore). Turns gestures into `LineCommand`s and hands
+  them to `tick` through `InputState` — it never touches physics. See
+  Frontend conventions.
+- `src/settings.rs` — the **settings menu** (2026-08-20): an overlay for
+  the knobs that configure the game rather than sail the boat. Settings
+  do NOT live in the play HUD (owner call): the HUD's job is the boat,
+  and something you set once and forget has no business holding
+  permanent space on a phone screen. Follows the keel editor's overlay
+  pattern — freezes the game while open (input AND the physics tick),
+  which is what lets it reuse keys and take presses without fighting the
+  HUD's touch claims. Opened by the gear button (bottom row, left of
+  LINES) or **O**; closed by CLOSE, Escape, O again, or a tap on the
+  dimmed scrim. Adding a setting is a row in `ROWS` plus an arm in
+  both `value` and `value_mut` (`draw` reads through the former). Currently holds three, all of
+  them the CREW rather than the world: LINE HANDLING (how fast a line
+  goes ashore), HAUL FORCE (what a pair of hands can pull, in kilos) and
+  LINE REACH (how far a line can be got ashore). The frame loop bundles
+  them into `InputState::crew` (so they still ride the recorded input
+  stream — see Mooring lines).
+  **Gotcha (found live, 2026-08-20)**: the key press or button tap that
+  OPENS an overlay is still "pressed" when that overlay's own input runs
+  later in the same frame, so it closed itself instantly and the menu
+  never appeared. `SettingsMenu::open` sets a `just_opened` flag and the
+  first `update` returns without reading input at all. Any future
+  self-toggling overlay needs the same guard — the keel editor dodges it
+  only because E is handled in exactly one place.
+  **Gotcha (CodeRabbit review, 2026-08-21)**: the mouse and touch paths
+  share one `grab`, and `simulate_mouse_with_touch(false)` means the
+  mouse button reads permanently UP on a phone — so the mouse branch's
+  `else { grab = None }` fired every frame, ahead of the touch loop, and
+  the slider took the value under the tap and then ignored the drag.
+  The release is gated on `self.touch.is_none()`. The keel editor dodges
+  this by keeping `mouse_on_weight` and `weight_touch` separate; a
+  shared claim needs the gate.
 - `src/keel_editor.rs` — in-app editor for `BoatDesign`: drag a fixed-grid
   bar chart to paint the underwater area distribution, drag a displacement
   slider (4–14 t range bracketing the reference boats, 100 kg steps;
@@ -449,6 +496,375 @@ like Pegasus.
   to starboard (the blade deflects the other way). Both fields are clamped
   defensively at the top of `tick` so a corrupt recording can't command
   super-physical inputs.
+- **Mooring lines** (2026-08-20, `sim-core/src/line.rs` + `step_lines` in
+  sim.rs): NOT a Rapier joint, for the same reason hull drag isn't Rapier
+  damping — every force here is computed in `tick` from modeled geometry,
+  and a rope has two properties a joint can't express: it is
+  **unilateral** (pulls, never pushes; slack is the normal state of a
+  tended line and gives exactly zero force) and **elastic**, which is the
+  whole point (nylon stretching is what stops 8.5 t without snatching).
+  The force is applied at the FAIRLEAD's own world point, which is what
+  makes spring lines work with no special case — a line made fast forward
+  plus ahead thrust pivots the boat about that fairlead and swings her
+  alongside, straight out of the existing keel/rudder model
+  (`a_spring_line_swings_the_boat_alongside` pins it, against a no-line
+  control so prop walk can't be mistaken for the spring).
+  - **Load-elongation curve.** `T(e) = MBL*(e/e_break)^p`, fitted through
+    two published points for three-strand nylon: 2.5 % extension at 10 %
+    of breaking load, ~20 % at 50 %. That gives p = ln5/ln8 = 0.774 and
+    e_break = 0.49. The exponent is BELOW 1 — the curve SOFTENS as it
+    loads, the opposite of the intuition that a rope stiffens, and it is
+    what the published data says. **Independent corroboration**: the
+    extrapolated break strain, ~49 %, lands inside the 40–55 % that
+    three-strand nylon is separately published as breaking at, and
+    nothing in the two-point fit put it there. Both constants are
+    re-derived from the anchor points by
+    `nylon_curve_matches_its_published_anchor_points` so they can't drift
+    apart (same derive-don't-assert rule as `RUDDER_AR`). Consequences
+    worth knowing: a working breeze load (~1.1 kN, this hull in 20 kn
+    abeam) gives only ~6 cm on a 10 m line — a taut line, not a bungee —
+    while the stretch nylon is famous for lives an order of magnitude up
+    (metres at half breaking load). Known simplification: below the lower
+    anchor the law extrapolates a stiffer toe than real rope's
+    constructional stretch; the fix is a third published point, not a
+    shape change.
+  - **`LINE_MBL`** = 34.6 kN: 1/2" three-strand nylon at 6400 lbf
+    (Cordage Institute / ASTM D-4268 test methods) scaled by d² to the
+    modeled 14 mm. A line exceeding it PARTS. **`LINE_DAMPING_RATIO`**
+    (0.20 of critical) is a calibration inside a sourced band rather than
+    a measured constant — see the snub-restitution bullet below.
+  - **Lines are sim STATE, orders are input** — exactly the engine-spool
+    split. `InputState::line` carries at most one `LineCommand` per tick
+    (`MakeFast`/`Tend`/`CastOff`), which is all a pair of hands can issue
+    at 120 Hz; `tick` owns the lines. So the rope work costs a future
+    recording nothing extra: the orders are already in the stream, and
+    replaying it reproduces them (the recording/replay TOOLING itself is
+    still roadmap work — see Scenarios and scoring).
+    `same_input_sequence_is_bit_identical` now scripts line orders too
+    and compares the line state as well as the pose. Ids
+    are monotonic and NEVER recycled (a `Tend` in flight must not land on
+    a rope that replaced the one it meant — the same lesson as the
+    frontend's recycled touch ids). `new_continuing` carries the lines
+    across, so opening the keel editor while lying to your ropes doesn't
+    cast them off; R-reset builds a fresh `Sim` and they're gone with it.
+  - **Getting a line ashore takes time, proportional to the distance**
+    (`LineState::Passing`): `dist / pass_speed`, so a metre off the
+    pontoon is a step and a turn on the cleat while a full-reach throw is
+    a second or so. A line is made fast at the length it turns out to be
+    WHEN IT LANDS, not when it was thrown, and if the boat has drifted
+    out of reach by then the throw falls short and is lost. Everything
+    after that is hauling and surging from that length — which is why a
+    line goes visibly slack the moment you close on the cleat.
+    **The reach is checked at exactly two moments, both in sim-core**:
+    when the order is given (`apply_command`, against the distance right
+    then) and when the line LANDS (`step_lines`, at the `Passing → Fast`
+    transition). Never in between, and never once it is fast — after
+    that the scope is fixed and the rope simply stretches. The landing
+    check uses the reach the throw was made under, carried on
+    `LineState::Passing`, not the live setting: winding the knob down
+    while a line is in the air must not retroactively lose it.
+  - **The crew's limits are SETTINGS, not constants of the world**
+    (`CrewLimits { pass_speed, haul_kg, reach }` on `InputState`,
+    `clamped()` at the top of `tick` exactly like throttle and rudder):
+    how fast a line goes ashore (1–20 m/s), what a pair of hands can
+    pull (1–150 kg, default 10) and how far a line can be thrown
+    (1–25 m, **default 4** — owner call 2026-08-21: short enough that
+    you have to bring her alongside, rather than mooring by rope from
+    half a berth away). Player knobs for how much of the game is rope
+    work, set in the settings menu (`src/settings.rs`) and carried in
+    the input stream rather than on the `Sim`, so a recording would
+    replay with the crew it was made with. One struct rather than three loose
+    fields, so `apply_command` doesn't grow a parameter per knob.
+  - **Tending is force-limited one way and not the other.** Hauling in
+    derates linearly to zero as the line's own tension approaches what
+    the crew can pull — `CrewLimits::haul_kg`, **10 kg by default**
+    (owner call, 2026-08-21), expressed in kilos because that is how
+    anyone talks about what they can hold on a rope. So you cannot winch
+    8.5 t up to the pontoon against a breeze by hand — you rig a spring
+    and use the engine, and the crew gathers the slack you make. Surging
+    out isn't limited (a turn round a cleat, let it run) but stops at
+    `LINE_SCOPE_MAX`, the end of the rope.
+  - **Fairleads are read off `HULL_PTS`** (the shoulder vertex, the
+    waist, midway along the aft run — the outline's own half-beam at each
+    station), so a fairlead is always exactly on the hull the renderer
+    draws and the collider uses. Shore anchors are the pontoon cleats
+    (`CLEAT_SPACING`, half a berth width apart along both faces, so every
+    berth has one at each end and one in the middle) and the mooring
+    poles, both from sim-core's geometry functions.
+  - **What lets go is a fitting on the BOAT** (2026-08-20, owner: "what I
+    wanted simulated was a cleat tearing off a boat; shore cleats are
+    more robust than the ones on boats"). Each fitting has a limit
+    (`fitting_limit`) and a name for the HUD when it goes
+    (`fitting_gave`). BoatUS Foundation's cleat testing
+    had cleat ASSEMBLIES failing between 1,190 and 7,500 lbf (5.3–33 kN),
+    and note what that tested: BOAT deck hardware bolted through a deck.
+    `DECK_FITTING_MBL` = 14 kN sits mid-band. It is NOT evidence about
+    pontoon cleats, which are commercial gear through-bolted to a float
+    frame, so `PONTOON_CLEAT_MBL` = 25 kN sits above any boat's fitting
+    and below the rope's 34.6 kN. **The ordering matters more than the
+    values**: deck fitting < shore cleat < rope, so what tears out is the
+    thing on the boat. A mooring POLE has no fitting at all — the line
+    goes round it — so there too the boat's own cleat is the limit. A
+    parted ROPE was therefore unreachable until per-fitting sums landed
+    (the deck fitting's 14 kN was always the lowest of the three, so it
+    always went first); it becomes possible only when opposed ropes on
+    one fitting cancel enough of its load for the rope to reach 34.6 kN
+    first. When a fitting is carried away by a SUM no single rope
+    failed, so the HUD is handed the heaviest-loaded rope on it — a
+    shared fitting still names one thing.
+    Measured threshold (`measure_snap_threshold`): backing onto a 5 m
+    scope with slack out, she holds at a 3.2 kn arrival and tears the
+    fitting out at 3.8 — a genuinely bad arrival for 8.5 tonnes.
+    **Getting the ordering backwards was a real bug** (the first version
+    had the pontoon cleat weakest at 9 kN): the marina then destroyed
+    itself at the top of the wind dial, losing 63 harbour cleats to a
+    slammed wind reversal, because those breast lines sat at 87 % of a
+    9 kN limit before anything happened. With the ordering right the same
+    reversal peaks at 10.6 kN against 14 kN and costs nothing.
+  - **What the weather can do to the marina** (2026-08-20, re-measured
+    2026-08-21; `measure_resting_mooring_loads` and
+    `measure_mooring_loads`). At `WIND_MAX` (25 m/s) the fleet's
+    most-loaded ropes sit at a p90 of 7.8 kN — 56 % of the 14 kN deck
+    fitting that holds them — and a slammed SE→NW reversal peaks at
+    10.6 kN and costs nothing. The suddenness was never the issue: a
+    step from calm to 50 knots in one tick peaks at 4.8 kN. What made
+    the marina fragile was the FITTING ORDERING (see
+    `DECK_FITTING_MBL`), not the weather model. Two things worth
+    remembering from that investigation: a berth's breast lines carry
+    more than its crossed pole lines (p90 7.8 vs 6.9 kN at `WIND_MAX`)
+    because the pole lines meet a beam load at poor angles; and a wind
+    DIRECTION swept round has a resonance band at 6–8 s per revolution,
+    the mooring system's own period (12.4 kN at 6 s against 7.8 kN at
+    45 s), far more punishing than any step — so "smooth the dial" would
+    move a fast sweep toward the dangerous band, not away from it. Max
+    wind AND max current together still reach 14 kN, which is correct
+    (water is ~800× denser than air) and a marina nobody would have
+    built; `CURRENT_MAX` is the knob there, not the physics.
+  - **A torn-out fitting stays torn out** (2026-08-20). Without this the
+    punishment for a bad arrival was "throw the same line at the same
+    cleat again", which quietly undoes the consequence. `Sim.broken`
+    records each `Fitting` as it goes — `Fitting::Shore(pos)` for a
+    pontoon cleat, `Fitting::Deck(hull, fairlead)` for a deck fitting —
+    and `MakeFast` refuses either end if its fitting is gone. Identified
+    by POSITION rather than index because the marina's cleats are
+    generated geometry with no identity of their own. A parted ROPE
+    leaves both fittings intact; anything else takes one with it — and
+    the fitting takes EVERY rope that was on it, not just the one that
+    overloaded it (`line_on_broken_fitting`, shared with
+    `new_continuing` so the live rule and the carry-across rule cannot
+    drift; `a_fitting_that_tears_out_takes_every_rope_that_was_on_it`).
+    A cleat torn off the pontoon cannot still be holding its
+    neighbour's rope. This was already reachable through a shore cleat
+    (two fairleads could always share one) and allowing ropes to share a
+    fairlead made it reachable on deck fittings too. Only the rope that
+    actually overloaded is reported in `line_failures` — the others did
+    not fail, they lost what they were tied to, so the HUD still names
+    one thing. Frontend consequence: `report_failures` sets a flag that
+    stops `prune` reporting a rope taken with its fitting as a throw
+    that "fell short", which would otherwise overwrite the accurate
+    message in the same frame.
+    `new_continuing` carries the damage across (a keel change does not
+    repair the marina) — and PRUNES the fresh rigging to match, because
+    `build` re-rigs the fleet knowing nothing about it and a boat would
+    otherwise get its carried-away cleat back while the renderer still
+    drew the holes (CodeRabbit review, 2026-08-21;
+    `a_keel_change_does_not_re_rig_a_fitting_that_tore_out`). R-reset
+    builds a fresh `Sim` and everything is whole again, which is what
+    starting a run over should mean. The
+    renderer draws a carried-away cleat as the holes it left and a torn
+    fairlead as a crossed-out stub, and `reachable`/`nearest_fairlead`
+    stop offering them.
+  - **The damper must not out-pull the rope.** Damping force is bounded
+    by the elastic tension (`LINE_DAMP_FORCE_CAP`), which is the shape of
+    hysteretic damping — energy lost per cycle is a FRACTION of energy
+    stored — and fixes a measured artefact: because the load-elongation
+    curve is sub-linear its tangent stiffness is formally infinite at
+    zero strain, so a damper sized from that stiffness spiked at exactly
+    the moment of contact (1.6 kN of damping against 267 N of elastic
+    tension), felt as a snatch the rope should not give.
+  - **How springy the rope is, in one number.** `measure_snub_restitution`
+    (ignored harness) brings the boat up on a paid-out line at 2.5 kn and
+    reports how much of her way she gets back. The damping ratio is a
+    calibration inside the published 20–50 % hysteresis band for nylon,
+    not a measured constant: 0.05 returns 61 % of her kinetic energy,
+    0.10 48 %, 0.20 32 %, 0.35 20 %. Shipped at 0.20 — the damped end,
+    deliberately, because nothing here models the friction of a line
+    surging round a cleat and through a fairlead, which in life eats a
+    real share of a snatch.
+  - **Gotcha (found in the first backing test)**: arriving on a short
+    line with real sternway SNATCHES, and the boat rebounds forward off
+    it and goes slack again before settling, so line tests must check the
+    ENVELOPE over a run (peak tension, peak stretch) rather than sampling
+    at one instant. A second lesson from the same place (2026-08-20): a
+    snatch needs SPEED onto SLACK. Backing from rest on a taut line just
+    loads up to the thrust and holds — two tests were written with that
+    backwards and proved the opposite of what they claimed.
+  - **Six fairleads, none on the centreline** (owner call, 2026-08-20):
+    bow pair, waist pair, quarters. A stem-head or stern fairlead sits
+    right between its own port and starboard pair, which makes the
+    nearest-handle picker ambiguous exactly where you most want to be
+    sure which side you are leading from — and a bow line off the stem is
+    barely a different rope from one off the port bow.
+  - **Not the same connection twice** (owner call, 2026-08-21,
+    REPLACING the one-rope-per-fairlead rule of 2026-08-20). Doubling up
+    is real seamanship and is now allowed: several ropes off one
+    fairlead, several onto one cleat, on the boat's fittings and the
+    harbour's alike. What is still refused is a second rope between the
+    SAME fairlead and the SAME anchor — the fumbled gesture the old rule
+    was really aimed at, and the one case that would sit exactly on top
+    of the first where nothing could select it
+    (`a_fairlead_may_carry_several_ropes_but_not_the_same_one_twice`).
+    Anchor identity is by VALUE, and a shore anchor carries its position,
+    so this leans on the same exact-float identity `Fitting::Shore` does
+    — sound for the same reason: every cleat position comes from the one
+    generator (`cleat_point`). `LINE_COUNT_MAX` no longer coincides with
+    the handle count: six ropes is now a real cap rather than an
+    arithmetic accident.
+    **A fitting carries the SUM of what is on it** (2026-08-22,
+    implemented in the same breath as allowing ropes to share one).
+    Doubling onto ONE fitting must not make that fitting stronger, which
+    is what checking each rope separately would have meant; spreading a
+    load over TWO fittings genuinely does strengthen a mooring, and falls
+    out of the same rule for free
+    (`one_fitting_carries_the_sum_of_the_ropes_on_it` tears a deck
+    fitting out with two ropes neither of which is near its own limit).
+    The sum is a VECTOR sum, because these are forces: two ropes off one
+    cleat pulling opposite ways largely cancel the pull-out load, so
+    doubling up can make a mooring EASIER as well as harder (owner call —
+    "it might as well make mooring easier sometimes"). Mildly optimistic
+    about the horn-crushing mode, where opposed loads still stress a
+    fitting.
+    **`step_lines` is two phases because of it.** Phase one walks the
+    lines: tension, forces onto the hulls, the one per-line limit left
+    (the ROPE's own `LINE_MBL`), and a deposit of `(fitting, force)` into
+    a scratch buffer. Phase two groups that buffer and breaks any fitting
+    whose total exceeds its limit. Turning it round this way is what
+    kills the QUADRATIC: asking each line "who else is on my fitting?"
+    is a SEARCH — a line names its fittings by value and there is no
+    fitting→lines index — and doing that per line is ~2n² comparisons a
+    tick, measured at **313 µs against a ~111 µs tick**. Depositing
+    instead of searching makes phase one linear, and phase two is then a
+    grouping problem: a sort of a REUSED scratch buffer (`Sim.fit_loads`,
+    cleared not reallocated) plus a walk of the runs, keyed by
+    `fitting_key`. So the whole thing is **O(n log n), not linear** —
+    the sort is the dominant term, and an earlier draft of this note
+    wrongly called it linear.
+    **A HashMap accumulator IS linear and was measured, not argued
+    away** (2026-08-22, owner: "why create a tmp Vec and then sort it,
+    when you could create a temp Map"): keyed by the same
+    `fitting_key`, depositing with `entry().or_insert()`, and — to stay
+    deterministic — reading it back by walking the LINES rather than
+    iterating the map, since `HashMap` order would decide which failure
+    the HUD names first and in what order `broken` grows. It builds for
+    wasm and passes the whole suite. It is also **slower here**: 143 µs
+    with a cheap FNV-style hasher and 160 µs with the default SipHash,
+    against 121 µs for the sort (111 µs baseline). Not a hashing
+    problem — a locality one: ~450 contiguous entries sort with almost
+    no cache misses, while the map pays random-access probing on every
+    one of ~1000 deposits and lookups a tick, and `HashMap::clear` walks
+    its control bytes where `Vec::clear` is free. The asymptotically
+    better structure loses at this n; revisit if the marina ever grows
+    an order of magnitude. **Measured cost of the whole change:
+    111 → 121 µs, +9%**, of which the grouping is ~13 µs; at n = 450
+    entries log₂n ≈ 9, so phase one's real work dominates the clock even
+    though the sort dominates the asymptotics. Truly linear IS available
+    and was deliberately NOT taken: a persistent fitting table with
+    indices on each line makes each deposit O(1) and phase two O(F), for
+    O(n + F) overall. Rejected because `Fitting` is public
+    API (`broken_fittings()`, the renderer's torn-cleat drawing, the
+    `MakeFast` refusal), so indices would ripple through all of it and
+    add an index-validity invariant to keep in step with `MakeFast`,
+    `new_continuing` and the fleet rebuild — a new class of bug to save
+    ~10 µs. A spatial index over the cleats is the wrong tool entirely:
+    it answers "what is NEAR this point?", which is LINES-mode
+    hit-testing, not "which ropes are on exactly THIS fitting?", and
+    fitting identity is already exact by construction.
+    **Consequence for sleep**: a sleeping fleet boat's ropes are now
+    WORKED OUT every tick and skipped only for the force application,
+    because a fitting she shares with someone else's rope has to carry
+    her load too. Skipping them outright — as the first version did —
+    would silently drop her contribution the moment a player rope landed
+    on a cleat she was already using, which is reachable. The perf win
+    survives because it was never the arithmetic, it was the WAKING.
+    A side benefit: her `tension` is live now rather than stale from
+    whenever she last woke, which is why the resting-load figures moved a
+    few percent without any change in the dynamics (the storm peaks are
+    bit-identical).
+
+  - **A line can be made fast to another BOAT** (2026-08-20):
+    `Anchor::Boat { hull, fairlead }` alongside `Anchor::Shore`, so
+    rafting up — or taking a line to your neighbour while you get sorted
+    out — is a rope like any other. It pulls at BOTH ends: `step_lines`
+    applies the equal and opposite force at the far hull's own fairlead
+    and wakes her, because she is being hauled on rather than lying to
+    her own moorings. Pinned by a force balance against a no-rope control
+    (`a_line_to_a_neighbour_hauls_on_the_neighbour_too`): her own
+    moorings go from ~2 N lying quiet to a few hundred N with a rope on
+    her quarter. Measuring her DISPLACEMENT instead is a trap — the
+    marina shakes down onto its moorings over the first half-minute
+    either way, and that motion is far bigger than the effect.
+  - **The moored fleet lies to the same ropes** (2026-08-20, second
+    commit): every berthed boat is a DYNAMIC body with four real `Line`s
+    — two crossed to its pole pair, two breast lines to the pontoon face,
+    the rig of the reference photos — instead of a static collider with
+    renderer-only decoration. One `Line` type, one tension law, one
+    `tick`: `Hull::Player` / `Hull::Moored(i)` on each line says which
+    hull it pulls. So an occupied berth still stops you, but it GIVES
+    when you lean on it and its moorings put it back
+    (`an_occupied_berth_is_blocked_by_the_moored_boat` checks all three),
+    and the whole marina leans a little when the wind gets up. Their
+    lines are made fast at exactly the distance they span at rest, so the
+    marina starts snug with no slack and no invented pre-tension: any
+    movement in any direction lengthens at least one of a berth's four
+    ropes. The breast lines belay to the two studs STRADDLING the berth
+    centre — real stations from `cleat_point`, the one generator
+    `cleat_positions` also goes through, so a rope ends where a stud is
+    drawn (CodeRabbit review, 2026-08-21: they used to sit a free 1.3 m
+    either side of centre, about half a cleat spacing, so all 150 of
+    them finished on bare planking and a fitting torn out there was
+    recorded at a point no stud ever occupied;
+    `every_fleet_cleat_is_a_cleat_the_renderer_draws` pins it). Exact
+    float equality is why that is ONE generator and not two agreeing
+    formulas: a shore fitting is identified BY its position. What made
+    it fit was PHASING the cleat grid half a spacing off the pole
+    stations (`CLEAT_PHASE`), so each berth gets a pair 1.25 m either
+    side of its centre instead of one stud dead centre and one out at
+    the boundary where a pole already stands. That was not cosmetic
+    book-keeping: snapping to the boundary studs (±2.5 m) instead splays
+    the lines wider, meets a beam load at poorer angles, and turned a
+    max-wind reversal from costing nothing into tearing out 22 fittings;
+    putting both lines on one central stud drops the inboard yaw
+    restraint entirely. The phased grid leaves every measured mooring
+    load within noise of what the off-grid rig gave.
+  - **Sleep is what makes ~75 extra hulls affordable**, and it took some
+    care. Measured cost per `tick` (native release, full marina): 101 µs
+    with the old static fleet, 113 µs now — but **375 µs** in the version
+    where the fleet never slept, a 3.7× regression that would have shown
+    up on a phone. The fix is that a berthed boat settling on its ropes
+    is allowed to doze: the fleet's hull forces, its rope pulls, AND its
+    per-tick `reset_forces`/`reset_torques` all pass `wake_up: false`.
+    (2026-08-22 update, CodeRabbit review: this paragraph used to say
+    `step_lines` skips a sleeping hull's ropes ENTIRELY, which stopped
+    being true the moment fittings started carrying a sum — a fitting
+    she shares with someone else's rope has to carry her load too, so
+    her ropes are now WORKED OUT every tick and only the force
+    APPLICATION is skipped; see the per-fitting-sum bullet below for the
+    updated 121 µs figure.)
+    **Gotcha**: `reset_forces(true)` was the one that kept the whole
+    marina awake — easy to miss, since it reads as bookkeeping rather
+    than as a force. The one thing sleep would otherwise break is that
+    wind and current are knobs the PLAYER turns, so `tick` compares `env`
+    against the previous tick's and wakes every moored body when it
+    changes (`a_change_of_wind_wakes_the_sleeping_fleet` pins it);
+    contact wakes a boat by itself, so nudging one still works.
+  - Fleet line ids live in their own range (`FLEET_LINE_ID_BASE`), so the
+    crew's ids stay 0, 1, 2… however many boats are berthed, and a
+    `CastOff` can never name one of the marina's own. `new_continuing`
+    transplants only the player's lines — `build` re-rigs the marina
+    from scratch, and its boats sit centimetres from where they were.
+  - **Known simplification**: lines don't collide with anything — they
+    pass through poles, jetties and moored hulls, with no friction round
+    a turn and no catenary weight. Top-down 2D; documented on the module.
 - **Engine & propeller** (~28 hp auxiliary, fixed right-handed 3-blade
   prop): thrust, walk and wash act at the prop's station, which since
   2026-08-04 is DERIVED per design as `rudder.x + PROP_AHEAD_OF_RUDDER`
@@ -1003,8 +1419,9 @@ like Pegasus.
   each frame, so shoving against the edge racks up no invisible travel,
   and a zero offset can never turn nonzero on its own (the boat is
   always inside the world). Pinch/wheel zoom leaves the offset alone.
-  A CENTER button (twin of the C key) appears left of KEEL ONLY while
-  the offset is >0.5 m; C, CENTER, R-reset and editor Apply all zero it
+  A CENTER button (twin of the C key) appears left of the settings
+  gear ONLY while the offset is >0.5 m; C, CENTER, R-reset and editor
+  Apply all zero it
   (zoom persists throughout).
 - **Touch controls**: the two HUD compass indicators are draggable **dials**
   (`Dial` struct) — drag direction from the dial centre = the flow's TOWARD
@@ -1027,6 +1444,90 @@ like Pegasus.
   phase on an already-claimed id means a recycled id = new finger, so the
   claim is dropped and re-evaluated). One `Option<u64>` claim per control
   is what makes simultaneous two-thumb throttle+rudder work.
+- **LINES mode** (2026-08-20, `src/mooring.rs`): the mooring frontend, on
+  the `T` key and the LINES button (the button exists for the same reason
+  KEEL does — without it there's no way in on a touch-only device).
+  Unlike the keel editor it does **NOT freeze the sim**: getting a line
+  ashore is something you do with the boat still moving, so the handles
+  have to work live.
+  - **The gesture is deliberately forgiving**, because a fairlead is
+    ~2 m from its neighbour and the camera is often zoomed out: a press
+    near the hull takes the NEAREST handle or rope (see the
+    nearest-wins bullet below), and one state
+    machine accepts either a drag (fairlead → anchor) or two taps
+    (fairlead, then anchor), so nobody has to be precise with a moving
+    target. A drag that lands on nothing cancels; a TAP that lands on
+    nothing leaves the fairlead armed for the second tap. Hit radii are
+    `(scale*0.9).clamp(18, 42)` css px — floored so handles stay
+    hittable when zoomed out.
+  - **One claim covers every mooring gesture** (leading a line, holding
+    HAUL/SLACK, dragging the pass-speed setting) — they're mutually
+    exclusive by hand, so it's one `Option<Grab>` inside `MooringUi` plus
+    one claim slot outside: `mouse_claim = Some(5)` and
+    `mooring_touch: Option<(u64, Vec2)>`. The touch claim carries the
+    finger's LAST SEEN POSITION because `touches()` drops a lifted id
+    without reporting a final position, and where the rope was let go is
+    exactly what decides whether it lands on a cleat.
+  - **Input runs before the camera block**, so world↔screen hit-testing
+    uses `last_cam`/`last_scale`/`last_boat` — last frame's view and
+    INTERPOLATED pose, i.e. what the player was actually looking at when
+    they pressed. (`last_scale` already existed for the pan code; the
+    other two are its companions.)
+  - **Held controls repeat, one-shots queue.** `next_command` drains a
+    queued `MakeFast`/`CastOff` first, otherwise re-issues `Tend` for as
+    long as HAUL or SLACK is held — that's how a continuous pull is
+    expressed in a one-order-per-tick input stream. Sliding a finger off
+    a tend button stops the pull, like a real press-and-hold control.
+  - **Picking a rope vs picking a handle: NEAREST WINS, not a fixed
+    priority** (bug found by the owner, 2026-08-20). Checking fairleads
+    first made ropes unselectable near the boat, because every rope's
+    inboard end sits exactly ON a fairlead — the handle swallowed the
+    press every time. Two fixes, both needed: `press` now measures the
+    distance to the nearest handle AND to the nearest rope and takes
+    whichever is genuinely closer, and `dist_to_rope` hit-tests the rope
+    as DRAWN, bight and all, instead of the straight chord — a slack line
+    bulges off to one side, so tapping the rope you can see was missing
+    it entirely. A rope gets the more generous radius of the two (it is a
+    long thin target; a handle is a fat round one), which nearest-wins
+    keeps honest. Ties go to the HANDLE (`df <= dr`), which is what
+    makes doubling up reachable now that sim-core allows it: a press
+    right ON an occupied fairlead arms it for a second rope, while a
+    press further along the rope selects the rope.
+  - **Refusals say why.** An order that silently does nothing is the
+    worst kind, and the reach limit in particular is invisible until
+    something mentions it. While a fairlead is armed its REACH is drawn
+    as a ring on the water and the rubber band turns red the moment the
+    pointer leaves it; a release outside it, a rope that would repeat one
+    already there ("the stbd waist already has a line to there"), and no
+    line left to spare each put a short note in the status line
+    (`MooringUi::note`, ~2.6 s). A line that vanishes while still
+    `Passing` reports itself as a throw that fell short. The frontend
+    re-checks the same three rules sim-core enforces — not to enforce
+    them, which is `tick`'s job, but so the refusal has a reason
+    attached.
+  - **The tend buttons follow the SELECTION, never the status line**: a
+    transient note must not make live controls vanish from under a thumb.
+  - **Drawing**: `draw_ropes` draws EVERY rope in the marina, the
+    player's and the fleet's, through one path — they are the same thing,
+    so they are drawn by the same code (the fleet's just quieter, and
+    culled against the camera: a few hundred ropes exist and a berth or
+    two is ever on screen). Ropes are drawn whether or not the mode is
+    open (once a line is out it's part of the world), BEFORE the hull so the end tucks
+    under the deck edge at its fairlead — the same ordering trick as the
+    rudder blade. A slack line bights out to the side by the parabolic
+    arc-length relation `h = sqrt(3*d*slack/8)`, so the bight grows the
+    way real rope does as you close on the cleat rather than by an
+    invented curve; in a top-down view the bight has to lie somewhere, so
+    it's pushed to whichever side is away from the boat (rope draped over
+    the deck reads as a mistake). Tension tints and thickens the rope; a
+    line still going ashore snakes out with its end running ahead of it.
+    Cleats are drawn as studs on the pontoon faces from
+    `cleat_positions()`, so a stud you can see is a stud you can reach.
+  - The crew's line-passing speed is a SETTING and lives in the settings
+    menu (`src/settings.rs`), not in this panel — the mooring panel
+    carries only the controls you use while handling a rope.
+    `hud_button` is the shared plate/rim/label helper the whole bottom
+    row uses.
 - **Safe-area insets**: `index.html` resolves `env(safe-area-inset-*)` via a
   hidden probe element (+ folds the floating-toolbar height in via
   `visualViewport`) and pushes css px into the wasm export
@@ -1049,10 +1550,11 @@ like Pegasus.
   blade-angle formula sim-core uses. The churned-water trail
   (`src/wake.rs`, see Project structure) is the other render-side
   reader of sim state: it draws right after the ripples, so it sits on
-  the water and under the land fills, jetties, moored boats and the
-  player's own hull.
-- Controls: touch/mouse = drag the dials/sliders + RESET/KEEL buttons
-  (+ CENTER while panned), pinch = zoom, one-finger/mouse drag on the
+  the water and under the land fills, jetties, moored boats, the ropes
+  and the player's own hull.
+- Controls: touch/mouse = drag the dials/sliders + the bottom row's
+  RESET/KEEL/LINES buttons and settings gear (+ CENTER while panned,
+  leftmost of the row), pinch = zoom, one-finger/mouse drag on the
   water = pan, scroll wheel / +/- keys = zoom and C = centre (desktop
   twins);
   keyboard = **the boat has the primary keys** (agreed 2026-08-03: driving
@@ -1060,7 +1562,9 @@ like Pegasus.
   (continuous `is_key_down`×dt like the env keys), Space = engine to
   neutral (edge-triggered). Wind keeps ←/→ dir + ↑/↓ speed; current sits
   on the IJKL "second arrows" cluster (J/L dir, I/K speed) — which is why
-  the keel editor moved from K to **E** (K = current speed down now). R
+  the keel editor moved from K to **E** (K = current speed down now).
+  **T** opens LINES mode (mooring lines — see above), **O** the settings
+  menu. R
   reset (reset = `respawn(&design)`, a fresh `Sim::new_with_design`,
   never an in-place teleport; env is kept but **helm/engine reset to
   `InputState::NEUTRAL`** — a fresh boat doesn't inherit a live
@@ -1103,12 +1607,18 @@ like Pegasus.
   own rule against designing for hypothetical future requirements); add
   the abstraction once a second ship type actually needs to coexist with
   the first.
-- **Ropes**: placeable mooring lines (bow/stern/springs) — each a constraint
-  or spring force between a hull fairlead and a quay bollard, applied inside
-  `tick` from an extended `InputState`. Then: scenarios (approach, spring
-  off a lee quay, …), recordings/replays (the Pegasus hybrid format),
-  scoring. (Touch controls and engine/rudder are done — see Frontend
-  conventions and Simulation model above.)
+- **Ropes**: DONE 2026-08-20 (see Mooring lines under Simulation model and
+  LINES mode under Frontend conventions), including the moored fleet —
+  the whole marina lies to real ropes on dynamic hulls. What the rope
+  work leaves open: line MATERIAL is fixed
+  at 14 mm three-strand nylon (polyester would be a per-line choice, and
+  the curve is already the only thing that would vary); and lines pass
+  through poles, hulls and jetties without contact or friction (no turn
+  round a pole, no catenary weight — the top-down 2D simplifications
+  documented on the module).
+- **Scenarios and scoring**: approach, spring off a lee quay, …;
+  recordings/replays (the Pegasus hybrid format) — the input stream now
+  carries line orders too, so a replay would reproduce the rope work.
 
 ## License
 GPL-3.0-or-later (deliberate choice, 2026-08-02, formalising the field the

@@ -12,16 +12,21 @@
 //! written directly in css px.
 
 use harbour_sim_core::boat::BoatDesign;
+use harbour_sim_core::line::{Anchor, Fitting, Hull, ShoreKind};
 use harbour_sim_core::sim::{
-    Env, HULL_PTS, InputState, JETTY_HALF_W, PHYSICS_DT, POLE_RADIUS, Sim, head_arc, hill_shore,
-    jetties, marina_shore_len, moored_boats, pole_positions, road_shore, world_bounds,
+    Env, HULL_PTS, InputState, JETTY_HALF_W, PHYSICS_DT, POLE_RADIUS, Sim, cleat_positions,
+    head_arc, hill_shore, jetties, marina_shore_len, pole_positions, road_shore, world_bounds,
 };
 use keel_editor::{EditorAction, EditorLayout, KeelEditor};
 use macroquad::prelude::*;
+use mooring::{Ctx as MooringCtx, MooringLayout, MooringUi, View};
+use settings::{SettingsLayout, SettingsMenu};
 use wake::Wake;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 mod keel_editor;
+mod mooring;
+mod settings;
 mod wake;
 
 // DEFAULT zoom bounds for the fill-screen camera: never show more than
@@ -134,6 +139,25 @@ fn draw_strip(a: &[Vec2], b: &[Vec2], w2s: impl Fn(Vec2) -> Vec2, col: Color) {
     }
 }
 
+/// One HUD button: dark plate, thin rim, centred label. `on` draws it
+/// engaged, for buttons that toggle a mode rather than firing an action.
+fn hud_button(r: Rect, label: &str, fs: f32, on: bool) {
+    let plate =
+        if on { Color::from_rgba(24, 62, 84, 200) } else { Color::from_rgba(10, 20, 30, 170) };
+    let rim =
+        if on { Color::from_rgba(120, 200, 235, 220) } else { Color::from_rgba(130, 160, 178, 255) };
+    draw_rectangle(r.x, r.y, r.w, r.h, plate);
+    draw_rectangle_lines(r.x, r.y, r.w, r.h, 2.0, rim);
+    let m = measure_text(label, None, fs as u16, 1.0);
+    draw_text(
+        label,
+        r.x + (r.w - m.width) * 0.5,
+        r.y + r.h * 0.5 + fs * 0.35,
+        fs,
+        Color::from_rgba(205, 227, 240, 255),
+    );
+}
+
 /// A draggable compass dial (screen-space geometry, css px).
 #[derive(Clone, Copy)]
 struct Dial {
@@ -208,7 +232,15 @@ async fn main() {
     // truth for all of it: what's drawn IS what collides.
     let jetty_list = jetties();
     let poles = pole_positions();
-    let moored = moored_boats();
+    let cleats = cleat_positions();
+    // Everything a rope can be belayed to, built once from sim-core's own
+    // geometry like the rest of the scenery — what is drawn IS what a
+    // line can reach.
+    let anchors: Vec<Anchor> = cleats
+        .iter()
+        .map(|&pos| Anchor::Shore { pos, kind: ShoreKind::Cleat })
+        .chain(poles.iter().map(|&pos| Anchor::Shore { pos, kind: ShoreKind::Pole }))
+        .collect();
     let road = road_shore();
     let hill = hill_shore();
     let head = head_arc();
@@ -261,6 +293,24 @@ async fn main() {
     // a camera preference — it survives resets and respawns.
     let mut zoom = 1.0f32;
     let mut pinch: Option<(u64, u64, f32)> = None;
+    // Mooring lines: the mode, its handles, and the finger holding one of
+    // them. One claim covers every mooring gesture (leading a line,
+    // hauling, the speed setting) — they are mutually exclusive by hand.
+    let mut mooring = MooringUi::new();
+    // Configuration lives in its own menu, not in the play HUD.
+    let mut settings = SettingsMenu::new();
+    let mut mooring_touch: Option<(u64, Vec2)> = None;
+    // Last frame's camera centre, the companion to `last_scale`: input
+    // runs before the camera block, so world↔screen hit-testing uses the
+    // view the player was actually looking at when they pressed.
+    let mut last_cam = Vec2::ZERO;
+    // Last frame's INTERPOLATED pose, the companion to `last_cam`: what
+    // the player saw when they reached for a fairlead.
+    let mut last_boat = (prev_pos, prev_heading);
+    // The moored fleet's live poses, refreshed once a frame into a reused
+    // buffer — they lie to real ropes now, so where they are is sim state
+    // rather than something the renderer can read off `moored_boats()`.
+    let mut moored_poses: Vec<(Vec2, f32)> = sim.moored_poses().collect();
     // Camera pan: an OFFSET from the boat, in world metres (one-finger
     // drag on the water, or a mouse drag — mouse_claim 4). The camera
     // keeps FOLLOWING the boat while panned, displaced by this — watch
@@ -340,16 +390,52 @@ async fn main() {
             keel_w,
             keel_h,
         );
-        // CENTER button, left of KEEL — the touch/mouse twin of the C key.
+        // LINES button, left of KEEL — the touch/mouse twin of the T key,
+        // and the only way into mooring mode on a touch-only device (the
+        // same reason KEEL exists).
+        let lines_w = fs * 4.8;
+        let lines_rect = Rect::new(
+            keel_rect.x - margin - lines_w,
+            sh - sa_b - margin - keel_h,
+            lines_w,
+            keel_h,
+        );
+        // Settings button, left of LINES — the touch/mouse twin of the O
+        // key. Drawn as a gear rather than a word: the bottom row is
+        // already four buttons wide on a phone, and configuration is the
+        // one thing here that does not need a label to be found.
+        let gear_rect = Rect::new(
+            lines_rect.x - margin - keel_h,
+            sh - sa_b - margin - keel_h,
+            keel_h,
+            keel_h,
+        );
+        // CENTER button, left of the settings gear — the touch/mouse twin
+        // of the C key.
         // Only shown (and only hittable) while the camera is panned away
         // from the boat, so the button row stays uncluttered otherwise.
         let center_w = fs * 5.2;
         let center_rect = Rect::new(
-            keel_rect.x - margin - center_w,
+            gear_rect.x - margin - center_w,
             sh - sa_b - margin - keel_h,
             center_w,
             keel_h,
         );
+        // Mooring panel, stacked above the button row: the tend controls
+        // for the selected line, nearest the thumb. Positions are fixed
+        // whether or not a line is selected, so the buttons appear in
+        // place instead of shuffling the row around under a finger.
+        let tend_y = sh - sa_b - margin * 2.0 - keel_h * 2.0;
+        let cast_w = fs * 5.8;
+        let slack_w = fs * 5.0;
+        let haul_w = fs * 4.4;
+        let cast_rect = Rect::new(sw - sa_r - margin - cast_w, tend_y, cast_w, keel_h);
+        let slack_rect =
+            Rect::new(cast_rect.x - margin * 0.6 - slack_w, tend_y, slack_w, keel_h);
+        let haul_rect = Rect::new(slack_rect.x - margin * 0.6 - haul_w, tend_y, haul_w, keel_h);
+        // The mooring status line sits above the tend row.
+        let mooring_status_y = tend_y - fs * 0.6;
+        let mooring_layout = MooringLayout { haul: haul_rect, slack: slack_rect, cast: cast_rect };
         // Helm/engine sliders on the mid-left/mid-right edges — the
         // two-thumb zone on a phone, clear of the dials above (centre at
         // 0.56·sh keeps the throttle's top under the wind dial's label
@@ -365,10 +451,28 @@ async fn main() {
             vertical: false,
         };
 
-        if !editor.active {
+        if !editor.active && !settings.active {
             let mut do_reset = is_key_pressed(KeyCode::R);
             let mut do_open_editor = false;
             let mut do_center = is_key_pressed(KeyCode::C);
+            let mut do_toggle_lines = is_key_pressed(KeyCode::T);
+            let mut do_open_settings = is_key_pressed(KeyCode::O);
+
+            // Everything the mooring UI needs of the world this frame,
+            // against LAST frame's camera and interpolated pose — input
+            // runs ahead of the camera block, so this is the view the
+            // player was actually looking at when they pressed.
+            let mooring_ctx = MooringCtx {
+                view: View { cam: last_cam, scale: last_scale, sw, sh },
+                boat_pos: last_boat.0,
+                boat_heading: last_boat.1,
+                moored: &moored_poses,
+                anchors: &anchors,
+                lines: sim.lines(),
+                broken: sim.broken_fittings(),
+                reach: settings.reach,
+                layout: mooring_layout,
+            };
 
             // --- Touch input: dial drags + reset/keel taps -----------------
             let ts = touches();
@@ -380,6 +484,10 @@ async fn main() {
                     // A recycled id is a NEW finger: drop any stale claim first.
                     if wind_claim == Some(t.id) {
                         wind_claim = None;
+                    }
+                    if mooring_touch.is_some_and(|(id, _)| id == t.id) {
+                        mooring.clear_grabs();
+                        mooring_touch = None;
                     }
                     if current_claim == Some(t.id) {
                         current_claim = None;
@@ -402,8 +510,14 @@ async fn main() {
                         do_reset = true;
                     } else if keel_rect.contains(p) {
                         do_open_editor = true;
+                    } else if lines_rect.contains(p) {
+                        do_toggle_lines = true;
+                    } else if gear_rect.contains(p) {
+                        do_open_settings = true;
                     } else if cam_offset.length() > 0.5 && center_rect.contains(p) {
                         do_center = true;
+                    } else if mooring_touch.is_none() && mooring.press(p, &mooring_ctx) {
+                        mooring_touch = Some((t.id, p));
                     }
                 }
                 if wind_claim == Some(t.id) {
@@ -418,6 +532,9 @@ async fn main() {
                     input.throttle = throttle_slider.value(p);
                 } else if rudder_claim == Some(t.id) {
                     input.rudder = rudder_slider.value(p);
+                } else if mooring_touch.is_some_and(|(id, _)| id == t.id) {
+                    mooring.hold(p, &mooring_ctx);
+                    mooring_touch = Some((t.id, p));
                 }
             }
             if wind_claim.is_some_and(|id| !cur_ids.contains(&id)) {
@@ -431,6 +548,16 @@ async fn main() {
             }
             if rudder_claim.is_some_and(|id| !cur_ids.contains(&id)) {
                 rudder_claim = None;
+            }
+            // A lifted finger releases its mooring gesture where it was
+            // last seen — `touches()` drops the id without reporting a
+            // final position, and where the rope was let go is exactly
+            // what decides whether it lands on a cleat.
+            if let Some((id, at)) = mooring_touch
+                && !cur_ids.contains(&id)
+            {
+                mooring.release(at, &mooring_ctx);
+                mooring_touch = None;
             }
             prev_touch_ids = cur_ids;
 
@@ -448,6 +575,7 @@ async fn main() {
                         && current_claim != Some(t.id)
                         && throttle_claim != Some(t.id)
                         && rudder_claim != Some(t.id)
+                        && mooring_touch.is_none_or(|(id, _)| id != t.id)
                 })
                 .map(|t| (t.id, t.position / dpi))
                 .collect();
@@ -496,8 +624,14 @@ async fn main() {
                     do_reset = true;
                 } else if keel_rect.contains(mp) {
                     do_open_editor = true;
+                } else if lines_rect.contains(mp) {
+                    do_toggle_lines = true;
+                } else if gear_rect.contains(mp) {
+                    do_open_settings = true;
                 } else if cam_offset.length() > 0.5 && center_rect.contains(mp) {
                     do_center = true;
+                } else if mooring.press(mp, &mooring_ctx) {
+                    mouse_claim = Some(5);
                 } else {
                     // Anywhere on the water: drag to pan (claim 4).
                     mouse_claim = Some(4);
@@ -524,9 +658,13 @@ async fn main() {
                         cam_offset.y += d.y / last_scale; // screen y is inverted
                         pan_mouse_prev = mp;
                     }
+                    Some(5) => mooring.hold(mp, &mooring_ctx),
                     _ => {}
                 }
             } else {
+                if mouse_claim == Some(5) {
+                    mooring.release(mp, &mooring_ctx);
+                }
                 mouse_claim = None;
             }
 
@@ -595,6 +733,30 @@ async fn main() {
                 zoom *= 2.0f32.powf(-dt);
             }
 
+            if do_open_settings {
+                settings.open();
+                // Same claim reset as the keel editor: the fingers that
+                // opened this are not driving dials or ropes.
+                prev_touch_ids = touches().iter().map(|t| t.id).collect();
+                wind_claim = None;
+                current_claim = None;
+                throttle_claim = None;
+                rudder_claim = None;
+                mouse_claim = None;
+                mooring.clear_grabs();
+                mooring_touch = None;
+            }
+            if do_toggle_lines {
+                mooring.active = !mooring.active;
+                // Leaving the mode drops anything in hand; entering it
+                // starts clean too, so a stale armed fairlead from last
+                // time can't complete on the first tap.
+                mooring.clear_grabs();
+                mooring_touch = None;
+                if !mooring.active {
+                    mooring.selected = None;
+                }
+            }
             if do_center {
                 cam_offset = Vec2::ZERO;
             }
@@ -610,10 +772,19 @@ async fn main() {
                 // ...and a clean slate of water: a surviving wake would
                 // draw a streak from wherever the boat was to the spawn.
                 wake.clear();
+                // ...and no ropes: `respawn` builds a fresh `Sim`, so the
+                // lines are gone with it. Drop every one of the UI's
+                // references to them, not just the grab and selection —
+                // a queued order or a stale `passing` id would otherwise
+                // reach into a sim that never issued them.
+                mooring.reset();
+                mooring_touch = None;
             }
             if do_open_editor {
                 editor.load_design(&design);
                 editor.active = true;
+                mooring.clear_grabs();
+                mooring_touch = None;
                 // Drop stale claims — these fingers are opening the
                 // editor, not driving dials/sliders.
                 wind_claim = None;
@@ -628,10 +799,20 @@ async fn main() {
             while accum >= PHYSICS_DT {
                 prev_pos = cur_pos;
                 prev_heading = cur_heading;
+                // One line order per tick, drained from the mooring UI:
+                // queued one-shots first, then a held HAUL/SLACK repeated
+                // for as long as it is held.
+                input.line = mooring.next_command(sim.lines());
+                input.crew = settings.crew();
                 sim.tick(&env, &input);
+                mooring.report_failures(sim.line_failures());
                 (cur_pos, cur_heading) = sim.boat_pose();
                 accum -= PHYSICS_DT;
             }
+            input.line = None;
+            mooring.prune(sim.lines());
+            moored_poses.clear();
+            moored_poses.extend(sim.moored_poses());
 
             // Cosmetic wake, advanced on the FRAME's dt (it is render
             // state, not physics) and only while the sim is running —
@@ -680,6 +861,8 @@ async fn main() {
             follow.y.clamp(wb + vis_hh, wt - vis_hh)
         };
         last_scale = scale;
+        last_cam = vec2(cam_x, cam_y);
+        last_boat = (pos, heading);
         let w2s = |p: Vec2| -> Vec2 {
             vec2(sw * 0.5 + (p.x - cam_x) * scale, sh * 0.5 - (p.y - cam_y) * scale)
         };
@@ -831,9 +1014,31 @@ async fn main() {
             draw_line(sr1.x, sr1.y, st1.x, st1.y, 1.5, deck_edge);
             draw_line(st0.x, st0.y, st1.x, st1.y, 1.5, deck_edge);
         }
+        // Cleats along the faces — real marina furniture, and what a bow
+        // or breast line belays to. Positions come from sim-core, so a
+        // stud you can see is a stud you can reach.
+        let cleat_col = Color::from_rgba(84, 80, 72, 255);
+        for c in &cleats {
+            if !visible(*c, 1.0) {
+                continue;
+            }
+            let sc = w2s(*c);
+            let r = (0.22 * scale).max(1.2);
+            // One that has been pulled off the pontoon leaves its holes
+            // behind, and is not offered as an anchor any more.
+            if sim.broken_fittings().contains(&Fitting::Shore(*c)) {
+                draw_circle_lines(sc.x, sc.y, r * 1.6, 2.0, mooring::TORN_OUT);
+            } else {
+                draw_circle(sc.x, sc.y, r, cleat_col);
+            }
+        }
 
-        // --- Moored boats (static in sim-core) + their mooring lines ------
-        let moor_line = Color::from_rgba(200, 198, 190, 200);
+        // --- Moored boats -------------------------------------------------
+        // Dynamic in sim-core since 2026-08-20, so they are drawn at the
+        // pose the sim gives them rather than at the fixed berth
+        // geometry — a boat you lean on moves, and comes back. Their
+        // mooring lines are real `Line`s and were drawn above with
+        // everyone else's, so there is no decorative rigging left here.
         let moored_line_col = Color::from_rgba(46, 48, 54, 255);
         let moored_fills = [
             Color::from_rgba(226, 222, 208, 255),
@@ -841,41 +1046,14 @@ async fn main() {
             Color::from_rgba(230, 224, 212, 255),
             Color::from_rgba(206, 200, 188, 255),
         ];
-        for (bi, mb) in moored.iter().enumerate() {
-            if !visible(mb.pos, 16.0) {
+        for (bi, &(mpos, mheading)) in moored_poses.iter().enumerate() {
+            if !visible(mpos, 16.0) {
                 continue;
             }
-            let (mc, ms) = (mb.heading.cos(), mb.heading.sin());
+            let (mc, ms) = (mheading.cos(), mheading.sin());
             let ml = |lx: f32, ly: f32| -> Vec2 {
-                w2s(mb.pos + vec2(lx * mc - ly * ms, lx * ms + ly * mc))
+                w2s(mpos + vec2(lx * mc - ly * ms, lx * ms + ly * mc))
             };
-            let fwd = vec2(mc, ms);
-            let port = vec2(-ms, mc);
-
-            // Crossed lines from the outboard end's quarters to its pole
-            // pair — the classic Swedish pole berth from the photos.
-            let (end_x, quarter_x) = if mb.bow_to_jetty { (-5.9, -5.6) } else { (6.0, 4.2) };
-            let end_c = mb.pos + fwd * end_x;
-            for p in mb.poles {
-                let side_sign = if (p - end_c).dot(port) >= 0.0 { 1.0 } else { -1.0 };
-                let q = ml(quarter_x, -1.5 * side_sign);
-                let pw = w2s(p);
-                draw_line(q.x, q.y, pw.x, pw.y, (0.07 * scale).max(1.0), moor_line);
-            }
-            // Short breast lines from the jetty end's quarters to the face.
-            let jetty_quarter_x = if mb.bow_to_jetty { 4.2 } else { -5.6 };
-            let across = vec2(-mb.out.y, mb.out.x);
-            for side in [1.0f32, -1.0] {
-                let qw = mb.pos
-                    + vec2(
-                        jetty_quarter_x * mc - 1.5 * side * ms,
-                        jetty_quarter_x * ms + 1.5 * side * mc,
-                    );
-                let s = if (qw - mb.jetty_face).dot(across) >= 0.0 { 1.0 } else { -1.0 };
-                let a = w2s(mb.jetty_face + across * (1.3 * s));
-                let q = w2s(qw);
-                draw_line(q.x, q.y, a.x, a.y, (0.07 * scale).max(1.0), moor_line);
-            }
 
             // Hull: same outline as the player's, quieter deck detail.
             let fill = moored_fills[bi % moored_fills.len()];
@@ -931,6 +1109,24 @@ async fn main() {
             draw_circle(sp.x, sp.y, r + 1.0, pole_rim);
             draw_circle(sp.x, sp.y, r, pole_fill);
         }
+
+        // --- Mooring lines ------------------------------------------------
+        // Drawn before the hull so a rope's end tucks under the deck edge
+        // at its fairlead (same ordering trick as the rudder blade), and
+        // always — once a line is out it is part of the world, not part
+        // of the LINES-mode overlay.
+        let mooring_ctx = MooringCtx {
+            view: View { cam: vec2(cam_x, cam_y), scale, sw, sh },
+            boat_pos: pos,
+            boat_heading: heading,
+            moored: &moored_poses,
+            anchors: &anchors,
+            lines: sim.lines(),
+            broken: sim.broken_fittings(),
+            reach: settings.reach,
+            layout: mooring_layout,
+        };
+        mooring::draw_ropes(&mooring_ctx, mooring.selected, visible);
 
         // --- Boat --------------------------------------------------------
         let (c, s) = (heading.cos(), heading.sin());
@@ -1050,6 +1246,9 @@ async fn main() {
         draw_circle(mast.x, mast.y, (0.18 * scale).max(1.5), hull_line);
 
         // --- HUD ---------------------------------------------------------
+        // Mooring handles sit over everything they attach to.
+        mooring::draw_handles(&mooring, &mooring_ctx);
+
         let text = Color::from_rgba(205, 227, 240, 255);
         let dim = Color::from_rgba(130, 160, 178, 255);
         let wind_col = Color::from_rgba(120, 220, 255, 255);
@@ -1195,68 +1394,95 @@ async fn main() {
         draw_text(&sog, sw * 0.5 - sd.width * 0.5, sa_t + margin + fs, fs, text);
 
         // Reset button (bottom-right) — the touch/mouse twin of the R key.
-        draw_rectangle(
-            reset_rect.x,
-            reset_rect.y,
-            reset_rect.w,
-            reset_rect.h,
-            Color::from_rgba(10, 20, 30, 170),
-        );
-        draw_rectangle_lines(reset_rect.x, reset_rect.y, reset_rect.w, reset_rect.h, 2.0, dim);
-        let rl = measure_text("RESET", None, fs as u16, 1.0);
-        draw_text(
-            "RESET",
-            reset_rect.x + (reset_rect.w - rl.width) * 0.5,
-            reset_rect.y + reset_rect.h * 0.5 + fs * 0.35,
-            fs,
-            text,
-        );
+        hud_button(reset_rect, "RESET", fs, false);
 
         // Keel editor button (bottom-right, left of RESET) — the
-        // touch/mouse twin of the K key.
-        draw_rectangle(
-            keel_rect.x,
-            keel_rect.y,
-            keel_rect.w,
-            keel_rect.h,
-            Color::from_rgba(10, 20, 30, 170),
-        );
-        draw_rectangle_lines(keel_rect.x, keel_rect.y, keel_rect.w, keel_rect.h, 2.0, dim);
-        let kl = measure_text("KEEL", None, fs as u16, 1.0);
-        draw_text(
-            "KEEL",
-            keel_rect.x + (keel_rect.w - kl.width) * 0.5,
-            keel_rect.y + keel_rect.h * 0.5 + fs * 0.35,
-            fs,
-            text,
-        );
+        // touch/mouse twin of the E key.
+        hud_button(keel_rect, "KEEL", fs, editor.active);
 
-        // Centre-on-boat button (left of KEEL) — only while the camera is
+        // Mooring lines button (left of KEEL) — the touch/mouse twin of
+        // the T key, and the only way into the mode without a keyboard.
+        hud_button(lines_rect, "LINES", fs, mooring.active);
+
+        // Settings gear (left of LINES) — the touch/mouse twin of the O
+        // key. Drawn from primitives: the built-in font is ASCII only, so
+        // there is no gear glyph to set.
+        hud_button(gear_rect, "", fs, settings.active);
+        {
+            let c = vec2(gear_rect.x + gear_rect.w * 0.5, gear_rect.y + gear_rect.h * 0.5);
+            let r = gear_rect.h * 0.26;
+            for k in 0..6 {
+                let a = k as f32 * std::f32::consts::TAU / 6.0;
+                let (sn, cs) = a.sin_cos();
+                draw_line(
+                    c.x + cs * r * 0.9,
+                    c.y + sn * r * 0.9,
+                    c.x + cs * r * 1.5,
+                    c.y + sn * r * 1.5,
+                    2.5,
+                    text,
+                );
+            }
+            draw_circle_lines(c.x, c.y, r, 2.5, text);
+            draw_circle(c.x, c.y, r * 0.34, text);
+        }
+
+        // Mooring panel: only while the mode is open. The tend controls
+        // for the selected rope sit nearest the thumb, the line-handling
+        // speed setting above them.
+        if mooring.active {
+            let selected = mooring.selected.and_then(|id| sim.lines().iter().find(|l| l.id == id));
+            // The tend controls follow the SELECTION, never the status
+            // line: a transient note must not make live buttons vanish
+            // from under a thumb.
+            if selected.is_some() {
+                hud_button(haul_rect, "HAUL", fs, false);
+                hud_button(slack_rect, "SLACK", fs, false);
+                hud_button(cast_rect, "CAST OFF", fs, false);
+            }
+            // One status line, with a refused order's reason taking
+            // priority for a couple of seconds — an order that does
+            // nothing without saying why is the worst kind.
+            if let Some(msg) = mooring.note() {
+                draw_text(
+                    msg,
+                    haul_rect.x,
+                    mooring_status_y,
+                    fs * 0.85,
+                    Color::from_rgba(255, 150, 120, 255),
+                );
+            } else if let Some(l) = selected {
+                // Both ends from the render pose: mixing in the sim's
+                // un-interpolated one makes the number disagree with the
+                // rope that is drawn, and flickers it across the 2 cm
+                // slack threshold between frames.
+                let dist = (mooring_ctx.anchor_pos(l.anchor)
+                    - mooring_ctx.fairlead_of(l.hull, l.fairlead))
+                .length();
+                let slack = l.scope - dist;
+                let state = if !l.is_fast() {
+                    "going ashore".to_string()
+                } else if slack > 0.02 {
+                    format!("{slack:.1} m slack")
+                } else {
+                    format!("{:.2} kN", l.tension / 1000.0)
+                };
+                let label = format!("{} line, {:.1} m - {state}", l.fairlead.label(), l.scope);
+                draw_text(&label, haul_rect.x, mooring_status_y, fs * 0.85, text);
+            } else {
+                let hint = if sim.lines().iter().all(|l| l.hull != Hull::Player) {
+                    "drag from a fairlead to a cleat or pole"
+                } else {
+                    "tap a rope to haul, slack or cast it off"
+                };
+                draw_text(hint, haul_rect.x, mooring_status_y, fs * 0.85, dim);
+            }
+        }
+
+        // Centre-on-boat button (left of LINES) — only while the camera is
         // panned off the boat; the touch/mouse twin of the C key.
         if cam_offset.length() > 0.5 {
-            draw_rectangle(
-                center_rect.x,
-                center_rect.y,
-                center_rect.w,
-                center_rect.h,
-                Color::from_rgba(10, 20, 30, 170),
-            );
-            draw_rectangle_lines(
-                center_rect.x,
-                center_rect.y,
-                center_rect.w,
-                center_rect.h,
-                2.0,
-                dim,
-            );
-            let cl = measure_text("CENTER", None, fs as u16, 1.0);
-            draw_text(
-                "CENTER",
-                center_rect.x + (center_rect.w - cl.width) * 0.5,
-                center_rect.y + center_rect.h * 0.5 + fs * 0.35,
-                fs,
-                text,
-            );
+            hud_button(center_rect, "CENTER", fs, false);
         }
 
         // Hints, bottom-left. Keyboard lines only where a keyboard is
@@ -1270,12 +1496,16 @@ async fn main() {
         ];
         if sw >= 700.0 {
             help.push("keys: W/S throttle, A/D rudder, Space stop engine, arrows wind");
-            help.push("I/K+J/L = current, R = reset, E = keel editor, wheel/+- = zoom, C = centre");
+            help.push(
+                "I/K+J/L = current, R = reset, E = keel, T = lines, O = settings, C = centre",
+            );
         }
         let help_x = sa_l + margin + 40.0;
         // On narrow screens the hint line runs under the buttons (they
         // share the bottom edge) — lift the block above them then.
-        let buttons_left = if cam_offset.length() > 0.5 { center_rect.x } else { keel_rect.x };
+        // The LEFTMOST button of the row, so the help text clears all of
+        // them: LINES and the settings gear both sit left of KEEL.
+        let buttons_left = if cam_offset.length() > 0.5 { center_rect.x } else { gear_rect.x };
         let help_w = help
             .iter()
             .map(|l| measure_text(l, None, (fs * 0.8) as u16, 1.0).width)
@@ -1285,6 +1515,11 @@ async fn main() {
         } else {
             sh - sa_b - margin
         };
+        // ...and in mooring mode the panel occupies that same strip above
+        // the buttons, so the help block steps up clear of the panel AND
+        // of the status line drawn just above it.
+        let help_base =
+            if mooring.active { help_base.min(mooring_status_y - fs * 1.1) } else { help_base };
         for (i, line) in help.iter().enumerate() {
             draw_text(
                 line,
@@ -1293,6 +1528,26 @@ async fn main() {
                 fs * 0.8,
                 dim,
             );
+        }
+
+        // --- Settings overlay ---------------------------------------------
+        // Freezes the game while open (input AND the physics tick), the
+        // same rule as the keel editor — which is what lets it reuse keys
+        // and take presses without fighting the HUD's touch claims.
+        if settings.active {
+            let layout = SettingsLayout::centred(sw, sh, fs);
+            if settings.update(&layout) {
+                settings.active = false;
+                prev_touch_ids = touches().iter().map(|t| t.id).collect();
+                wind_claim = None;
+                current_claim = None;
+                throttle_claim = None;
+                rudder_claim = None;
+                mouse_claim = None;
+            }
+            if settings.active {
+                settings.draw(&layout, sw, sh);
+            }
         }
 
         // --- Keel design editor overlay -----------------------------------
