@@ -17,9 +17,10 @@
 use crate::boat::{BoatDesign, RudderDesign};
 use crate::keel::{flat_plate_cd, KeelDerived, KeelProfile};
 use crate::line::{
-    anchor_fitting, line_on_broken_fitting, line_pull, weakest_link, Anchor,
+    anchor_fitting, fitting_gave, fitting_key, fitting_limit, line_on_broken_fitting, line_pull,
+    Anchor,
     CrewLimits, Fairlead, Fitting, Gave, Hull, Line, LineCommand, LineState, ShoreKind,
-    LINE_SCOPE_MAX, LINE_SCOPE_MIN,
+    LINE_MBL, LINE_SCOPE_MAX, LINE_SCOPE_MIN,
 };
 use glam::Vec2;
 use rapier2d::prelude::*;
@@ -1476,6 +1477,11 @@ pub struct Sim {
     /// with its real cause instead of noticing a rope has silently
     /// vanished.
     failures: Vec<(u32, Hull, Gave)>,
+    /// Scratch for `step_lines`' second phase: (fitting, the force one
+    /// rope puts on it, that rope's id, whose rope). Lives on `Sim` only
+    /// so its capacity survives between ticks — it carries no state, and
+    /// is cleared at the top of every `step_lines`.
+    fit_loads: Vec<(Fitting, Vec2, u32, Hull)>,
     /// Fittings torn out so far this run, in the order they went. The
     /// marina remembers: you cannot re-use the cleat you just pulled off
     /// the pontoon. A fresh `Sim` (R-reset) repairs everything, which is
@@ -1790,6 +1796,7 @@ impl Sim {
             next_line_id: 0,
             last_env: Env::CALM,
             failures: Vec::new(),
+            fit_loads: Vec::new(),
             broken: Vec::new(),
             ticks: 0,
         }
@@ -1946,23 +1953,27 @@ impl Sim {
         let mut lost: Vec<u32> = Vec::new();
         let failures = &mut self.failures;
         let broken = &mut self.broken;
+        // Phase one fills this with (fitting, the force this rope puts on
+        // it, which rope, whose rope); phase two groups it. Reused across
+        // ticks, so `clear` keeps the capacity and no tick allocates.
+        let loads = &mut self.fit_loads;
+        loads.clear();
         for line in &mut self.lines {
             // Whose rope this is decides which hull it pulls on: the
             // player's boat and the moored fleet lie to the same ropes,
             // computed by the same code.
-            let (frame, handle, wake) = match line.hull {
-                Hull::Player => (boat, self.boat, true),
+            let (frame, handle, asleep) = match line.hull {
+                Hull::Player => (boat, self.boat, false),
                 Hull::Moored(i) => {
                     let handle = self.moored[usize::from(i)];
-                    // A boat asleep on its moorings is in equilibrium:
-                    // its ropes are doing exactly what they did last
-                    // tick, and recomputing them would change nothing —
-                    // and waking it to find that out is the one thing
-                    // that would make ~300 ropes expensive.
-                    if self.bodies[handle].is_sleeping() {
-                        continue;
-                    }
-                    (self.frames[usize::from(i)], handle, false)
+                    // A boat asleep on her moorings is in equilibrium,
+                    // so her ropes are doing exactly what they did last
+                    // tick. Her loads are still WORKED OUT — a fitting
+                    // she shares with someone else's rope has to carry
+                    // them — but they are not applied, because waking
+                    // the fleet to discover nothing changed is what
+                    // makes ~300 ropes expensive.
+                    (self.frames[usize::from(i)], handle, self.bodies[handle].is_sleeping())
                 }
             };
             let p = world_of(&frame, line.fairlead);
@@ -2005,30 +2016,39 @@ impl Sim {
                     let stretch_rate = -v_pt.dot(dir);
                     let pull = line_pull(line.scope, dist, stretch_rate, frame.mass);
                     line.tension = pull;
-                    // Something in the load path gives before the rest —
-                    // usually a FITTING, not the rope (see `weakest_link`).
-                    let (limit, gave) = weakest_link(line.anchor);
-                    if pull >= limit {
+                    // The ROPE is the only per-line limit. Its FITTINGS
+                    // are checked below, against the sum of everything
+                    // on them — see the phase-two note. A parted rope
+                    // leaves both fittings intact and simply lets go.
+                    if pull >= LINE_MBL {
                         lost.push(line.id);
-                        failures.push((line.id, line.hull, gave));
-                        // ...and what gave is GONE. A parted rope leaves
-                        // both fittings intact; anything else takes one
-                        // with it.
-                        let destroyed = match gave {
-                            Gave::Rope => None,
-                            Gave::Fairlead => Some(Fitting::Deck(line.hull, line.fairlead)),
-                            Gave::Cleat | Gave::Neighbour => anchor_fitting(line.anchor),
-                        };
-                        if let Some(f) = destroyed
-                            && !broken.contains(&f)
-                        {
-                            broken.push(f);
-                        }
+                        failures.push((line.id, line.hull, Gave::Rope));
                         continue;
                     }
                     let f = dir * pull;
-                    self.bodies[handle]
-                        .add_force_at_point(vector![f.x, f.y], point![p.x, p.y], wake);
+                    // Deposit into both fittings' running totals. Equal
+                    // and opposite: the fairlead is pulled toward the
+                    // anchor, the anchor toward the fairlead. A pole is
+                    // not a fitting — the rope goes ROUND it — so it
+                    // takes no load path of its own.
+                    loads.push((Fitting::Deck(line.hull, line.fairlead), f, line.id, line.hull));
+                    if let Some(af) = anchor_fitting(line.anchor) {
+                        loads.push((af, -f, line.id, line.hull));
+                    }
+                    if asleep {
+                        // She is in equilibrium on her moorings: her
+                        // fittings still carry this, but applying it
+                        // would WAKE her, and waking the whole fleet
+                        // every tick is the one thing that makes ~300
+                        // ropes expensive (101 us -> 375 us when this
+                        // was got wrong).
+                        continue;
+                    }
+                    self.bodies[handle].add_force_at_point(
+                        vector![f.x, f.y],
+                        point![p.x, p.y],
+                        matches!(line.hull, Hull::Player),
+                    );
                     // A rope made fast to a NEIGHBOUR pulls the
                     // neighbour just as hard, at her own fairlead — and
                     // wakes her, because she is genuinely being hauled
@@ -2044,7 +2064,54 @@ impl Sim {
                 }
             }
         }
-        if !lost.is_empty() {
+        // --- Phase two: what each FITTING is carrying ---------------
+        // A fitting takes the sum of every rope on it. Doubling onto one
+        // cleat does not make the cleat stronger; spreading a load over
+        // two genuinely does, and that falls out of this for free. The
+        // sum is a VECTOR sum, because these are forces: two ropes off
+        // one cleat pulling opposite ways largely cancel the pull-out
+        // load on it, which can make a mooring easier as well as harder
+        // (owner call, 2026-08-22). It is mildly optimistic about the
+        // horn-crushing mode, where opposed loads still stress a fitting.
+        //
+        // Grouping without a map: sort the scratch buffer so equal
+        // fittings are adjacent, then walk the runs. O(n log n) on ~450
+        // entries, ~13 us against a ~134 us tick — measured, and chosen
+        // over a persistent fitting table (O(1) per deposit) because a
+        // table means indices on every line, kept in step with
+        // `MakeFast`, `new_continuing` and the fleet rebuild, for a
+        // saving nothing needs.
+        if !loads.is_empty() {
+            loads.sort_unstable_by(|a, b| fitting_key(a.0).cmp(&fitting_key(b.0)));
+            let mut i = 0;
+            while i < loads.len() {
+                let f = loads[i].0;
+                let key = fitting_key(f);
+                let mut sum = Vec2::ZERO;
+                // Blame the heaviest-loaded rope on it: no single rope
+                // "failed" when a sum carries a fitting away, but the
+                // HUD still has to name one thing.
+                let (mut worst, mut worst_line) = (-1.0f32, (loads[i].2, loads[i].3));
+                while i < loads.len() && fitting_key(loads[i].0) == key {
+                    sum += loads[i].1;
+                    let m = loads[i].1.length();
+                    if m > worst {
+                        worst = m;
+                        worst_line = (loads[i].2, loads[i].3);
+                    }
+                    i += 1;
+                }
+                if sum.length() >= fitting_limit(f) && !broken.contains(&f) {
+                    broken.push(f);
+                    let hull = match f {
+                        Fitting::Deck(h, _) => h,
+                        Fitting::Shore(_) => worst_line.1,
+                    };
+                    failures.push((worst_line.0, hull, fitting_gave(f)));
+                }
+            }
+        }
+        if !lost.is_empty() || !self.broken.is_empty() {
             // What gave takes every line that depended on it, not only
             // the one that overloaded it: a cleat torn off the pontoon
             // cannot still be holding its neighbour's rope, and a deck
@@ -3439,7 +3506,7 @@ mod tests {
 
     /// What really happens when you back hard onto a short line: the
     /// cleat comes off YOUR DECK. A rope is rarely the weak link (see
-    /// `line::weakest_link`), and the difference matters for how the sim
+    /// `line::fitting_limit`), and the difference matters for how the sim
     /// feels — without it the rope stores the whole snatch and hands it
     /// back, catapulting the boat away like a slingshot.
     #[test]
@@ -3552,6 +3619,59 @@ mod tests {
         );
     }
 
+    /// A fitting carries the SUM of what is on it, not each rope
+    /// separately. Two ropes off one fairlead pulling the same way tear
+    /// the deck fitting out between them while NEITHER is anywhere near
+    /// its own limit — doubling onto one fitting does not make the
+    /// fitting stronger. (Spreading the same load over two fittings
+    /// genuinely does, and that falls out of the same rule for free.)
+    #[test]
+    fn one_fitting_carries_the_sum_of_the_ropes_on_it() {
+        let mut sim = line_arena();
+        let bow = sim.fairlead_world(Fairlead::PortBow);
+        // Both off the same handle, both leading nearly the same way, so
+        // their pulls add rather than cancel.
+        let (a, _) = pass_line(&mut sim, &Env::CALM, Fairlead::PortBow, bow + Vec2::new(6.0, -0.6));
+        let (b, _) = pass_line(&mut sim, &Env::CALM, Fairlead::PortBow, bow + Vec2::new(6.0, 0.6));
+        // Surge both out so there is slack to snatch onto.
+        let (pay_a, pay_b) = (
+            order(LineCommand::Tend { id: a, rate: -1.0 }),
+            order(LineCommand::Tend { id: b, rate: -1.0 }),
+        );
+        for i in 0..(12.0 / PHYSICS_DT) as u32 {
+            sim.tick(&Env::CALM, if i % 2 == 0 { &pay_a } else { &pay_b });
+        }
+        let mut peak = 0.0f32;
+        let mut gave = None;
+        for _ in 0..(30.0 / PHYSICS_DT) as u32 {
+            sim.tick(&Env::CALM, &FULL_ASTERN);
+            for l in sim.lines() {
+                if l.id == a || l.id == b {
+                    peak = peak.max(l.tension);
+                }
+            }
+            if let Some(&(_, _, g)) = sim.line_failures().first() {
+                gave = Some(g);
+                break;
+            }
+        }
+        assert_eq!(
+            gave,
+            Some(Gave::Fairlead),
+            "the pair should carry the deck fitting away between them"
+        );
+        assert!(
+            peak < DECK_FITTING_MBL,
+            "neither rope should have reached the fitting's own limit on its own — \
+             peak was {peak:.0} N against {DECK_FITTING_MBL:.0} N"
+        );
+        assert!(
+            sim.broken_fittings().contains(&Fitting::Deck(Hull::Player, Fairlead::PortBow)),
+            "the fairlead should be recorded as carried away"
+        );
+        assert!(sim.lines().iter().all(|l| l.id != a && l.id != b), "both ropes go with it");
+    }
+
     /// Two lines out and a gale on the beam: the boat works on its ropes
     /// but stays put. Without them the same wind walks it away.
     #[test]
@@ -3648,7 +3768,7 @@ mod tests {
         let (start_pos, start_heading) = sim.boat_pose();
         // Moderate power, as you would actually spring off: leaning on a
         // three-metre spring at FULL throttle tears the pontoon cleat out
-        // (see `line::weakest_link`), which is realistic and is a
+        // (see `line::fitting_limit`), which is realistic and is a
         // different test's business.
         let ahead = InputState { throttle: 0.6, ..InputState::NEUTRAL };
         run_input(&mut sim, &Env::CALM, &ahead, 20.0);

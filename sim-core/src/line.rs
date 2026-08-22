@@ -231,18 +231,53 @@ pub enum Fitting {
 /// fitting on this boat, or whatever the far end is made fast to. Every
 /// line runs through this boat's own deck fitting, so that is always in
 /// the chain.
-pub fn weakest_link(anchor: Anchor) -> (f32, Gave) {
-    let far = match anchor {
-        // The line goes ROUND a pole; nothing to tear out of it.
-        Anchor::Shore { kind: ShoreKind::Pole, .. } => (LINE_MBL, Gave::Rope),
-        Anchor::Shore { kind: ShoreKind::Cleat, .. } => (PONTOON_CLEAT_MBL, Gave::Cleat),
-        Anchor::Boat { .. } => (DECK_FITTING_MBL, Gave::Neighbour),
-    };
-    let mine = (DECK_FITTING_MBL, Gave::Fairlead);
-    let rope = (LINE_MBL, Gave::Rope);
-    // Ours first, so a tie with an identical fitting at the far end
-    // blames this boat — we are the one loading it.
-    [mine, far, rope].into_iter().min_by(|a, b| a.0.total_cmp(&b.0)).expect("three links")
+/// What a fitting can take before it comes away, and what to call it
+/// when it does. The ORDERING is what matters, not the values: deck
+/// fitting < shore cleat < rope, so the thing that tears out is the one
+/// on the boat.
+///
+/// A fitting is checked against the SUM of every rope on it, not against
+/// each rope separately (see `step_lines`) — doubling onto one cleat
+/// does not make the cleat stronger, though spreading a load over two
+/// genuinely does. A ROPE is the one per-line limit left, `LINE_MBL`.
+pub fn fitting_limit(f: Fitting) -> f32 {
+    match f {
+        Fitting::Deck(..) => DECK_FITTING_MBL,
+        Fitting::Shore(_) => PONTOON_CLEAT_MBL,
+    }
+}
+
+/// What to blame when `f` comes away.
+pub fn fitting_gave(f: Fitting) -> Gave {
+    match f {
+        Fitting::Deck(Hull::Player, _) => Gave::Fairlead,
+        Fitting::Deck(Hull::Moored(_), _) => Gave::Neighbour,
+        Fitting::Shore(_) => Gave::Cleat,
+    }
+}
+
+/// A sort key that puts equal fittings next to each other, so a tick's
+/// loads can be grouped by the fitting they act on without a map. It is
+/// NOT a meaningful ordering — `Vec2` has no `Ord` and float bit patterns
+/// do not sort numerically — and it does not need to be: grouping only
+/// asks that identical keys compare equal and land together.
+///
+/// Bit patterns are the right comparison here for the same reason
+/// `Fitting::Shore` is identified by position at all: every cleat
+/// position comes from the one generator (`cleat_point`), so two
+/// references to one cleat are bit-identical.
+pub fn fitting_key(f: Fitting) -> (u8, u32, u32) {
+    match f {
+        Fitting::Deck(hull, fairlead) => (
+            0,
+            match hull {
+                Hull::Player => 0,
+                Hull::Moored(i) => 1 + u32::from(i),
+            },
+            fairlead as u32,
+        ),
+        Fitting::Shore(p) => (1, p.x.to_bits(), p.y.to_bits()),
+    }
 }
 
 /// How far a line can be got ashore, metres. A heaving line goes further

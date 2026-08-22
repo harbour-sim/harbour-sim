@@ -593,10 +593,9 @@ like Pegasus.
     poles, both from sim-core's geometry functions.
   - **What lets go is a fitting on the BOAT** (2026-08-20, owner: "what I
     wanted simulated was a cleat tearing off a boat; shore cleats are
-    more robust than the ones on boats"). `weakest_link` walks a line's
-    load path — this boat's deck fitting, the rope, and whatever the far
-    end is made fast to — and the lowest of the three gives, with `Gave`
-    naming it so the HUD can say which. BoatUS Foundation's cleat testing
+    more robust than the ones on boats"). Each fitting has a limit
+    (`fitting_limit`) and a name for the HUD when it goes
+    (`fitting_gave`). BoatUS Foundation's cleat testing
     had cleat ASSEMBLIES failing between 1,190 and 7,500 lbf (5.3–33 kN),
     and note what that tested: BOAT deck hardware bolted through a deck.
     `DECK_FITTING_MBL` = 14 kN sits mid-band. It is NOT evidence about
@@ -606,9 +605,13 @@ like Pegasus.
     values**: deck fitting < shore cleat < rope, so what tears out is the
     thing on the boat. A mooring POLE has no fitting at all — the line
     goes round it — so there too the boat's own cleat is the limit. A
-    parted ROPE is therefore the rare case; the tie-break in
-    `weakest_link` puts this boat's fitting first, so a rope to another
-    boat with identical hardware blames the one doing the pulling.
+    parted ROPE was therefore unreachable until per-fitting sums landed
+    (the deck fitting's 14 kN was always the lowest of the three, so it
+    always went first); it becomes possible only when opposed ropes on
+    one fitting cancel enough of its load for the rope to reach 34.6 kN
+    first. When a fitting is carried away by a SUM no single rope
+    failed, so the HUD is handed the heaviest-loaded rope on it — a
+    shared fitting still names one thing.
     Measured threshold (`measure_snap_threshold`): backing onto a 5 m
     scope with slack out, she holds at a 3.2 kn arrival and tears the
     fitting out at 3.8 — a genuinely bad arrival for 8.5 tonnes.
@@ -717,30 +720,77 @@ like Pegasus.
     generator (`cleat_point`). `LINE_COUNT_MAX` no longer coincides with
     the handle count: six ropes is now a real cap rather than an
     arithmetic accident.
-    **Open question this raises, deliberately NOT decided here**: a
-    fitting is checked against each rope on it SEPARATELY, so two ropes
-    off one fairlead let that fitting hold 2×`DECK_FITTING_MBL` before it
-    gives. Spreading a load over two fittings genuinely does strengthen a
-    mooring; doubling onto ONE fitting does not, so the honest quantity
-    is the SUM per fitting. Not implemented because it is a physics
-    change with its own feel implications (it makes mooring harsher),
-    not because it is expensive — **measured 2026-08-22**, and the first
-    version of this note had the cost wrong. A line names its fittings
-    by VALUE and there is no fitting→lines index (a shore fitting is
-    identified by POSITION, and the marina's cleats are generated
-    geometry with no index of their own), so "what else is on this
-    fitting?" can only be answered by looking at every other line: the
-    naive form is ~2n² comparisons a tick at n = 300, and it costs
-    **313 µs against a 134 µs tick**. But sorting a REUSED scratch
-    buffer of (fitting key, tension) and scanning the runs is only
-    **13 µs, ~10%** — affordable. Worth knowing before anyone optimises
-    for a problem that isn't there: the shipped marina has **zero**
-    shared fittings (300 lines, 450 fitting slots — pole lines have none,
-    a rope goes ROUND a pole), because each berthed boat's four ropes sit
-    on four distinct fairleads and its two breast studs are distinct.
-    Only the player's ≤6 ropes can share anything, so the cheapest form
-    of all is to sum over just the ≤12 fittings the crew's ropes touch —
-    at the price of baking in an assumption about the generated rig.
+    **A fitting carries the SUM of what is on it** (2026-08-22,
+    implemented in the same breath as allowing ropes to share one).
+    Doubling onto ONE fitting must not make that fitting stronger, which
+    is what checking each rope separately would have meant; spreading a
+    load over TWO fittings genuinely does strengthen a mooring, and falls
+    out of the same rule for free
+    (`one_fitting_carries_the_sum_of_the_ropes_on_it` tears a deck
+    fitting out with two ropes neither of which is near its own limit).
+    The sum is a VECTOR sum, because these are forces: two ropes off one
+    cleat pulling opposite ways largely cancel the pull-out load, so
+    doubling up can make a mooring EASIER as well as harder (owner call —
+    "it might as well make mooring easier sometimes"). Mildly optimistic
+    about the horn-crushing mode, where opposed loads still stress a
+    fitting.
+    **`step_lines` is two phases because of it.** Phase one walks the
+    lines: tension, forces onto the hulls, the one per-line limit left
+    (the ROPE's own `LINE_MBL`), and a deposit of `(fitting, force)` into
+    a scratch buffer. Phase two groups that buffer and breaks any fitting
+    whose total exceeds its limit. Turning it round this way is what
+    kills the QUADRATIC: asking each line "who else is on my fitting?"
+    is a SEARCH — a line names its fittings by value and there is no
+    fitting→lines index — and doing that per line is ~2n² comparisons a
+    tick, measured at **313 µs against a ~111 µs tick**. Depositing
+    instead of searching makes phase one linear, and phase two is then a
+    grouping problem: a sort of a REUSED scratch buffer (`Sim.fit_loads`,
+    cleared not reallocated) plus a walk of the runs, keyed by
+    `fitting_key`. So the whole thing is **O(n log n), not linear** —
+    the sort is the dominant term, and an earlier draft of this note
+    wrongly called it linear.
+    **A HashMap accumulator IS linear and was measured, not argued
+    away** (2026-08-22, owner: "why create a tmp Vec and then sort it,
+    when you could create a temp Map"): keyed by the same
+    `fitting_key`, depositing with `entry().or_insert()`, and — to stay
+    deterministic — reading it back by walking the LINES rather than
+    iterating the map, since `HashMap` order would decide which failure
+    the HUD names first and in what order `broken` grows. It builds for
+    wasm and passes the whole suite. It is also **slower here**: 143 µs
+    with a cheap FNV-style hasher and 160 µs with the default SipHash,
+    against 121 µs for the sort (111 µs baseline). Not a hashing
+    problem — a locality one: ~450 contiguous entries sort with almost
+    no cache misses, while the map pays random-access probing on every
+    one of ~1000 deposits and lookups a tick, and `HashMap::clear` walks
+    its control bytes where `Vec::clear` is free. The asymptotically
+    better structure loses at this n; revisit if the marina ever grows
+    an order of magnitude. **Measured cost of the whole change:
+    111 → 121 µs, +9%**, of which the grouping is ~13 µs; at n = 450
+    entries log₂n ≈ 9, so phase one's real work dominates the clock even
+    though the sort dominates the asymptotics. Truly linear IS available
+    and was deliberately NOT taken: a persistent fitting table with
+    indices on each line makes each deposit O(1) and phase two O(F), for
+    O(n + F) overall. Rejected because `Fitting` is public
+    API (`broken_fittings()`, the renderer's torn-cleat drawing, the
+    `MakeFast` refusal), so indices would ripple through all of it and
+    add an index-validity invariant to keep in step with `MakeFast`,
+    `new_continuing` and the fleet rebuild — a new class of bug to save
+    ~10 µs. A spatial index over the cleats is the wrong tool entirely:
+    it answers "what is NEAR this point?", which is LINES-mode
+    hit-testing, not "which ropes are on exactly THIS fitting?", and
+    fitting identity is already exact by construction.
+    **Consequence for sleep**: a sleeping fleet boat's ropes are now
+    WORKED OUT every tick and skipped only for the force application,
+    because a fitting she shares with someone else's rope has to carry
+    her load too. Skipping them outright — as the first version did —
+    would silently drop her contribution the moment a player rope landed
+    on a cleat she was already using, which is reachable. The perf win
+    survives because it was never the arithmetic, it was the WAKING.
+    A side benefit: her `tension` is live now rather than stale from
+    whenever she last woke, which is why the resting-load figures moved a
+    few percent without any change in the dynamics (the storm peaks are
+    bit-identical).
+
   - **A line can be made fast to another BOAT** (2026-08-20):
     `Anchor::Boat { hull, fairlead }` alongside `Anchor::Shore`, so
     rafting up — or taking a line to your neighbour while you get sorted
@@ -792,8 +842,14 @@ like Pegasus.
     where the fleet never slept, a 3.7× regression that would have shown
     up on a phone. The fix is that a berthed boat settling on its ropes
     is allowed to doze: the fleet's hull forces, its rope pulls, AND its
-    per-tick `reset_forces`/`reset_torques` all pass `wake_up: false`,
-    and `step_lines` skips a sleeping hull's ropes entirely.
+    per-tick `reset_forces`/`reset_torques` all pass `wake_up: false`.
+    (2026-08-22 update, CodeRabbit review: this paragraph used to say
+    `step_lines` skips a sleeping hull's ropes ENTIRELY, which stopped
+    being true the moment fittings started carrying a sum — a fitting
+    she shares with someone else's rope has to carry her load too, so
+    her ropes are now WORKED OUT every tick and only the force
+    APPLICATION is skipped; see the per-fitting-sum bullet below for the
+    updated 121 µs figure.)
     **Gotcha**: `reset_forces(true)` was the one that kept the whole
     marina awake — easy to miss, since it reads as bookkeeping rather
     than as a force. The one thing sleep would otherwise break is that
