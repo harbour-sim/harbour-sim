@@ -723,9 +723,24 @@ like Pegasus.
     gives. Spreading a load over two fittings genuinely does strengthen a
     mooring; doubling onto ONE fitting does not, so the honest quantity
     is the SUM per fitting. Not implemented because it is a physics
-    change with its own feel implications (it makes mooring harsher) and
-    a per-tick cost to think about over ~300 ropes — the naive grouping
-    is a sort or an O(n²) scan every tick, against a 113 µs budget.
+    change with its own feel implications (it makes mooring harsher),
+    not because it is expensive — **measured 2026-08-22**, and the first
+    version of this note had the cost wrong. A line names its fittings
+    by VALUE and there is no fitting→lines index (a shore fitting is
+    identified by POSITION, and the marina's cleats are generated
+    geometry with no index of their own), so "what else is on this
+    fitting?" can only be answered by looking at every other line: the
+    naive form is ~2n² comparisons a tick at n = 300, and it costs
+    **313 µs against a 134 µs tick**. But sorting a REUSED scratch
+    buffer of (fitting key, tension) and scanning the runs is only
+    **13 µs, ~10%** — affordable. Worth knowing before anyone optimises
+    for a problem that isn't there: the shipped marina has **zero**
+    shared fittings (300 lines, 450 fitting slots — pole lines have none,
+    a rope goes ROUND a pole), because each berthed boat's four ropes sit
+    on four distinct fairleads and its two breast studs are distinct.
+    Only the player's ≤6 ropes can share anything, so the cheapest form
+    of all is to sum over just the ≤12 fittings the crew's ropes touch —
+    at the price of baking in an assumption about the generated rig.
   - **A line can be made fast to another BOAT** (2026-08-20):
     `Anchor::Boat { hull, fairlead }` alongside `Anchor::Shore`, so
     rafting up — or taking a line to your neighbour while you get sorted
