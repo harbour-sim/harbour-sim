@@ -1437,7 +1437,6 @@ pub struct Sim {
     impulse_joints: ImpulseJointSet,
     multibody_joints: MultibodyJointSet,
     ccd_solver: CCDSolver,
-    query_pipeline: QueryPipeline,
     integration_params: IntegrationParameters,
     gravity: Vector<f32>,
     boat: RigidBodyHandle,
@@ -1779,7 +1778,6 @@ impl Sim {
             impulse_joints: ImpulseJointSet::new(),
             multibody_joints: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
-            query_pipeline: QueryPipeline::new(),
             integration_params: IntegrationParameters {
                 dt: PHYSICS_DT,
                 ..IntegrationParameters::default()
@@ -2258,7 +2256,6 @@ impl Sim {
             &mut self.impulse_joints,
             &mut self.multibody_joints,
             &mut self.ccd_solver,
-            Some(&mut self.query_pipeline),
             &(),
             &(),
         );
