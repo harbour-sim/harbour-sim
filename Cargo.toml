@@ -12,10 +12,10 @@ members = ["sim-core"]
 # macroquad-free crate, following the Pegasus architecture: it keeps the sim
 # reusable for server-side verification / headless testing later.
 harbour-sim-core = { path = "sim-core" }
-# Pinned exact: sim-core pins glam to the version macroquad 0.4.15
+# Pinned exact: sim-core pins glam to the version macroquad 0.4.16
 # re-exports so Vec2 unifies across the crate boundary. Upgrade the two
 # together, deliberately.
-macroquad = "=0.4.15"
+macroquad = "=0.4.16"
 
 [profile.release]
 # Tuned for wasm size (the deploy artifact), same as Pegasus.

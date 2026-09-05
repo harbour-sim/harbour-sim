@@ -6,8 +6,8 @@ license = "GPL-3.0-or-later"
 description = "Harbour Sim deterministic simulation core: boat hydrodynamics + wind, harbour geometry, physics tick. Macroquad-free so it can be compiled headless (tests, future server-side verification)."
 
 [dependencies]
-rapier2d = { version = "0.23", features = ["default"] }
-# Pinned to the exact version macroquad 0.4.15 re-exports as its `Vec2` —
+rapier2d = { version = "0.31", features = ["default"] }
+# Pinned to the exact version macroquad 0.4.16 re-exports as its `Vec2` —
 # the game passes these types straight into rendering, so they must be the
 # SAME crate version or the two Vec2s won't unify.
 glam = "0.27"
