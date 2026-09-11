@@ -19,6 +19,62 @@
 use crate::keel::KeelProfile;
 use glam::Vec2;
 
+/// How many blades the boat steers with and where they sit athwartships
+/// (2026-09-11, added with the Beneteau Oceanis 38.1 preset). The one
+/// number that matters is the lateral OFFSET: a blade on the centreline
+/// stands in the propeller race and a blade a metre outboard of it does
+/// not, which is the whole reason a twin-ruddered boat has no steerage
+/// from a burst of ahead power and has to be handled on her momentum
+/// instead. sim.rs derives that from the offset against the race's own
+/// radius rather than carrying a "has prop wash" flag, so the two can
+/// never disagree.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RudderLayout {
+    /// Number of blades: 1 for a single rudder, 2 for twins.
+    blades: u8,
+    /// Lateral offset of each blade from the centreline (m). Zero for a
+    /// single rudder; the half-separation for twins.
+    offset: f32,
+}
+
+impl RudderLayout {
+    /// One blade on the centreline — the configuration every boat here
+    /// had before 2026-09-11, and still the one that lets a burst of
+    /// ahead power steer a stopped boat (the blade stands in the prop
+    /// race; see `K_WASH` and the wash fractions in sim.rs).
+    pub const SINGLE: RudderLayout = RudderLayout { blades: 1, offset: 0.0 };
+
+    /// Two blades, each `offset` metres off the centreline — one to
+    /// port, one to starboard. `offset` must be positive; it is what
+    /// takes both blades OUT of the propeller race, which is the whole
+    /// handling difference and is derived, not declared (sim.rs measures
+    /// each blade against the race's own radius).
+    pub const fn twin(offset: f32) -> RudderLayout {
+        RudderLayout { blades: 2, offset }
+    }
+
+    /// How many blades this layout has.
+    pub fn blades(&self) -> usize {
+        self.blades as usize
+    }
+
+    /// Half the separation between the blades (m); 0 for a single rudder.
+    pub fn offset(&self) -> f32 {
+        self.offset
+    }
+
+    /// The blades' lateral offsets, in the boat's own (fwd, side) frame —
+    /// `side` is port, so a twin's entries are ±offset. Fixed-size so the
+    /// derived foil stays `Copy`: only the first `blades()` entries are
+    /// meaningful.
+    pub fn offsets(&self) -> [f32; 2] {
+        match self.blades {
+            1 => [0.0, 0.0],
+            _ => [-self.offset, self.offset],
+        }
+    }
+}
+
 /// The rudder blade of a [`BoatDesign`] (2026-08-04, previously the
 /// shared `RUDDER_*` constants in sim.rs sized from the O'Day 39 alone):
 /// position and dimensions, from which sim.rs derives the foil's area,
@@ -32,6 +88,8 @@ use glam::Vec2;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RudderDesign {
     /// Blade centre position along the hull (local x, m — negative aft).
+    /// Both blades of a twin installation share it: they sit abreast of
+    /// each other, not in line.
     pub x: f32,
     /// Fore-aft chord (m). Real blades taper; this is the mean chord.
     pub chord: f32,
@@ -46,12 +104,27 @@ pub struct RudderDesign {
     /// why a barn-door outboard rudder has a mushier lift slope than a
     /// spade of the same area.
     pub root_endplated: bool,
+    /// One blade on the centreline, or two set out either side of it —
+    /// see [`RudderLayout`]. Everything that follows from twins (no prop
+    /// wash over the blades, each blade seeing its own inflow as the
+    /// hull spins, more total area at a shorter span) is DERIVED from
+    /// this offset in sim.rs rather than declared here.
+    pub layout: RudderLayout,
 }
 
 impl RudderDesign {
-    /// Blade area (m²).
+    /// Area of ONE blade (m²). See [`RudderDesign::total_area`] for what
+    /// the boat actually drags around.
     pub fn area(&self) -> f32 {
         self.chord * self.depth
+    }
+
+    /// Total blade area of the installation (m²) — one blade's area times
+    /// the blade count. This is the figure that belongs in a wetted-area
+    /// sum or a rudder-as-%-of-lateral-plane cross-check; the per-blade
+    /// `area` is what each foil's own lift and drag are computed on.
+    pub fn total_area(&self) -> f32 {
+        self.area() * self.layout.blades() as f32
     }
 
     /// Effective aspect ratio: geometric depth/chord, doubled when the
@@ -123,7 +196,7 @@ impl BoatDesign {
             // skeg boat should have (the skeg itself is fixed area,
             // already painted in the curve). Root end-plated by hull +
             // skeg.
-            rudder: RudderDesign { x: -4.6, chord: 0.55, depth: 1.35, root_endplated: true },
+            rudder: RudderDesign { x: -4.6, chord: 0.55, depth: 1.35, root_endplated: true, layout: RudderLayout::SINGLE },
             displacement_kg: 8_500.0,
         }
     }
@@ -172,7 +245,7 @@ impl BoatDesign {
             // inside the aft end of the waterline — which, since the
             // profiles carry real overhangs, is the curve's own aft
             // ending at −5.2: trailing edge there, centre at −4.9.
-            rudder: RudderDesign { x: -4.9, chord: 0.61, depth: 1.52, root_endplated: true },
+            rudder: RudderDesign { x: -4.9, chord: 0.61, depth: 1.52, root_endplated: true, layout: RudderLayout::SINGLE },
             displacement_kg: 8_165.0,
         }
     }
@@ -221,8 +294,79 @@ impl BoatDesign {
             // proportionally more of the boat's steering and tracking.
             // Same spade position rule as the O'Day: trailing edge at the
             // curve's own aft waterline ending (−5.05), centre −4.75.
-            rudder: RudderDesign { x: -4.75, chord: 0.60, depth: 1.65, root_endplated: true },
+            rudder: RudderDesign { x: -4.75, chord: 0.60, depth: 1.65, root_endplated: true, layout: RudderLayout::SINGLE },
             displacement_kg: 8_000.0,
+        }
+    }
+
+    /// **Beneteau Oceanis 38.1** (Finot-Conq, France, from 2013) — the
+    /// TWIN-RUDDER preset (2026-09-11), and the reason twin rudders exist
+    /// in this sim at all: the archetype of the modern volume-production
+    /// cruiser, a beamy chined hull whose broad transom is what makes a
+    /// single blade impractical in the first place (heel it and a
+    /// centreline rudder lifts toward the surface, while the leeward one
+    /// of a pair digs in).
+    ///
+    /// Published specs (see `docs/reference-boats.md` for sources): LOA
+    /// 11.50 m, hull length 11.13 m, LWL 10.72 m — the longest waterline
+    /// of the five presets on a plumb bow and a short reverse transom —
+    /// beam 3.99 m, draft 2.08 m (deep keel; 1.64 m shoal, 1.26–2.40 m
+    /// lifting), light displacement 6,850 kg with 1,790 kg of deep-keel
+    /// ballast. Lightest of the presets by a clear margin, which is the
+    /// honest modern figure and not a thumb on the scale.
+    ///
+    /// The curve: a narrow (≈1.3 m chord) bulbed iron fin at the full
+    /// 2.08 m draft — the deepest keel here — over a canoe body shallower
+    /// even than the Elan's, because a chined flat-bottomed hull carries
+    /// almost no lateral plane outside its fin. Net area comes out the
+    /// smallest of the five: the depth is all in a short fin, and a short
+    /// fin buys area without buying yaw damping (cubic in distance from
+    /// the pivot).
+    pub fn beneteau_oceanis_381() -> BoatDesign {
+        BoatDesign {
+            keel: KeelProfile {
+                points: vec![
+                    Vec2::new(-6.0, 0.0),
+                    Vec2::new(-5.35, 0.0), // aft waterline ending (LWL 10.72 m of 11.50 LOA)
+                    Vec2::new(-5.30, 0.09), // very shallow run under the wide chined stern
+                    Vec2::new(-1.55, 0.30),
+                    Vec2::new(-1.25, 2.08), // bulbed iron fin, at the real 2.08 m draft
+                    Vec2::new(0.05, 2.08),
+                    Vec2::new(0.35, 0.34),
+                    Vec2::new(3.3, 0.26),
+                    Vec2::new(4.9, 0.06),
+                    Vec2::new(5.37, 0.0), // forward waterline ending (plumb bow)
+                    Vec2::new(6.0, 0.0),
+                ],
+            },
+            // TWIN blades, 1.20 m either side of the centreline. That
+            // offset is the load-bearing number and it is geometry, not a
+            // handling knob: the hull's own half-beam at this station is
+            // ≈1.63 m (`HULL_PTS`), so the blades sit inboard of the
+            // topsides where a real pair does, and 1.20 m is an order of
+            // magnitude outside the propeller race (radius ≈0.15 m — see
+            // `prop_race_radius` in sim.rs), which is what removes the
+            // wash steering.
+            //
+            // Dimensions: each blade 0.45 m mean chord × 1.25 m deep
+            // hanging off a hull only ~0.3 m deep out there, so the tips
+            // reach ≈1.55 m — inside the 2.08 m keel, as twin rudders
+            // must be (they are the boat's grounding limit otherwise).
+            // 1.13 m² of blade in total, ≈22% of this boat's small
+            // lateral plane, far above the ~10% single-spade rule of
+            // thumb — which is exactly right and not an error: twins are
+            // deliberately generous in area because they have no prop
+            // wash to help them and because, heeled, one of them is
+            // doing most of the work. Roots end-plated by the flat hull
+            // bottom above them (AR ≈5.6 per blade).
+            rudder: RudderDesign {
+                x: -4.95,
+                chord: 0.45,
+                depth: 1.25,
+                root_endplated: true,
+                layout: RudderLayout::twin(1.20),
+            },
+            displacement_kg: 6_850.0,
         }
     }
 
@@ -271,7 +415,7 @@ impl BoatDesign {
             // effective AR ≈ 2.8 (vs ≈5 for the spades), the honest
             // reason a barn-door rudder feels mushier per square metre
             // than a spade.
-            rudder: RudderDesign { x: -5.38, chord: 0.55, depth: 1.55, root_endplated: false },
+            rudder: RudderDesign { x: -5.38, chord: 0.55, depth: 1.55, root_endplated: false, layout: RudderLayout::SINGLE },
             displacement_kg: 11_800.0,
         }
     }
@@ -291,6 +435,7 @@ mod tests {
             (BoatDesign::hallberg_rassy_38(), 1.75, "Hallberg-Rassy 38"),
             (BoatDesign::oday_39(), 1.93, "O'Day 39"),
             (BoatDesign::elan_impression_394(), 1.80, "Elan Impression 394"),
+            (BoatDesign::beneteau_oceanis_381(), 2.08, "Beneteau Oceanis 38.1"),
             (BoatDesign::alajuela_38(), 1.83, "Alajuela 38"),
         ] {
             let deepest = design.keel.points.iter().map(|p| p.y).fold(0.0f32, f32::max);
@@ -306,10 +451,12 @@ mod tests {
         let hr = BoatDesign::hallberg_rassy_38();
         let oday = BoatDesign::oday_39();
         let elan = BoatDesign::elan_impression_394();
+        let oceanis = BoatDesign::beneteau_oceanis_381();
         let alajuela = BoatDesign::alajuela_38();
         // Displacement: modern cruiser < fin cruiser/racer < fin+skeg
         // cruiser < full-keel heavy cruiser — straight from the published
         // numbers.
+        assert!(oceanis.displacement_kg < elan.displacement_kg);
         assert!(elan.displacement_kg < oday.displacement_kg);
         assert!(oday.displacement_kg < hr.displacement_kg);
         assert!(hr.displacement_kg < alajuela.displacement_kg);
@@ -326,6 +473,65 @@ mod tests {
         assert!(
             a_elan < a_oday && a_oday < a_hr && a_hr < a_alajuela,
             "areas should rank Elan < O'Day < HR < Alajuela, got {a_elan} / {a_oday} / {a_hr} / {a_alajuela}"
+        );
+        // The Oceanis belongs in the modern shallow-fin band WITH the
+        // Elan — same design generation, same flat chined underbody, and
+        // their areas land within a few percent of each other (5.3 vs
+        // 5.4 m²). Deliberately NOT ranked against the Elan: a 2% gap
+        // between two boats drawn from profile readings is not a claim
+        // either set of published specs can support, and asserting it
+        // would make an honest curve edit fail for no reason.
+        let a_oceanis = oceanis.keel.derive().area;
+        assert!(
+            a_oceanis < a_oday,
+            "the Oceanis's flat underbody should carry less lateral plane than the O'Day's, \
+             got {a_oceanis} vs {a_oday}"
+        );
+        assert!(
+            (a_oceanis - a_elan).abs() < 0.15 * a_elan,
+            "Oceanis {a_oceanis} and Elan {a_elan} should sit in the same band"
+        );
+    }
+
+    #[test]
+    fn only_the_oceanis_has_twin_rudders_and_they_sit_inside_her_topsides() {
+        for (design, name) in [
+            (BoatDesign::hallberg_rassy_38(), "Hallberg-Rassy 38"),
+            (BoatDesign::oday_39(), "O'Day 39"),
+            (BoatDesign::elan_impression_394(), "Elan Impression 394"),
+            (BoatDesign::alajuela_38(), "Alajuela 38"),
+        ] {
+            assert_eq!(
+                design.rudder.layout,
+                RudderLayout::SINGLE,
+                "{name} is a single-rudder boat"
+            );
+            assert_eq!(design.rudder.total_area(), design.rudder.area(), "{name}: one blade");
+        }
+        let oceanis = BoatDesign::beneteau_oceanis_381();
+        assert_eq!(oceanis.rudder.layout.blades(), 2);
+        assert!((oceanis.rudder.total_area() - 2.0 * oceanis.rudder.area()).abs() < 1e-6);
+        // A real pair hangs under the hull, not out past the topsides —
+        // and a blade outboard of the hull would be a fender-catching
+        // liability no builder ships. The hull's own half-beam at the
+        // blades' station (interpolated on `HULL_PTS`' aft run, −3.6 m at
+        // 1.9 to −5.6 m at 1.5) is the check.
+        let x = oceanis.rudder.x;
+        let half_beam = 1.5 + (1.9 - 1.5) * ((x - (-5.6)) / (-3.6 - (-5.6)));
+        assert!(
+            oceanis.rudder.layout.offset() < half_beam,
+            "blades {:.2} m out vs a half-beam of {half_beam:.2} m at x {x}",
+            oceanis.rudder.layout.offset()
+        );
+        // And the tips must stay inside the keel: twin rudders that draw
+        // more than the keel make the RUDDERS the grounding limit, which
+        // is exactly what no one builds.
+        let hull_depth = oceanis.keel.sample(x);
+        let rudder_draft = hull_depth + oceanis.rudder.depth;
+        let keel_draft = oceanis.keel.points.iter().map(|p| p.y).fold(0.0f32, f32::max);
+        assert!(
+            rudder_draft < keel_draft,
+            "rudders draw {rudder_draft:.2} m, keel {keel_draft:.2} m — the keel must be deeper"
         );
     }
 

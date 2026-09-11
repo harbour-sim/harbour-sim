@@ -148,18 +148,24 @@ already solves structurally, the same way Publish Pages does.
   - `sim-core/src/boat.rs` — `BoatDesign` (2026-08-04): the parameter
     bundle the keel editor edits and `Sim::new_with_design` consumes — a
     `KeelProfile`, a `RudderDesign` (blade position/dimensions/end-plate
-    flag, per-preset since 2026-08-04 — see the Rudder bullet under
-    Simulation model), and `displacement_kg`. Four presets named after REAL
+    flag, per-preset since 2026-08-04, plus a `RudderLayout` since
+    2026-09-11 — see the Rudder bullet under
+    Simulation model), and `displacement_kg`. Five presets named after REAL
     boats (published specs, sources and the shared-hull caveat in
     `docs/reference-boats.md`): `hallberg_rassy_38()` (default — fin +
     skeg middle configuration, 8.5 t), `oday_39()` (fin + spade, 8.165 t
     — the rudder-sizing anchor: its blade is the one with real published
     dimensions),
     `elan_impression_394()` (2026-08-04, modern shallow-bodied cruiser,
-    8.0 t — smallest lateral plane and least yaw damping of the four;
+    8.0 t — smallest lateral plane and least yaw damping of the older
+    four;
     its spec pages 403'd so the figures were triangulated from search
     excerpts and validated by the D/L=222 consistency check, see
-    reference-boats.md), and `alajuela_38()` (heavy full keel, 11.8 t).
+    reference-boats.md), `beneteau_oceanis_381()` (2026-09-11, the
+    TWIN-RUDDER boat — Finot-Conq, from 2013, 6.85 t, LWL 10.72 m, draft
+    2.08 m: lightest and longest-waterlined of the five, so fastest under
+    the shared 28 hp and the only one that does NOT carry its way 100 m
+    from 3 kn to 1 kn), and `alajuela_38()` (heavy full keel, 11.8 t).
     The curve's unit makes the
     naming honest: area-per-length at a station IS local draught (m), so
     presets are capped at each boat's real draft (unit-tested). NOT a
@@ -227,10 +233,15 @@ already solves structurally, the same way Publish Pages does.
 - `src/keel_editor.rs` — in-app editor for `BoatDesign`: drag a fixed-grid
   bar chart to paint the underwater area distribution, drag a displacement
   slider (4–14 t range bracketing the reference boats, 100 kg steps;
-  Up/Down keys for keyboard parity), four preset buttons named after the
+  Up/Down keys for keyboard parity), five preset buttons named after the
   real boats in `boat.rs` — HR 38 [D] / O'Day 39 [F] / Elan 394 [G] /
-  Alajuela 38 [L],
-  each loading curve AND weight together (D and the arrows are game keys,
+  Oceanis 38.1 [B] / Alajuela 38 [L] — laid out on TWO rows since the
+  fifth landed (presets on top, Apply/Cancel at half width below):
+  seven buttons across one row is `canvas.w / 7`, under a thumb on a
+  phone, and the mobile-first rule makes that the layout's problem, not
+  the preset's. The split also stops a mis-aimed tap at Cancel landing
+  on a preset and silently rewriting the curve.
+  Each loads curve AND weight together (D and the arrows are game keys,
   but safe to reuse because the editor freezes all game input while open)
   — live-derived readout (since 2026-08-04 led by the LWL, read from
   `sim::waterline_extent` on the edited curve — paint the ends dry and
@@ -256,7 +267,10 @@ already solves structurally, the same way Publish Pages does.
   that station (not from the baseline) so it reads as an appendage
   hanging off the hull rather than overlapping the editable area; needed
   once the rudder stopped being part of the paintable profile (see the
-  Keel profile bullet under Simulation model). Also draws a **CG marker**
+  Keel profile bullet under Simulation model). A TWIN pair sits exactly
+  behind its sibling in a side elevation, so only the marker's LABEL
+  changes for it — but it must change, or the boat with the most rudder
+  of the five reads as having the least. Also draws a **CG marker**
   (2026-08-04, green, label at the canvas bottom so it can't collide
   with CLR's top label): the boat's centre of mass via
   `sim::hull_com_x()` — the `HULL_PTS` polygon centroid, i.e. the same
@@ -891,8 +905,53 @@ like Pegasus.
   |thrust|: `PROP_WALK_AHEAD` 0.06 (stern nudges starboard) vs
   `PROP_WALK_ASTERN` 0.13 (stern kicks port — "backs to port",
   `a_burst_astern_walks_the_stern_to_port`).
+- **Twin rudders** (2026-09-11, with the `beneteau_oceanis_381()`
+  preset): `RudderDesign` carries a `RudderLayout` — how many blades and
+  how far off the centreline — and `tick` now runs ONE PASS PER BLADE of
+  the existing foil model, each at its own point and in its own inflow.
+  There is no twin-rudder branch in the physics and no "has prop wash"
+  flag; three behaviours fall out of the offset alone.
+  - **No steerage from a burst of ahead power**, THE thing twin-rudder
+    owners complain about in a marina. `prop_race_radius()` derives the
+    slipstream from actuator-disc theory (a thrusting disc accelerates
+    its own flow, so the race CONTRACTS to `R/√2` — ≈0.15 m for the
+    16-inch `PROP_DIAMETER`), and `wash_fraction(offset)` is how much of
+    that race a blade stands in: 1 on the axis, 0 outside. The Oceanis's
+    blades sit 1.20 m out, eight times the race radius, so the
+    deflected-momentum term goes to zero and she has NOTHING until she
+    has way on. **Measured**: 1.5 s of full throttle and full helm from
+    rest swings the Elan's bow 5.7° and hers 0.04°, a factor of ~140.
+    Normalising the shares by their total keeps the wash bounded by the
+    thrust carrying it — the same bounded-by-construction property
+    `K_WASH`'s thrust-deflection form was chosen for.
+  - **The throttle makes her turning circle WIDER.** She is the only
+    preset whose full-throttle 90° turn (17.7 m) is longer than her
+    rudder-only one (16.7 m): the burst buys speed and no steering, and
+    speed widens a circle. Nothing models this — it is the arithmetic of
+    the bullet above, and it is pinned.
+  - **But she steers beautifully with way on** — tightest of the five on
+    the rudder-only row. 1.12 m² of blade at AR 5.6 each is ≈22% of her
+    small lateral plane against the ~10% single-spade rule of thumb,
+    which is what builders really fit and why: twins have no wash to help
+    them, and heeled, one blade does most of the work.
+  - A fourth effect is free from the rigid-body kinematics: the yaw sweep
+    of a point `(x, y)` is `w·(−y, x)`, so an offset blade picks up a
+    FORE-AFT term a centreline blade never sees — spin the hull and the
+    outboard blade of the pair is driven forward through the water while
+    the inboard one is dragged back. That `y = 0` is also why
+    generalising cost the other four presets nothing: their pinned
+    benchmarks are bit-identical.
+  - **Known simplification**: the blades are upright, parallel and in
+    line abreast. Real twins are canted outboard and often toed in — but
+    cant's whole purpose is being vertical when HEELED, and this is a
+    top-down 2D sim with no heel, so modeling it would do nothing while
+    toe-in without heel would be an invented constant. Neither blade
+    ventilates or lifts clear, same reason. Net: the sim gives you the
+    twin-rudder marina handling in full and none of the twin-rudder
+    SAILING payoff, because it models no heel to pay off.
 - **Rudder** (per-design since 2026-08-04: `RudderDesign { x, chord,
-  depth, root_endplated }` on `BoatDesign`, derived once per `Sim` into
+  depth, root_endplated, layout }` on `BoatDesign`, derived once per
+  `Sim` into
   `RudderFoil` — area, effective AR, post-stall ceiling; ±35° stays a
   shared constant, a property of typical steering gear rather than of a
   boat. Each preset carries its real boat's blade — the O'Day's
@@ -1546,9 +1605,22 @@ like Pegasus.
   and the prop-wash foam streaks use `get_time()`); nothing cosmetic may
   feed back into the sim. The wash streaks READ sim state (`sim.engine()`,
   so they fade with the spool lag) and follow the deflected blade ahead /
-  boil forward along the quarters astern; the rudder blade itself is drawn
-  BEFORE the hull fill (root under the counter), swinging by the same
-  blade-angle formula sim-core uses. The churned-water trail
+  boil forward along the quarters astern — except on a TWIN-ruddered
+  boat, where the race passes clean BETWEEN the blades and runs straight
+  aft whatever the helm is doing (the visible half of why her helm does
+  nothing at rest; sim-core reaches the same conclusion from the same
+  offset, see `wash_fraction`). The rudder is drawn as ONE LINE PER
+  BLADE at the layout's own lateral offsets — what's drawn is where the
+  force is applied, the `HULL_PTS` rule — swinging by the same
+  blade-angle formula sim-core uses.
+  **Gotcha (measured in a browser, 2026-09-11)**: those lines used to be
+  drawn BEFORE the hull fill, meaning to leave "only the swung part
+  showing past the counter". They never did: every preset's blade sits
+  well forward of the hull's own stern tip (−5.9 m), so the hull covered
+  the blade completely at every helm angle and NO boat in this sim had a
+  visible rudder at all. They are now drawn over the hull, translucent —
+  the honest top-down convention for an underwater appendage, and the
+  only way a twin pair reads as a pair. The churned-water trail
   (`src/wake.rs`, see Project structure) is the other render-side
   reader of sim state: it draws right after the ripples, so it sits on
   the water and under the land fills, jetties, moored boats, the ropes
@@ -1597,7 +1669,7 @@ like Pegasus.
   `CD_AIR_STERN`, `WIND_AREA_*`), and the deck rendering are all plain
   constants/
   functions, not behind any ship-type abstraction (`BoatDesign` varies
-  only the keel curve and displacement on that shared hull — its presets
+  only the keel curve, the rudder and displacement on that shared hull — its presets
   are 38-foot sailboat configurations, not ship types). The agreed
   direction is
   to support a small number of other small-vessel types later (starting
@@ -1633,7 +1705,7 @@ PR statement or a signature added to CLA.md, per its §6. The vendored
 required attribution header — keep it when replacing the bundle.
 
 ## Git workflow
-- Development branch: `claude/harbour-sim-feature-aokq29` (current).
+- Development branch: `claude/double-rudder-boat-physics-eatewo` (current).
 - Same rules as Pegasus: curate branches before rebase-merging to `main`;
   the wasm binary is **not tracked** (gitignored) — deploy builds it from
   source; `git fetch origin main && git rebase origin/main` before PRs.
