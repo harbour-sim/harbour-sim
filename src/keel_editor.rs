@@ -176,6 +176,8 @@ impl KeelEditor {
             self.load_design(&BoatDesign::oday_39());
         } else if layout.elan.contains(p) {
             self.load_design(&BoatDesign::elan_impression_394());
+        } else if layout.oceanis.contains(p) {
+            self.load_design(&BoatDesign::beneteau_oceanis_381());
         } else if layout.alajuela.contains(p) {
             self.load_design(&BoatDesign::alajuela_38());
         } else if layout.apply.contains(p) {
@@ -261,7 +263,7 @@ impl KeelEditor {
             return touch_action;
         }
 
-        // D/F/G/L load the preset boats. D is helm-to-starboard and the
+        // D/F/G/B/L load the preset boats. D is helm-to-starboard and the
         // arrows are env keys in the game, but the editor freezes all game
         // input while open, so reusing them here can't conflict.
         if is_key_pressed(KeyCode::D) {
@@ -272,6 +274,9 @@ impl KeelEditor {
         }
         if is_key_pressed(KeyCode::G) {
             self.load_design(&BoatDesign::elan_impression_394());
+        }
+        if is_key_pressed(KeyCode::B) {
+            self.load_design(&BoatDesign::beneteau_oceanis_381());
         }
         if is_key_pressed(KeyCode::L) {
             self.load_design(&BoatDesign::alajuela_38());
@@ -421,8 +426,18 @@ impl KeelEditor {
             1.5,
             rudder_col,
         );
+        // The canvas is a side elevation, so a twin pair sits exactly
+        // behind its sibling and there is nothing extra to draw — but the
+        // label has to say so, or the boat with the most rudder of the
+        // five reads as having the least. (The top-down view in main.rs
+        // is where you actually see both blades.)
+        let rudder_label = if self.rudder.layout.blades() > 1 {
+            "twin rudders (preset-set, not paintable)"
+        } else {
+            "rudder (preset-set, not paintable)"
+        };
         draw_text(
-            "rudder (preset-set, not paintable)",
+            rudder_label,
             rudder_x1 + 4.0 * ui,
             (rudder_top + rudder_bottom) * 0.5,
             fs * 0.55,
@@ -519,6 +534,7 @@ impl KeelEditor {
             (layout.hr38, "HR 38 [D]"),
             (layout.oday, "O'Day 39 [F]"),
             (layout.elan, "Elan 394 [G]"),
+            (layout.oceanis, "Oceanis 38.1 [B]"),
             (layout.alajuela, "Alajuela 38 [L]"),
             (layout.apply, "Apply [Enter]"),
             (layout.cancel, "Cancel [Esc]"),
@@ -543,6 +559,7 @@ pub struct EditorLayout {
     pub hr38: Rect,
     pub oday: Rect,
     pub elan: Rect,
+    pub oceanis: Rect,
     pub alajuela: Rect,
     pub apply: Rect,
     pub cancel: Rect,
@@ -553,23 +570,34 @@ pub struct EditorLayout {
 
 impl EditorLayout {
     /// Lay out the rows under `canvas`: readout text (drawn by `draw`,
-    /// not a rect here), then the displacement slider, then the six
-    /// buttons sized to fill exactly `canvas.w` — a fixed button width
-    /// could overflow the canvas (and the screen) on narrow viewports,
-    /// working against the whole point of having a touch-reachable editor.
+    /// not a rect here), then the displacement slider, then the buttons,
+    /// sized to fill exactly `canvas.w` — a fixed button width could
+    /// overflow the canvas (and the screen) on narrow viewports, working
+    /// against the whole point of having a touch-reachable editor.
+    ///
+    /// TWO rows since the fifth preset landed (2026-09-11): five presets
+    /// plus Apply and Cancel across one row would be `canvas.w / 7` per
+    /// button, well under a thumb on a phone, and the mobile-first rule
+    /// in CLAUDE.md makes that the layout's problem rather than the
+    /// preset's. Presets on top, the two actions below at half width
+    /// each — which also stops a mis-aimed tap at Cancel from landing on
+    /// a preset and silently rewriting the curve.
     pub fn under(canvas: Rect, ui: f32) -> EditorLayout {
         let gap = 12.0 * ui;
-        let bw = (canvas.w - gap * 5.0) / 6.0;
+        let bw = (canvas.w - gap * 4.0) / 5.0;
         let bh = 40.0 * ui;
         let y = canvas.y + canvas.h + 104.0 * ui;
+        let y2 = y + bh + gap;
+        let aw = (canvas.w - gap) / 2.0;
         let x0 = canvas.x;
         EditorLayout {
             hr38: Rect::new(x0, y, bw, bh),
             oday: Rect::new(x0 + (bw + gap), y, bw, bh),
             elan: Rect::new(x0 + (bw + gap) * 2.0, y, bw, bh),
-            alajuela: Rect::new(x0 + (bw + gap) * 3.0, y, bw, bh),
-            apply: Rect::new(x0 + (bw + gap) * 4.0, y, bw, bh),
-            cancel: Rect::new(x0 + (bw + gap) * 5.0, y, bw, bh),
+            oceanis: Rect::new(x0 + (bw + gap) * 3.0, y, bw, bh),
+            alajuela: Rect::new(x0 + (bw + gap) * 4.0, y, bw, bh),
+            apply: Rect::new(x0, y2, aw, bh),
+            cancel: Rect::new(x0 + aw + gap, y2, aw, bh),
             // 55% of the width for the track leaves room for the value
             // label on the right; 26 px tall so it's a real touch target.
             weight: Rect::new(x0, canvas.y + canvas.h + 56.0 * ui, canvas.w * 0.55, 26.0 * ui),

@@ -698,7 +698,7 @@ fn wetted_surface_area(profile: &KeelProfile, rudder: &RudderDesign) -> f32 {
         let xb = xa + dx;
         wsa += 0.5 * (girth(xa) + girth(xb)) * dx;
     }
-    wsa + 2.0 * rudder.area()
+    wsa + 2.0 * rudder.total_area()
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,6 +1001,39 @@ const PROP_AHEAD_OF_RUDDER: f32 = 0.5;
 pub fn prop_station(rudder_x: f32) -> f32 {
     rudder_x + PROP_AHEAD_OF_RUDDER
 }
+
+/// Propeller diameter (m): a 16-inch three-blade auxiliary wheel, the
+/// standard fit behind a ~28 hp saildrive or shaft on a 38-footer. Only
+/// the propeller's RACE needs it (see [`prop_race_radius`]) — thrust
+/// itself is sized from the bollard-pull rule, not from disc area.
+const PROP_DIAMETER: f32 = 0.42;
+
+/// Radius (m) of the propeller's slipstream where it reaches the rudder
+/// station. Actuator-disc theory: a thrusting disc accelerates the flow
+/// through it, so by continuity the race CONTRACTS, to `R/√2` in the far
+/// field — and at the rudder, barely more than a diameter astern, it is
+/// essentially there already. This is the number that decides whether a
+/// blade is in the wash at all, so it is derived from the propeller
+/// rather than asserted per boat.
+fn prop_race_radius() -> f32 {
+    0.5 * PROP_DIAMETER / std::f32::consts::SQRT_2
+}
+
+/// The share of the deflected propeller race a blade `offset` metres off
+/// the centreline can intercept — 1 on the axis, falling to 0 at the edge
+/// of the race, which for any real twin installation means exactly zero.
+///
+/// The linear taper stands in for the jet's own momentum profile (peaked
+/// on the axis, vanishing at the boundary); a blade is laterally a thin
+/// plate, so there is no span of it to average over and its share is just
+/// the local profile value. Nothing here is calibrated to a target: a
+/// centreline blade gets the whole wash exactly as before this existed,
+/// and the Oceanis's blades sit 1.20 m out against a ~0.15 m race, so
+/// they get zero with eight times the margin — the step's exact shape
+/// could not matter less, which is the point of not needing a flag.
+fn wash_fraction(offset: f32) -> f32 {
+    (1.0 - offset.abs() / prop_race_radius()).clamp(0.0, 1.0)
+}
 /// First-order engine spool time constant (s): the delivered thrust chases
 /// the telegraph, it doesn't step. Sim state (`Sim::engine`), advanced only
 /// inside `tick` — deterministic.
@@ -1041,15 +1074,37 @@ const RUDDER_MAX_DEG: f32 = 35.0;
 #[derive(Clone, Copy, Debug)]
 struct RudderFoil {
     x: f32,
+    /// Area of ONE blade — the foil laws below are per-blade, and `tick`
+    /// sums the blades' forces rather than treating twins as one big
+    /// rudder (they are not: each sees its own inflow, and only their
+    /// LIFT adds cleanly while their drag and their moments do not).
     area: f32,
     ar: f32,
     cd_max: f32,
+    /// Lateral offset of each blade (m, +ve to port), and how many of the
+    /// entries are real — `[0.0, _], 1` for a single rudder, `[-d, d], 2`
+    /// for twins. A fixed array keeps the foil `Copy` and keeps the
+    /// hot loop allocation-free.
+    offsets: [f32; 2],
+    blades: usize,
 }
 
 impl RudderFoil {
     fn from(r: &RudderDesign) -> RudderFoil {
         let ar = r.aspect_ratio();
-        RudderFoil { x: r.x, area: r.area(), ar, cd_max: flat_plate_cd(ar) }
+        RudderFoil {
+            x: r.x,
+            area: r.area(),
+            ar,
+            cd_max: flat_plate_cd(ar),
+            offsets: r.layout.offsets(),
+            blades: r.layout.blades(),
+        }
+    }
+
+    /// The blades' lateral offsets, just the real ones.
+    fn offsets(&self) -> &[f32] {
+        &self.offsets[..self.blades]
     }
 }
 /// The lift curve is linear (attached flow) up to STALL_ON (~17°) and
@@ -2219,28 +2274,60 @@ impl Sim {
         // paints it (see `keel.rs`), so there's nothing left to
         // double-count, and the blade's resistance to a spin is exactly
         // as stale or as fresh as its actual angle to the actual flow.
-        let flow = Vec2::new(-surge, -(sway + w * self.rudder.x));
-        let rud_pt = pos + fwd * self.rudder.x;
-        // rudder_force is a PURE function of the inflow and the blade angle,
-        // in the same local (fwd, side) frame `flow` is already expressed
-        // in — it knows nothing about world position/orientation. `tick`
-        // owns computing that inflow (surge/sway/yaw-sweep, above) and
-        // converting the returned local force into world space to apply it
-        // at the right point, below.
-        let f_local = rudder_force(flow, delta, &self.rudder);
-        let f_rudder = fwd * f_local.x + side * f_local.y;
-        rb.add_force_at_point(vector![f_rudder.x, f_rudder.y], point![rud_pt.x, rud_pt.y], true);
-        // Prop wash over the blade: motoring ahead the prop's slipstream
-        // hits the deflected rudder, which turns it sideways — the reaction
-        // is K_WASH·T·sin δ of side force at the stern, there the instant
-        // the throttle opens, boat speed zero or not. THE harbour
-        // manoeuvre: a burst of ahead power kicks the bow around before
-        // the boat gathers way. Astern (thrust < 0) the wash goes forward
-        // under the hull and misses the blade entirely — no steerage
-        // astern until sternway builds real flow, only prop walk. Both
-        // behaviours fall out of the single max(T, 0).
-        let f_wash = side * (-K_WASH * thrust.max(0.0) * delta.sin());
-        rb.add_force_at_point(vector![f_wash.x, f_wash.y], point![rud_pt.x, rud_pt.y], true);
+        //
+        // One pass per BLADE (2026-09-11): a single rudder has one on the
+        // centreline, twins have two set out either side of it. Nothing
+        // in the foil model changed to accommodate them — each blade is
+        // the same foil in its OWN inflow at its OWN point, and the
+        // twin-rudder handling everyone complains about in a marina falls
+        // out of where those points are rather than from any twin-rudder
+        // special case.
+        //
+        // The wash is shared out the same way. `wash_fraction` asks how
+        // much of the propeller race each blade stands in; a centreline
+        // blade gets all of it (unchanged behaviour for the four
+        // single-rudder presets, bit for bit) and a blade a metre
+        // outboard gets none, so a twin-ruddered boat has NO steerage
+        // from a burst of ahead power and must be handled on her
+        // momentum. Normalising by the total keeps the deflected momentum
+        // bounded by the thrust that carries it, the same
+        // bounded-by-construction property `K_WASH`'s thrust-deflection
+        // form was chosen for.
+        let wash_total: f32 = self.rudder.offsets().iter().map(|&y| wash_fraction(y)).sum();
+        let wash_norm = 1.0 / wash_total.max(1.0);
+        for &y_off in self.rudder.offsets() {
+            // The inflow at THIS blade. The yaw sweep of a point (x, y) in
+            // the body frame is w·(−y, x), so an offset blade picks up a
+            // fore-aft term too: spin the boat and the outboard blade of
+            // the pair is driven forward through the water while the
+            // inboard one is dragged back. Zero for a centreline blade,
+            // which is why this generalisation costs the existing presets
+            // nothing.
+            let flow = Vec2::new(-(surge - w * y_off), -(sway + w * self.rudder.x));
+            let rud_pt = pos + fwd * self.rudder.x + side * y_off;
+            // rudder_force is a PURE function of the inflow and the blade
+            // angle, in the same local (fwd, side) frame `flow` is already
+            // expressed in — it knows nothing about world
+            // position/orientation. `tick` owns computing that inflow
+            // (surge/sway/yaw-sweep, above) and converting the returned
+            // local force into world space to apply it at the right point,
+            // below.
+            let f_local = rudder_force(flow, delta, &self.rudder);
+            let f_rudder = fwd * f_local.x + side * f_local.y;
+            rb.add_force_at_point(vector![f_rudder.x, f_rudder.y], point![rud_pt.x, rud_pt.y], true);
+            // Prop wash over the blade: motoring ahead the prop's
+            // slipstream hits the deflected rudder, which turns it
+            // sideways — the reaction is K_WASH·T·sin δ of side force at
+            // the stern, there the instant the throttle opens, boat speed
+            // zero or not. THE harbour manoeuvre, for a boat that has a
+            // blade in the race. Astern (thrust < 0) the wash goes forward
+            // under the hull and misses the blade entirely — no steerage
+            // astern until sternway builds real flow, only prop walk. Both
+            // behaviours still fall out of the single max(T, 0).
+            let share = wash_fraction(y_off) * wash_norm;
+            let f_wash = side * (-K_WASH * thrust.max(0.0) * delta.sin() * share);
+            rb.add_force_at_point(vector![f_wash.x, f_wash.y], point![rud_pt.x, rud_pt.y], true);
+        }
 
         // --- Mooring lines: the crew's orders, then whatever the ropes
         // already out are pulling. Applied at each line's own fairlead,
@@ -2304,11 +2391,12 @@ mod tests {
     /// One knot in m/s.
     const KN: f32 = 0.5144;
 
-    fn presets() -> [(&'static str, BoatDesign); 4] {
+    fn presets() -> [(&'static str, BoatDesign); 5] {
         [
             ("Hallberg-Rassy 38", BoatDesign::hallberg_rassy_38()),
             ("O'Day 39", BoatDesign::oday_39()),
             ("Elan Impression 394", BoatDesign::elan_impression_394()),
+            ("Beneteau Oceanis 38.1", BoatDesign::beneteau_oceanis_381()),
             ("Alajuela 38", BoatDesign::alajuela_38()),
         ]
     }
@@ -2409,6 +2497,26 @@ mod tests {
             println!("  coasting 3->1 kn: {coast:.1} m");
             println!("  90° rudder only: {deg_r:.1}° in {dist_r:.1} m (completed: {done_r})");
             println!("  90° with burst:  {deg_b:.1}° in {dist_b:.1} m (completed: {done_b})");
+            let d = design.keel.derive();
+            let r = &design.rudder;
+            println!(
+                "  derived: area {:.1} m², CLR {:.2} m, yaw damping {:.0} kN·m/(rad/s)²",
+                d.area,
+                d.clr_offset,
+                RHO_WATER * d.drag_cubic_moment / 2000.0
+            );
+            println!(
+                "  rudder: {} blade(s) {:.2}×{:.2} m at x {:.2} (offset ±{:.2}), AR {:.1}, \
+                 total {:.2} m² = {:.0}% of lateral plane",
+                r.layout.blades(),
+                r.chord,
+                r.depth,
+                r.x,
+                r.layout.offset(),
+                r.aspect_ratio(),
+                r.total_area(),
+                100.0 * r.total_area() / d.area
+            );
         }
     }
 
@@ -2439,6 +2547,13 @@ mod tests {
             /// at the protocol's 90 s cap when not.
             rudder_only: (f32, f32, bool),
             with_burst: (f32, f32, bool),
+            /// The real-world coasting anchor this boat is held to (m
+            /// before dropping below 1 kn). A per-boat field rather than
+            /// one shared 100 m constant because carrying way is mostly
+            /// MASS: 100 m is the moderate-to-heavy-displacement claim
+            /// that motivated the ITTC rewrite, and the 6,850 kg Oceanis
+            /// honestly does not meet it (see her entry).
+            coast_anchor_m: f32,
         }
         let pins = [
             Pin {
@@ -2448,6 +2563,7 @@ mod tests {
                 coast_m: 111.3,
                 rudder_only: (90.0, 23.7, true),
                 with_burst: (90.0, 18.4, true),
+                coast_anchor_m: 100.0,
             },
             Pin {
                 name: "O'Day 39",
@@ -2456,6 +2572,7 @@ mod tests {
                 coast_m: 109.6,
                 rudder_only: (90.0, 18.7, true),
                 with_burst: (90.0, 16.4, true),
+                coast_anchor_m: 100.0,
             },
             Pin {
                 name: "Elan Impression 394",
@@ -2464,6 +2581,33 @@ mod tests {
                 coast_m: 112.6,
                 rudder_only: (90.0, 17.4, true),
                 with_burst: (90.0, 15.8, true),
+                coast_anchor_m: 100.0,
+            },
+            Pin {
+                name: "Beneteau Oceanis 38.1",
+                design: BoatDesign::beneteau_oceanis_381(),
+                // Fastest of the five: the longest waterline (10.72 m)
+                // and the lightest displacement, on the same 28 hp.
+                top_speed_kn: 6.13,
+                // The one preset that does NOT make 100 m, and the pin
+                // says so on purpose. It is the published 6,850 kg doing
+                // it, not a modelling choice: this is the O'Day's 110 m
+                // scaled by the mass ratio to within a metre. Light
+                // modern cruisers stopping short is a real complaint
+                // about them, and in this game it is the other half of
+                // the twin-rudder bargain — she will not carry her way
+                // up to a pontoon the way the Alajuela does.
+                coast_m: 93.5,
+                coast_anchor_m: 88.0,
+                // The twin-rudder signature, and the only pin here where
+                // the burst makes the turn WORSE. Every single-rudder
+                // preset tightens up with the throttle open because the
+                // race hits the deflected blade; hers passes between the
+                // blades, so all the burst buys her is speed, and speed
+                // widens the circle. Nothing models this directly — it
+                // falls out of 1.20 m of offset against a 0.15 m race.
+                rudder_only: (90.0, 16.7, true),
+                with_burst: (90.1, 17.7, true),
             },
             Pin {
                 name: "Alajuela 38",
@@ -2475,6 +2619,7 @@ mod tests {
                 // boat now, not of the old basin's walls.
                 rudder_only: (43.8, 67.3, false),
                 with_burst: (90.0, 24.9, true),
+                coast_anchor_m: 100.0,
             },
         ];
         for pin in pins {
@@ -2491,9 +2636,11 @@ mod tests {
                 "{name}: coasting 3->1 kn {coast:.1} m, pinned {:.1} m ±5%",
                 pin.coast_m
             );
-            // Real-world anchor, not just a pin: boats this size coast
-            // past 100 m before dropping below 1 kn.
-            assert!(coast > 100.0, "{name}: coasting {coast:.0} m — real boats pass 100 m");
+            // Real-world anchor, not just a pin: boats this size coast a
+            // long way before dropping below 1 kn — see `coast_anchor_m`
+            // for why the figure is per boat rather than a flat 100 m.
+            let anchor = pin.coast_anchor_m;
+            assert!(coast > anchor, "{name}: coasting {coast:.0} m, anchor {anchor:.0} m");
             for (label, throttle, expect) in [
                 ("rudder only", 0.0, pin.rudder_only),
                 ("with burst", 1.0, pin.with_burst),
@@ -2622,6 +2769,7 @@ mod tests {
             (BoatDesign::hallberg_rassy_38(), 9.50, "Hallberg-Rassy 38"),
             (BoatDesign::oday_39(), 10.21, "O'Day 39"),
             (BoatDesign::elan_impression_394(), 10.01, "Elan Impression 394"),
+            (BoatDesign::beneteau_oceanis_381(), 10.72, "Beneteau Oceanis 38.1"),
             (BoatDesign::alajuela_38(), 9.93, "Alajuela 38"),
         ] {
             let (aft, fwd) = waterline_extent(&design.keel);
@@ -3139,6 +3287,125 @@ mod tests {
             "rudder authority should be far greater ahead than astern: \
              ahead {ahead_authority} vs astern {astern_authority}"
         );
+    }
+
+    #[test]
+    fn the_prop_race_reaches_a_centreline_blade_and_no_twin() {
+        // The whole twin-rudder difference rests on one geometric claim,
+        // so check the claim rather than trusting it. A thrusting disc
+        // contracts its own race to R/√2, which for a 16-inch auxiliary
+        // wheel is ~0.15 m — so a centreline blade is in it entirely and
+        // a blade set out where a real pair sits is nowhere near it.
+        let r = prop_race_radius();
+        assert!(
+            (0.10..0.20).contains(&r),
+            "a 0.42 m wheel should contract to ~0.15 m of race, got {r:.3} m"
+        );
+        assert_eq!(wash_fraction(0.0), 1.0, "a centreline blade stands in the whole race");
+        // Every twin preset's blades, by their own published-geometry
+        // offset — and with room to spare, so the taper's exact shape is
+        // irrelevant (see `wash_fraction`).
+        let twin = BoatDesign::beneteau_oceanis_381().rudder.layout;
+        for y in twin.offsets() {
+            assert_eq!(wash_fraction(y), 0.0, "a blade {y:.2} m out cannot be in a {r:.2} m race");
+        }
+        assert!(
+            twin.offset() > 5.0 * r,
+            "the margin should be large, not marginal: offset {:.2} m vs race {r:.2} m",
+            twin.offset()
+        );
+    }
+
+    #[test]
+    fn twin_rudders_give_no_steerage_from_a_burst_of_ahead_power() {
+        // THE handling consequence, and the reason this preset exists. A
+        // single-rudder boat stopped in her own length can kick her bow
+        // round on a burst of power alone, because the race hits the
+        // deflected blade. A twin-ruddered boat cannot: the race goes
+        // BETWEEN her blades and she has nothing until she has way on.
+        //
+        // Measured against the Elan, which is the fair control rather
+        // than a convenient one — near-identical lateral plane (5.4 vs
+        // 5.3 m²), near-identical yaw damping (33 kN·m/(rad/s)² each) and
+        // slightly LESS blade area than the Oceanis. If the Oceanis
+        // still swings less, the blades' position is the only thing left
+        // that can explain it.
+        //
+        // Differential across both helm directions so prop walk — the
+        // same either way — cancels out and only steering remains.
+        let kick = |design: &BoatDesign| {
+            let swing = |rudder: f32| {
+                let mut sim = Sim::new_with_design(design);
+                let input = InputState { throttle: 1.0, rudder, ..InputState::NEUTRAL };
+                run_input(&mut sim, &Env::CALM, &input, 1.5);
+                sim.boat_pose().1
+            };
+            (swing(1.0) - swing(-1.0)).abs()
+        };
+        let single = kick(&BoatDesign::elan_impression_394());
+        let twins = kick(&BoatDesign::beneteau_oceanis_381());
+        println!("standing burst, 1.5 s: single spade {single:.4} rad, twins {twins:.4} rad");
+        assert!(
+            single > 0.05,
+            "the single-spade control should kick her bow round, got {single:.4} rad"
+        );
+        assert!(
+            twins < 0.25 * single,
+            "twin rudders should get almost nothing from a standing burst: \
+             {twins:.4} rad vs the single spade's {single:.4} rad"
+        );
+    }
+
+    #[test]
+    fn twin_rudders_steer_perfectly_well_once_she_has_way_on() {
+        // The other half of the bargain, and the reason the sim must not
+        // simply model twins as "a worse rudder": with real flow over the
+        // blades they are a lot of area at a good angle, and she out-turns
+        // her single-spade sibling. Same protocol as the open-water turn
+        // benchmark, engine in NEUTRAL so the only difference is the
+        // blades in the water — no wash on either side of the comparison.
+        let (elan_deg, elan_m, _) = measure_turn_90(&BoatDesign::elan_impression_394(), 0.0);
+        let (oce_deg, oce_m, oce_done) = measure_turn_90(&BoatDesign::beneteau_oceanis_381(), 0.0);
+        assert!(oce_done && oce_deg >= 89.0, "she should complete the turn, got {oce_deg:.1}°");
+        assert!(
+            oce_m < elan_m,
+            "with way on, twins should out-turn the single spade: {oce_m:.1} m vs \
+             the Elan's {elan_m:.1} m (at {elan_deg:.1}°)"
+        );
+    }
+
+    #[test]
+    fn spinning_the_hull_drives_the_two_blades_at_different_speeds() {
+        // A blade off the centreline picks up a FORE-AFT component of the
+        // yaw sweep, w·(−y), that a centreline blade never sees: spin the
+        // boat and one blade of the pair is driven forward through the
+        // water while the other is dragged back. It falls out of the
+        // rigid-body kinematics rather than being modeled, so this checks
+        // the sign and that it is the two blades that differ, not the
+        // boat's speed.
+        let design = BoatDesign::beneteau_oceanis_381();
+        let foil = RudderFoil::from(&design.rudder);
+        assert_eq!(foil.offsets().len(), 2);
+        let (surge, sway, w) = (1.0_f32, 0.0, 0.4); // turning to port, 0.4 rad/s
+        let speeds: Vec<f32> = foil
+            .offsets()
+            .iter()
+            .map(|&y| Vec2::new(-(surge - w * y), -(sway + w * foil.x)).length())
+            .collect();
+        assert!(
+            (speeds[0] - speeds[1]).abs() > 0.05,
+            "the blades should see different inflow speeds while spinning, got {speeds:?}"
+        );
+        // offsets() is [−d, +d] and `side` is port, so entry 0 is the
+        // STARBOARD blade — the outboard one in a turn to port, driven
+        // forward and therefore the faster of the two.
+        assert!(
+            speeds[0] > speeds[1],
+            "the outboard blade should be the faster one, got {speeds:?}"
+        );
+        // And a single rudder must be untouched by any of this.
+        let single = RudderFoil::from(&BoatDesign::elan_impression_394().rudder);
+        assert_eq!(single.offsets(), &[0.0]);
     }
 
     #[test]

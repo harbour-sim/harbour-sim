@@ -1185,7 +1185,16 @@ async fn main() {
                 let alpha = engine.abs().min(1.0) * (1.0 - ph) * 0.5;
                 let foam = Color::new(0.75, 0.88, 0.92, alpha);
                 let (a, b) = if engine > 0.0 {
-                    let dir = vec2(-blade.cos(), blade.sin());
+                    // Ahead the slipstream follows the blade it hits —
+                    // but only if a blade is in it. A twin-ruddered
+                    // boat's race passes clean BETWEEN her rudders and
+                    // goes straight aft whatever the helm is doing, which
+                    // is the visible half of why the helm does nothing
+                    // for her at rest (sim-core reaches the same
+                    // conclusion from the same offset — see
+                    // `wash_fraction`).
+                    let deflect = if design.rudder.layout.blades() > 1 { 0.0 } else { blade };
+                    let dir = vec2(-deflect.cos(), deflect.sin());
                     let start = vec2(-6.0, fy * 1.1);
                     let p = start + dir * (ph * (1.5 + 2.2 * engine));
                     (bl(p.x, p.y), bl(p.x + dir.x * 0.7, p.y + dir.y * 0.7))
@@ -1199,20 +1208,6 @@ async fn main() {
             }
         }
 
-        // Rudder blade: stock at the ACTIVE DESIGN's blade position (each
-        // preset carries its real boat's rudder — see `RudderDesign` in
-        // boat.rs; same values the physics uses), drawn BEFORE the hull
-        // fill so the root reads as under the counter and only the swung
-        // part shows past it. Stock at the blade's leading edge, the
-        // drawn line is the chord.
-        let stock_x = design.rudder.x + design.rudder.chord / 2.0;
-        let te = vec2(
-            stock_x - design.rudder.chord * blade.cos(),
-            design.rudder.chord * blade.sin(),
-        );
-        let rp = bl(stock_x, 0.0);
-        let tep = bl(te.x, te.y);
-        draw_line(rp.x, rp.y, tep.x, tep.y, (0.16 * scale).max(1.5), hull_line);
 
         let p0 = bl(HULL_PTS[0].0, HULL_PTS[0].1);
         for i in 1..HULL_PTS.len() - 1 {
@@ -1226,6 +1221,38 @@ async fn main() {
             let b = bl(bx2, by2);
             draw_line(a.x, a.y, b.x, b.y, (0.18 * scale).max(1.0), hull_line);
         }
+        // Rudder blade(s): stock at the ACTIVE DESIGN's blade position
+        // (each preset carries its real boat's rudder — see
+        // `RudderDesign` in boat.rs; the same values the physics uses).
+        // ONE LINE PER BLADE, at the layout's own lateral offsets, so a
+        // twin-ruddered boat visibly has two — same single-source-of-truth
+        // rule as `HULL_PTS` and the harbour geometry: what's drawn is
+        // where the force is applied. Both blades swing together, as they
+        // do on a real boat's linked stocks.
+        //
+        // Drawn OVER the hull, translucent, rather than under it
+        // (2026-09-11). It used to be drawn before the hull fill, meaning
+        // to leave "only the swung part showing past the counter" — but
+        // every preset's blade sits well forward of the hull's own stern
+        // tip (−5.9 m), so in practice the hull covered the blade
+        // completely at every helm angle and no boat here had a visible
+        // rudder at all. Measured in a browser, not assumed. A faint
+        // overlay is the honest top-down convention for an underwater
+        // appendage, and it is the only way the twin pair reads as a
+        // pair.
+        let stock_x = design.rudder.x + design.rudder.chord / 2.0;
+        let blade_col = Color::new(0.16, 0.17, 0.19, 0.55);
+        let offsets = design.rudder.layout.offsets();
+        for &y_off in &offsets[..design.rudder.layout.blades()] {
+            let te = vec2(
+                stock_x - design.rudder.chord * blade.cos(),
+                y_off + design.rudder.chord * blade.sin(),
+            );
+            let rp = bl(stock_x, y_off);
+            let tep = bl(te.x, te.y);
+            draw_line(rp.x, rp.y, tep.x, tep.y, (0.20 * scale).max(2.0), blade_col);
+        }
+
         // Deck details for the current (and, for now, only) modeled ship
         // type — a small cruising sailboat: foredeck lines, coachroof,
         // cockpit, sprayhood, mast + boom (rendered even with the sail
@@ -1590,7 +1617,10 @@ async fn main() {
             let ui = (min_dim / 980.0).clamp(0.5, 1.0);
             let canvas = Rect::new(
                 sw * 0.5 - 300.0 * ui,
-                sh * 0.5 - 170.0 * ui,
+                // Shifted up by half the second button row (see
+                // `EditorLayout::under`) so the whole overlay stays
+                // vertically centred rather than drifting down the screen.
+                sh * 0.5 - 196.0 * ui,
                 600.0 * ui,
                 220.0 * ui,
             );
