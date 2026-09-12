@@ -20,8 +20,11 @@ displacement** on the sim's single ~38 ft hull. Shared between all presets
   work), and the deck rendering;
 - windage areas/coefficients, the ~28 hp auxiliary and its prop (the
   prop's *position* follows the design's rudder — it sits a fixed
-  clearance ahead of the blade, as on every real boat here, so the blade
-  always stands in the wash).
+  clearance ahead of the blade, as on every real boat here). Note that
+  this buys a blade the wash only FORE-AND-AFT: the Oceanis's prop leads
+  her rudders like everyone else's, but her blades are set out either
+  side of the race laterally and so stand in none of it — see *Twin
+  rudders* below, where that is the whole point.
 
 Rudder blades are per-preset since 2026-08-04 (`RudderDesign`: position,
 chord, depth, whether the root is end-plated by the hull, and — since
@@ -63,7 +66,7 @@ preset is allowed to paint deeper than its boat's published draft
 ## The boats
 
 | | Hallberg-Rassy 38 | O'Day 39 | Elan Impression 394 | Beneteau Oceanis 38.1 | Alajuela 38 |
-|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|
 | Role in the sim | **default** — the middle configuration | modern fin-keel cruiser/racer | contemporary cruiser, most agile | **twin rudders** — the modern volume cruiser | traditional long-keel cruiser |
 | Keel / rudder | fin keel, skeg-hung rudder | fin keel, spade rudder | cast-iron fin, deep single spade rudder | bulbed iron fin, **twin spade rudders** | full keel, transom-hung rudder |
 | Designer, years | Olle Enderlein / Christoph Rassy, 1977–1986 (202 built) | Philippe Briand, from 1982 | Rob Humphreys, from 2012 | Finot-Conq, from 2013 | William Atkin's *Ingrid* lineage (Colin Archer ancestry), 1977–1985 |
@@ -211,7 +214,7 @@ an asymptote, not a cutoff); **coasting** — engine neutral from 3 kn,
 path length to 1 kn.
 
 | | Theory / anchor | HR 38 | O'Day 39 | Elan I394 | Oceanis 38.1 | Alajuela 38 |
-|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|
 | Hull speed (kn) | 1.34·√LWL(ft), per boat → | 7.5 | 7.8 | 7.7 | 7.9 | 7.7 |
 | Top speed, 28 hp (kn) | real ~38 ft auxiliaries: ~6.5–7 kn | 5.6 (75%) | 5.9 (75%) | 5.8 (76%) | **6.1 (77%)** | 5.5 (71%) |
 | 90°, rudder only (m) | fin keeler: ~2 boat lengths | 23.7 | 18.7 | 17.4 | **16.7** | plateaus at 44° (67 m) |
