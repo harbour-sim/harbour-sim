@@ -45,11 +45,28 @@ impl RudderLayout {
     pub const SINGLE: RudderLayout = RudderLayout { blades: 1, offset: 0.0 };
 
     /// Two blades, each `offset` metres off the centreline — one to
-    /// port, one to starboard. `offset` must be positive; it is what
-    /// takes both blades OUT of the propeller race, which is the whole
-    /// handling difference and is derived, not declared (sim.rs measures
-    /// each blade against the race's own radius).
+    /// port, one to starboard. It is what takes both blades OUT of the
+    /// propeller race, which is the whole handling difference and is
+    /// derived, not declared (sim.rs measures each blade against the
+    /// race's own radius).
+    ///
+    /// **Panics** unless `offset` is finite and strictly positive
+    /// (CodeRabbit review, 2026-09-12). `BoatDesign` is public, so a
+    /// layout built outside this file reaches `tick`'s force path
+    /// unchecked: a NaN or infinite offset would put NaN into a blade's
+    /// world position and silently poison the whole rigid body, and zero
+    /// would stack both blades on the centreline — a "twin" rudder that
+    /// is really one blade of double area sitting in the prop race,
+    /// i.e. the exact opposite of what this type exists to express.
+    /// One comparison catches all four cases: NaN, negatives and zero
+    /// all fail `> 0.0`, and `< INFINITY` takes the last one. Plain
+    /// comparisons rather than `is_finite`, so this stays a `const fn`
+    /// and a bad literal fails to COMPILE in a const context.
     pub const fn twin(offset: f32) -> RudderLayout {
+        assert!(
+            offset > 0.0 && offset < f32::INFINITY,
+            "twin rudder offset must be finite and strictly positive"
+        );
         RudderLayout { blades: 2, offset }
     }
 
@@ -491,6 +508,30 @@ mod tests {
             (a_oceanis - a_elan).abs() < 0.15 * a_elan,
             "Oceanis {a_oceanis} and Elan {a_elan} should sit in the same band"
         );
+    }
+
+    // Compile-time proof of the const-context claim in `twin`'s docs: a
+    // GOOD literal is accepted in a const item. (The bad-literal half
+    // cannot be written here — it is a compile error by design.)
+    const _GOOD: RudderLayout = RudderLayout::twin(1.2);
+
+    #[test]
+    fn a_twin_layout_refuses_an_offset_that_is_not_a_real_separation() {
+        // `BoatDesign` is public, so these reach `tick`'s force path if
+        // the constructor lets them: NaN/inf poison the rigid body, and
+        // zero is a "twin" rudder that is really one blade on the
+        // centreline — standing in the prop race, the exact behaviour
+        // this type exists to rule out.
+        for bad in [0.0, -1.2, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                std::panic::catch_unwind(|| RudderLayout::twin(bad)).is_err(),
+                "twin({bad}) should be refused"
+            );
+        }
+        // And the real thing still builds.
+        let ok = RudderLayout::twin(1.2);
+        assert_eq!(ok.blades(), 2);
+        assert_eq!(ok.offsets(), [-1.2, 1.2]);
     }
 
     #[test]
