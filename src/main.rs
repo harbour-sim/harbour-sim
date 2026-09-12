@@ -20,12 +20,14 @@ use harbour_sim_core::sim::{
 use keel_editor::{EditorAction, EditorLayout, KeelEditor};
 use macroquad::prelude::*;
 use mooring::{Ctx as MooringCtx, MooringLayout, MooringUi, View};
+use scenario::{Scenario, ScenarioAction, ScenarioLayout};
 use settings::{SettingsLayout, SettingsMenu};
 use wake::Wake;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 mod keel_editor;
 mod mooring;
+mod scenario;
 mod settings;
 mod wake;
 
@@ -45,14 +47,6 @@ const VIEW_MIN_W: f32 = 30.0;
 // end is a close-up for threading a berth.
 const ZOOM_OUT_MAX_W: f32 = 450.0;
 const ZOOM_IN_MIN_W: f32 = 24.0;
-
-// Environment knob rates (per second of key held) and ranges. The touch
-// dials share the same WIND_MAX / CURRENT_MAX: dial rim = max.
-const DIR_RATE: f32 = 45.0; // degrees
-const WIND_RATE: f32 = 3.0; // m/s
-const CURRENT_RATE: f32 = 0.4; // m/s
-const WIND_MAX: f32 = 25.0;
-const CURRENT_MAX: f32 = 2.5;
 
 // Helm/engine key rates (full-scale units per second of key held):
 // hard-over in ~1.1 s, idle to full throttle in ~1.4 s.
@@ -158,34 +152,6 @@ fn hud_button(r: Rect, label: &str, fs: f32, on: bool) {
     );
 }
 
-/// A draggable compass dial (screen-space geometry, css px).
-#[derive(Clone, Copy)]
-struct Dial {
-    cx: f32,
-    cy: f32,
-    r: f32,
-}
-
-impl Dial {
-    fn hit(&self, p: Vec2) -> bool {
-        // Generous hit area — fat fingers land outside the drawn ring.
-        (p - vec2(self.cx, self.cy)).length() <= self.r * 1.45
-    }
-
-    /// Drag position → (compass direction the flow points TOWARD, 0..1
-    /// magnitude). Screen y grows downward, compass 0° = north = up.
-    fn value(&self, p: Vec2) -> (f32, f32) {
-        let v = p - vec2(self.cx, self.cy);
-        let to_deg = v.x.atan2(-v.y).to_degrees().rem_euclid(360.0);
-        let frac = if v.length() < self.r * 0.12 {
-            0.0 // centre dead-zone: an easy way to set dead calm
-        } else {
-            (v.length() / self.r).clamp(0.0, 1.0)
-        };
-        (to_deg.round(), (frac * 20.0).round() / 20.0)
-    }
-}
-
 /// A draggable linear slider (screen-space css px) holding a -1..=1 value:
 /// the throttle (vertical, up = ahead) and the rudder (horizontal, right =
 /// starboard helm). Like a real single-lever control or a helm with
@@ -215,6 +181,66 @@ impl Slider {
         };
         let v = if raw.abs() < 0.10 { 0.0 } else { raw.clamp(-1.0, 1.0) };
         (v * 20.0).round() / 20.0 // same 1/20 quantisation as the dials
+    }
+}
+
+/// Live touch/mouse state of the in-game HUD: which finger (or mouse
+/// press) owns which control, plus the pan/pinch gestures on the water
+/// and the finger holding a mooring gesture.
+///
+/// It lives in one struct because every overlay transition — the keel
+/// editor, the settings menu or the scenario modal opening or closing —
+/// has to reset all of it at once (`overlay_transition`), and the copies
+/// of that reset scattered over the call sites had already started going
+/// stale one field at a time: only the settings-menu copy cleared the
+/// pan/pinch gesture (CodeRabbit review), only some cleared the mooring
+/// grabs, and a missed field reads as a finger resuming a drag it never
+/// made.
+#[derive(Default)]
+struct HudInput {
+    /// Touch ids seen last frame. "Fresh touch" detection is by
+    /// id-not-seen-last-frame, NOT by `TouchPhase::Started` — touchstart
+    /// collapses into the following touchmove whenever events outpace the
+    /// frame loop (the hard-won Pegasus lesson in docs/touch-input.md).
+    prev_touch_ids: Vec<u64>,
+    /// Per-control claims: one `Option<u64>` each is what makes the
+    /// two-thumb grip work — one finger on the throttle, one on the
+    /// rudder, at once.
+    throttle_claim: Option<u64>,
+    rudder_claim: Option<u64>,
+    /// 0 = throttle, 1 = rudder, 2 = pan, 3 = mooring.
+    mouse_claim: Option<u8>,
+    /// The finger holding a mooring gesture and where it was last seen —
+    /// a lifted finger releases the rope where it was let go, which is
+    /// what decides whether it lands on a cleat.
+    mooring_touch: Option<(u64, Vec2)>,
+    /// The finger dragging the camera's follow-offset and where it was
+    /// last frame; `pan_mouse_prev` is the mouse's equivalent, under
+    /// `mouse_claim` 2.
+    pan_touch: Option<(u64, Vec2)>,
+    pan_mouse_prev: Vec2,
+    /// Live pinch, if any: the two finger ids (sorted) + their separation
+    /// last frame.
+    pinch: Option<(u64, u64, f32)>,
+}
+
+impl HudInput {
+    /// An overlay just opened or closed. Snapshot the held touches so the
+    /// first frame on the other side sees every finger as "already known"
+    /// and doesn't false-grab a slider, and drop every claim and gesture:
+    /// a finger that was dragging the throttle, panning the camera or
+    /// leading a rope before the overlay is not continuing that drag
+    /// after it. The mooring grabs go with them — the overlay freezes the
+    /// input block that would otherwise process the release.
+    fn overlay_transition(&mut self, mooring: &mut MooringUi) {
+        self.prev_touch_ids = touches().iter().map(|t| t.id).collect();
+        self.throttle_claim = None;
+        self.rudder_claim = None;
+        self.mouse_claim = None;
+        self.mooring_touch = None;
+        self.pan_touch = None;
+        self.pinch = None;
+        mooring.clear_grabs();
     }
 }
 
@@ -266,6 +292,14 @@ async fn main() {
         current_to_deg: 90.0,
         current_speed: 0.4,
     };
+    // The scenario modal owns the wind/current SETTINGS (the HUD keeps a
+    // read-only panel of them, the same call the settings menu made: the
+    // HUD's job is the boat). Its presets are written relative to the
+    // marina's down-channel bearing, read here straight off the shore
+    // geometry — the same derive-it-from-the-geometry rule the
+    // direction-sensitive sim-core tests follow.
+    let channel_axis = road[n_marina - 1] - road[0];
+    let mut scen = Scenario::new(channel_axis.x.atan2(channel_axis.y).to_degrees());
     // Helm + engine, the other half of the input stream. Unlike `env` this
     // resets to neutral with the boat (see the do_reset block).
     let mut input = InputState::NEUTRAL;
@@ -276,30 +310,19 @@ async fn main() {
     let (mut prev_pos, mut prev_heading) = sim.boat_pose();
     let (mut cur_pos, mut cur_heading) = (prev_pos, prev_heading);
 
-    // Touch/mouse claims for the two dials + two sliders. "Fresh touch"
-    // detection is by id-not-seen-last-frame, NOT by TouchPhase::Started —
-    // touchstart collapses into the following touchmove whenever events
-    // outpace the frame loop (the hard-won Pegasus lesson in
-    // docs/touch-input.md). Per-control claims are what make the two-thumb
-    // grip work: one finger on the throttle, one on the rudder, at once.
-    let mut prev_touch_ids: Vec<u64> = Vec::new();
-    let mut wind_claim: Option<u64> = None;
-    let mut current_claim: Option<u64> = None;
-    let mut throttle_claim: Option<u64> = None;
-    let mut rudder_claim: Option<u64> = None;
-    let mut mouse_claim: Option<u8> = None; // 0 = wind, 1 = current, 2 = throttle, 3 = rudder
-    // User camera zoom (see ZOOM_* above) and the live pinch, if any:
-    // the two finger ids (sorted) + their separation last frame. Zoom is
-    // a camera preference — it survives resets and respawns.
+    // Touch/mouse claims and gestures for the HUD's sliders, the camera
+    // and the mooring handles — see `HudInput`.
+    let mut hud = HudInput::default();
+    // User camera zoom (see ZOOM_* above). Zoom is a camera preference —
+    // it survives resets and respawns.
     let mut zoom = 1.0f32;
-    let mut pinch: Option<(u64, u64, f32)> = None;
-    // Mooring lines: the mode, its handles, and the finger holding one of
-    // them. One claim covers every mooring gesture (leading a line,
-    // hauling, the speed setting) — they are mutually exclusive by hand.
+    // Mooring lines: the mode and its handles. One claim covers every
+    // mooring gesture (leading a line, hauling, the speed setting) — they
+    // are mutually exclusive by hand.
     let mut mooring = MooringUi::new();
-    // Configuration lives in its own menu, not in the play HUD.
+    // Configuration lives in its own menu, not in the play HUD; the run's
+    // conditions live in their own modal, for the same reason.
     let mut settings = SettingsMenu::new();
-    let mut mooring_touch: Option<(u64, Vec2)> = None;
     // Last frame's camera centre, the companion to `last_scale`: input
     // runs before the camera block, so world↔screen hit-testing uses the
     // view the player was actually looking at when they pressed.
@@ -319,8 +342,6 @@ async fn main() {
     // version was tried first and replaced). Cleared by the CENTER
     // button / C key and by any respawn.
     let mut cam_offset = Vec2::ZERO;
-    let mut pan_touch: Option<(u64, Vec2)> = None;
-    let mut pan_mouse_prev = Vec2::ZERO;
     // Last frame's camera scale, for converting a pan's screen delta to
     // world metres at input time (the camera block runs later).
     let mut last_scale = 1.0f32;
@@ -341,49 +362,31 @@ async fn main() {
         // here and could open the keel editor ON TOP of an already-open
         // settings menu: both would update and draw the same frame, two
         // overlapping modals fighting over the same input.
-        if is_key_pressed(KeyCode::E) && !settings.active {
+        if is_key_pressed(KeyCode::E) && !settings.active && !scen.active {
             if !editor.active {
                 editor.load_design(&design);
             }
             editor.active = !editor.active;
-            // The HUD touch/mouse state (prev_touch_ids and all claims)
-            // freezes while the editor is open because the input block is
-            // skipped. Snapshot the current touches so the first frame
-            // after the editor closes sees every held finger as "already
-            // known" and doesn't false-grab dials/sliders. Claims are
-            // cleared unconditionally — a finger that was dragging a
-            // slider before the editor opened is not continuing that drag.
-            prev_touch_ids = touches().iter().map(|t| t.id).collect();
-            wind_claim = None;
-            current_claim = None;
-            throttle_claim = None;
-            rudder_claim = None;
-            mouse_claim = None;
-            // This toggle bypasses the `do_open_editor` path (and its
-            // `mooring.clear_grabs()`) entirely, so a held HAUL/SLACK
-            // survives into the editor being open — held rather than
-            // released, since the input block that would process the
-            // release is what the editor freezes (CodeRabbit review).
-            mooring.clear_grabs();
-            mooring_touch = None;
+            // The HUD touch/mouse state freezes while the editor is open
+            // because the input block is skipped, so every claim and
+            // gesture is dropped across the transition — including the
+            // mooring grabs, which this toggle would otherwise carry into
+            // the editor held (it bypasses the `do_open_editor` path and
+            // the input block that would process their release is exactly
+            // what the editor freezes — CodeRabbit review).
+            hud.overlay_transition(&mut mooring);
         }
 
         // --- HUD layout (css px) -----------------------------------------
-        // Computed every frame regardless of editor state: the dials/reset
-        // button still render (frozen) behind the editor overlay.
+        // Computed every frame regardless of overlay state: the HUD still
+        // renders (frozen) behind an overlay.
         let margin = (min_dim * 0.02).clamp(8.0, 18.0);
-        let dial_r = (min_dim * 0.11).clamp(34.0, 54.0);
         let fs = (min_dim * 0.035).clamp(12.0, 24.0);
-        let wind_dial = Dial {
-            cx: sa_l + margin + dial_r,
-            cy: sa_t + margin + dial_r,
-            r: dial_r,
-        };
-        let current_dial = Dial {
-            cx: sw - sa_r - margin - dial_r,
-            cy: sa_t + margin + dial_r,
-            r: dial_r,
-        };
+        // Conditions panel, top-left, where the wind dial used to sit:
+        // read-only indicators (the settings themselves live in the
+        // scenario modal) and the touch target that opens it — the touch
+        // twin of the V key, the same parity rule as KEEL and LINES.
+        let scen_panel = scenario::hud_panel_rect(&env, sa_l + margin, sa_t + margin, fs);
         let reset_w = fs * 4.6;
         let reset_h = fs * 2.2;
         let reset_rect = Rect::new(
@@ -464,12 +467,13 @@ async fn main() {
             vertical: false,
         };
 
-        if !editor.active && !settings.active {
+        if !editor.active && !settings.active && !scen.active {
             let mut do_reset = is_key_pressed(KeyCode::R);
             let mut do_open_editor = false;
             let mut do_center = is_key_pressed(KeyCode::C);
             let mut do_toggle_lines = is_key_pressed(KeyCode::T);
             let mut do_open_settings = is_key_pressed(KeyCode::O);
+            let mut do_open_scenario = is_key_pressed(KeyCode::V);
 
             // Everything the mooring UI needs of the world this frame,
             // against LAST frame's camera and interpolated pose — input
@@ -487,38 +491,30 @@ async fn main() {
                 layout: mooring_layout,
             };
 
-            // --- Touch input: dial drags + reset/keel taps -----------------
+            // --- Touch input: slider drags + button/panel taps -------------
             let ts = touches();
             let cur_ids: Vec<u64> = ts.iter().map(|t| t.id).collect();
             for t in &ts {
                 let p = t.position / dpi; // physical → logical (see header note)
-                let fresh = !prev_touch_ids.contains(&t.id) || t.phase == TouchPhase::Started;
+                let fresh = !hud.prev_touch_ids.contains(&t.id) || t.phase == TouchPhase::Started;
                 if fresh {
                     // A recycled id is a NEW finger: drop any stale claim first.
-                    if wind_claim == Some(t.id) {
-                        wind_claim = None;
-                    }
-                    if mooring_touch.is_some_and(|(id, _)| id == t.id) {
+                    if hud.mooring_touch.is_some_and(|(id, _)| id == t.id) {
                         mooring.clear_grabs();
-                        mooring_touch = None;
+                        hud.mooring_touch = None;
                     }
-                    if current_claim == Some(t.id) {
-                        current_claim = None;
+                    if hud.throttle_claim == Some(t.id) {
+                        hud.throttle_claim = None;
                     }
-                    if throttle_claim == Some(t.id) {
-                        throttle_claim = None;
+                    if hud.rudder_claim == Some(t.id) {
+                        hud.rudder_claim = None;
                     }
-                    if rudder_claim == Some(t.id) {
-                        rudder_claim = None;
-                    }
-                    if wind_dial.hit(p) && wind_claim.is_none() {
-                        wind_claim = Some(t.id);
-                    } else if current_dial.hit(p) && current_claim.is_none() {
-                        current_claim = Some(t.id);
-                    } else if throttle_slider.hit(p) && throttle_claim.is_none() {
-                        throttle_claim = Some(t.id);
-                    } else if rudder_slider.hit(p) && rudder_claim.is_none() {
-                        rudder_claim = Some(t.id);
+                    if throttle_slider.hit(p) && hud.throttle_claim.is_none() {
+                        hud.throttle_claim = Some(t.id);
+                    } else if rudder_slider.hit(p) && hud.rudder_claim.is_none() {
+                        hud.rudder_claim = Some(t.id);
+                    } else if scen_panel.contains(p) {
+                        do_open_scenario = true;
                     } else if reset_rect.contains(p) {
                         do_reset = true;
                     } else if keel_rect.contains(p) {
@@ -529,50 +525,36 @@ async fn main() {
                         do_open_settings = true;
                     } else if cam_offset.length() > 0.5 && center_rect.contains(p) {
                         do_center = true;
-                    } else if mooring_touch.is_none() && mooring.press(p, &mooring_ctx) {
-                        mooring_touch = Some((t.id, p));
+                    } else if hud.mooring_touch.is_none() && mooring.press(p, &mooring_ctx) {
+                        hud.mooring_touch = Some((t.id, p));
                     }
                 }
-                if wind_claim == Some(t.id) {
-                    let (to, frac) = wind_dial.value(p);
-                    env.wind_from_deg = (to + 180.0).rem_euclid(360.0);
-                    env.wind_speed = frac * WIND_MAX;
-                } else if current_claim == Some(t.id) {
-                    let (to, frac) = current_dial.value(p);
-                    env.current_to_deg = to;
-                    env.current_speed = frac * CURRENT_MAX;
-                } else if throttle_claim == Some(t.id) {
+                if hud.throttle_claim == Some(t.id) {
                     input.throttle = throttle_slider.value(p);
-                } else if rudder_claim == Some(t.id) {
+                } else if hud.rudder_claim == Some(t.id) {
                     input.rudder = rudder_slider.value(p);
-                } else if mooring_touch.is_some_and(|(id, _)| id == t.id) {
+                } else if hud.mooring_touch.is_some_and(|(id, _)| id == t.id) {
                     mooring.hold(p, &mooring_ctx);
-                    mooring_touch = Some((t.id, p));
+                    hud.mooring_touch = Some((t.id, p));
                 }
             }
-            if wind_claim.is_some_and(|id| !cur_ids.contains(&id)) {
-                wind_claim = None;
+            if hud.throttle_claim.is_some_and(|id| !cur_ids.contains(&id)) {
+                hud.throttle_claim = None;
             }
-            if current_claim.is_some_and(|id| !cur_ids.contains(&id)) {
-                current_claim = None;
-            }
-            if throttle_claim.is_some_and(|id| !cur_ids.contains(&id)) {
-                throttle_claim = None;
-            }
-            if rudder_claim.is_some_and(|id| !cur_ids.contains(&id)) {
-                rudder_claim = None;
+            if hud.rudder_claim.is_some_and(|id| !cur_ids.contains(&id)) {
+                hud.rudder_claim = None;
             }
             // A lifted finger releases its mooring gesture where it was
             // last seen — `touches()` drops the id without reporting a
             // final position, and where the rope was let go is exactly
             // what decides whether it lands on a cleat.
-            if let Some((id, at)) = mooring_touch
+            if let Some((id, at)) = hud.mooring_touch
                 && !cur_ids.contains(&id)
             {
                 mooring.release(at, &mooring_ctx);
-                mooring_touch = None;
+                hud.mooring_touch = None;
             }
-            prev_touch_ids = cur_ids;
+            hud.prev_touch_ids = cur_ids;
 
             // --- Pan and pinch on fingers that are NOT holding a HUD
             // control. One free finger drags the camera's follow-offset
@@ -584,55 +566,51 @@ async fn main() {
             let free: Vec<(u64, Vec2)> = ts
                 .iter()
                 .filter(|t| {
-                    wind_claim != Some(t.id)
-                        && current_claim != Some(t.id)
-                        && throttle_claim != Some(t.id)
-                        && rudder_claim != Some(t.id)
-                        && mooring_touch.is_none_or(|(id, _)| id != t.id)
+                    hud.throttle_claim != Some(t.id)
+                        && hud.rudder_claim != Some(t.id)
+                        && hud.mooring_touch.is_none_or(|(id, _)| id != t.id)
                 })
                 .map(|t| (t.id, t.position / dpi))
                 .collect();
             match free[..] {
                 [(id, p)] => {
-                    if let Some((pid, prev)) = pan_touch
+                    if let Some((pid, prev)) = hud.pan_touch
                         && pid == id
                     {
                         let d = p - prev;
                         cam_offset.x -= d.x / last_scale;
                         cam_offset.y += d.y / last_scale; // screen y is inverted
                     }
-                    pan_touch = Some((id, p));
-                    pinch = None;
+                    hud.pan_touch = Some((id, p));
+                    hud.pinch = None;
                 }
                 [(ida, pa), (idb, pb)] => {
                     let key = (ida.min(idb), ida.max(idb));
                     let d = (pa - pb).length();
-                    if let Some((a, b, d0)) = pinch
+                    if let Some((a, b, d0)) = hud.pinch
                         && (a, b) == key
                         && d0 > 1.0
                     {
                         zoom *= d / d0;
                     }
-                    pinch = Some((key.0, key.1, d));
-                    pan_touch = None;
+                    hud.pinch = Some((key.0, key.1, d));
+                    hud.pan_touch = None;
                 }
                 _ => {
-                    pinch = None;
-                    pan_touch = None;
+                    hud.pinch = None;
+                    hud.pan_touch = None;
                 }
             }
 
-            // --- Mouse input: same dials, same gesture ---------------------
+            // --- Mouse input: same controls, same gestures -----------------
             let mp: Vec2 = mouse_position().into();
             if is_mouse_button_pressed(MouseButton::Left) {
-                if wind_dial.hit(mp) {
-                    mouse_claim = Some(0);
-                } else if current_dial.hit(mp) {
-                    mouse_claim = Some(1);
-                } else if throttle_slider.hit(mp) {
-                    mouse_claim = Some(2);
+                if throttle_slider.hit(mp) {
+                    hud.mouse_claim = Some(0);
                 } else if rudder_slider.hit(mp) {
-                    mouse_claim = Some(3);
+                    hud.mouse_claim = Some(1);
+                } else if scen_panel.contains(mp) {
+                    do_open_scenario = true;
                 } else if reset_rect.contains(mp) {
                     do_reset = true;
                 } else if keel_rect.contains(mp) {
@@ -644,49 +622,39 @@ async fn main() {
                 } else if cam_offset.length() > 0.5 && center_rect.contains(mp) {
                     do_center = true;
                 } else if mooring.press(mp, &mooring_ctx) {
-                    mouse_claim = Some(5);
+                    hud.mouse_claim = Some(3);
                 } else {
-                    // Anywhere on the water: drag to pan (claim 4).
-                    mouse_claim = Some(4);
-                    pan_mouse_prev = mp;
+                    // Anywhere on the water: drag to pan (claim 2).
+                    hud.mouse_claim = Some(2);
+                    hud.pan_mouse_prev = mp;
                 }
             }
             if is_mouse_button_down(MouseButton::Left) {
-                match mouse_claim {
-                    Some(0) => {
-                        let (to, frac) = wind_dial.value(mp);
-                        env.wind_from_deg = (to + 180.0).rem_euclid(360.0);
-                        env.wind_speed = frac * WIND_MAX;
-                    }
-                    Some(1) => {
-                        let (to, frac) = current_dial.value(mp);
-                        env.current_to_deg = to;
-                        env.current_speed = frac * CURRENT_MAX;
-                    }
-                    Some(2) => input.throttle = throttle_slider.value(mp),
-                    Some(3) => input.rudder = rudder_slider.value(mp),
-                    Some(4) => {
-                        let d = mp - pan_mouse_prev;
+                match hud.mouse_claim {
+                    Some(0) => input.throttle = throttle_slider.value(mp),
+                    Some(1) => input.rudder = rudder_slider.value(mp),
+                    Some(2) => {
+                        let d = mp - hud.pan_mouse_prev;
                         cam_offset.x -= d.x / last_scale;
                         cam_offset.y += d.y / last_scale; // screen y is inverted
-                        pan_mouse_prev = mp;
+                        hud.pan_mouse_prev = mp;
                     }
-                    Some(5) => mooring.hold(mp, &mooring_ctx),
+                    Some(3) => mooring.hold(mp, &mooring_ctx),
                     _ => {}
                 }
             } else {
-                if mouse_claim == Some(5) {
+                if hud.mouse_claim == Some(3) {
                     mooring.release(mp, &mooring_ctx);
                 }
-                mouse_claim = None;
+                hud.mouse_claim = None;
             }
 
             // --- Keyboard input ---------------------------------------------
-            // The boat has the primary keys — driving it is the main
-            // activity: W/S throttle, A/D helm, Space cuts the engine to
-            // neutral. Wind keeps the arrows; the current sits on IJKL,
-            // the "second arrows" cluster, with the same spatial meaning
-            // (I/K speed up/down, J/L rotate direction).
+            // The boat has the driving keys: W/S throttle, A/D helm, Space
+            // cuts the engine to neutral. Wind and current aren't out here
+            // at all any more — the arrows and the IJKL "second arrows"
+            // cluster still steer them, with the same spatial meaning, but
+            // inside the scenario modal (V).
             if is_key_down(KeyCode::W) {
                 input.throttle = (input.throttle + THROTTLE_KEY_RATE * dt).min(1.0);
             }
@@ -702,32 +670,6 @@ async fn main() {
             if is_key_pressed(KeyCode::Space) {
                 input.throttle = 0.0;
             }
-            if is_key_down(KeyCode::Left) {
-                env.wind_from_deg -= DIR_RATE * dt;
-            }
-            if is_key_down(KeyCode::Right) {
-                env.wind_from_deg += DIR_RATE * dt;
-            }
-            if is_key_down(KeyCode::Up) {
-                env.wind_speed = (env.wind_speed + WIND_RATE * dt).min(WIND_MAX);
-            }
-            if is_key_down(KeyCode::Down) {
-                env.wind_speed = (env.wind_speed - WIND_RATE * dt).max(0.0);
-            }
-            if is_key_down(KeyCode::J) {
-                env.current_to_deg -= DIR_RATE * dt;
-            }
-            if is_key_down(KeyCode::L) {
-                env.current_to_deg += DIR_RATE * dt;
-            }
-            if is_key_down(KeyCode::I) {
-                env.current_speed = (env.current_speed + CURRENT_RATE * dt).min(CURRENT_MAX);
-            }
-            if is_key_down(KeyCode::K) {
-                env.current_speed = (env.current_speed - CURRENT_RATE * dt).max(0.0);
-            }
-            env.wind_from_deg = env.wind_from_deg.rem_euclid(360.0);
-            env.current_to_deg = env.current_to_deg.rem_euclid(360.0);
 
             // --- Zoom, desktop side: scroll wheel and +/- keys (the touch
             // twin is the pinch above). Wheel deltas differ wildly between
@@ -748,24 +690,19 @@ async fn main() {
 
             if do_open_settings {
                 settings.open();
-                // Same claim reset as the keel editor: the fingers that
-                // opened this are not driving dials or ropes.
-                prev_touch_ids = touches().iter().map(|t| t.id).collect();
-                wind_claim = None;
-                current_claim = None;
-                throttle_claim = None;
-                rudder_claim = None;
-                mouse_claim = None;
-                mooring.clear_grabs();
-                mooring_touch = None;
-                // ...and the pan/pinch gesture too (CodeRabbit review): the
-                // pan/pinch block below is inside this same frozen input
-                // block, so a finger already panning when settings opens
-                // would otherwise sit stale until the menu closes, then
-                // read as a jump from wherever it was to wherever that
-                // finger has drifted to since.
-                pan_touch = None;
-                pinch = None;
+                // Same reset as every other overlay transition: the
+                // fingers that opened this are not driving sliders or
+                // ropes, and the pan/pinch gesture goes with them (the
+                // pan/pinch block above is inside this same frozen input
+                // block, so a finger already panning would otherwise sit
+                // stale until the menu closes, then read as a jump from
+                // wherever it was to wherever that finger has drifted to
+                // since — CodeRabbit review).
+                hud.overlay_transition(&mut mooring);
+            }
+            if do_open_scenario {
+                scen.open(&env);
+                hud.overlay_transition(&mut mooring);
             }
             if do_toggle_lines {
                 mooring.active = !mooring.active;
@@ -773,7 +710,7 @@ async fn main() {
                 // starts clean too, so a stale armed fairlead from last
                 // time can't complete on the first tap.
                 mooring.clear_grabs();
-                mooring_touch = None;
+                hud.mooring_touch = None;
                 if !mooring.active {
                     mooring.selected = None;
                 }
@@ -799,32 +736,27 @@ async fn main() {
                 // a queued order or a stale `passing` id would otherwise
                 // reach into a sim that never issued them.
                 mooring.reset();
-                mooring_touch = None;
+                hud.mooring_touch = None;
             }
             if do_open_editor {
                 editor.load_design(&design);
                 editor.active = true;
-                mooring.clear_grabs();
-                mooring_touch = None;
                 // Drop stale claims — these fingers are opening the
-                // editor, not driving dials/sliders.
-                wind_claim = None;
-                current_claim = None;
-                throttle_claim = None;
-                rudder_claim = None;
-                mouse_claim = None;
+                // editor, not driving the sliders.
+                hud.overlay_transition(&mut mooring);
             }
 
             // --- Fixed-timestep physics with render interpolation. ---------
             // Re-checked here rather than relying on the outer guard: this
-            // whole block runs inside `!editor.active && !settings.active`,
-            // but that condition is only evaluated once at the top of the
-            // frame — `do_open_settings` above can flip `settings.active`
-            // true PARTWAY through the same frame, and without this check
-            // the tick below would still run once more (and drain a queued
-            // mooring order) before the freeze visibly takes hold next
-            // frame (CodeRabbit review).
-            if !settings.active {
+            // whole block runs inside `!editor.active && !settings.active
+            // && !scen.active`, but that condition is only evaluated once
+            // at the top of the frame — `do_open_settings` (or
+            // `do_open_scenario`) above can flip an overlay open PARTWAY
+            // through the same frame, and without this check the tick
+            // below would still run once more (and drain a queued mooring
+            // order) before the freeze visibly takes hold next frame
+            // (CodeRabbit review).
+            if !settings.active && !scen.active {
                 accum += dt;
                 while accum >= PHYSICS_DT {
                     prev_pos = cur_pos;
@@ -1282,57 +1214,11 @@ async fn main() {
 
         let text = Color::from_rgba(205, 227, 240, 255);
         let dim = Color::from_rgba(130, 160, 178, 255);
-        let wind_col = Color::from_rgba(120, 220, 255, 255);
-        let cur_col = Color::from_rgba(90, 235, 170, 255);
 
-        // A dial: bg disc, ring (bright while grabbed), N tick, arrow of the
-        // flow's TOWARD direction with a knob at the magnitude, label below.
-        let draw_dial = |d: &Dial, vel: Vec2, frac: f32, col: Color, grabbed: bool, label: &str| {
-            draw_circle(d.cx, d.cy, d.r, Color::from_rgba(10, 20, 30, 150));
-            let ring = if grabbed { col } else { dim };
-            draw_circle_lines(d.cx, d.cy, d.r, if grabbed { 2.5 } else { 1.5 }, ring);
-            draw_text("N", d.cx - fs * 0.22, d.cy - d.r + fs * 0.75, fs * 0.7, dim);
-            if vel.length() > 1e-3 {
-                let dir = vec2(vel.x, -vel.y).normalize(); // screen y down
-                let tip = vec2(d.cx, d.cy) + dir * d.r * frac.max(0.18);
-                let tail = vec2(d.cx, d.cy) - dir * d.r * 0.25;
-                draw_line(tail.x, tail.y, tip.x, tip.y, 3.0, col);
-                let n = vec2(-dir.y, dir.x);
-                draw_triangle(
-                    tip + dir * fs * 0.55,
-                    tip - dir * fs * 0.1 + n * fs * 0.4,
-                    tip - dir * fs * 0.1 - n * fs * 0.4,
-                    col,
-                );
-            } else {
-                draw_circle(d.cx, d.cy, 3.0, col);
-            }
-            let dims = measure_text(label, None, fs as u16, 1.0);
-            draw_text(
-                label,
-                (d.cx - dims.width * 0.5).clamp(4.0, sw - dims.width - 4.0),
-                d.cy + d.r + fs * 1.1,
-                fs,
-                col,
-            );
-        };
-
-        draw_dial(
-            &wind_dial,
-            env.wind_vel(),
-            env.wind_speed / WIND_MAX,
-            wind_col,
-            wind_claim.is_some() || mouse_claim == Some(0),
-            &format!("WIND {:.1} m/s from {:03.0}", env.wind_speed, env.wind_from_deg),
-        );
-        draw_dial(
-            &current_dial,
-            env.current_vel(),
-            env.current_speed / CURRENT_MAX,
-            cur_col,
-            current_claim.is_some() || mouse_claim == Some(1),
-            &format!("CURR {:.1} m/s to {:03.0}", env.current_speed, env.current_to_deg),
-        );
+        // Conditions panel (top-left): read-only twins of the scenario
+        // modal's dials, so the wind and current stay visible while
+        // driving — and tapping it opens the modal to change them.
+        scenario::draw_hud_panel(&env, scen_panel, fs);
 
         let eng_col = Color::from_rgba(255, 185, 80, 255);
         let rud_col = Color::from_rgba(200, 160, 255, 255);
@@ -1378,7 +1264,7 @@ async fn main() {
             &throttle_slider,
             input.throttle,
             eng_col,
-            throttle_claim.is_some() || mouse_claim == Some(2),
+            hud.throttle_claim.is_some() || hud.mouse_claim == Some(0),
         );
         draw_text("F", tr.x + tr.w + 4.0, tr.y + fs * 0.8, fs * 0.7, dim);
         draw_text("R", tr.x + tr.w + 4.0, tr.y + tr.h - fs * 0.15, fs * 0.7, dim);
@@ -1397,7 +1283,7 @@ async fn main() {
             &rudder_slider,
             input.rudder,
             rud_col,
-            rudder_claim.is_some() || mouse_claim == Some(3),
+            hud.rudder_claim.is_some() || hud.mouse_claim == Some(1),
         );
         let rud_label = if input.rudder > 0.0 {
             format!("RUD {:.0} STBD", input.rudder * 35.0)
@@ -1415,14 +1301,25 @@ async fn main() {
             rud_col,
         );
 
-        // Boat speed-over-ground and speed-through-water, centred between
-        // the dials. STW is SOG relative to the current, not the wind —
-        // the reading a paddlewheel/pitot log would give.
+        // Boat speed-over-ground and speed-through-water, along the top
+        // edge. STW is SOG relative to the current, not the wind — the
+        // reading a paddlewheel/pitot log would give.
         let (v, _) = sim.boat_vel();
         let stw = (v - env.current_vel()).length();
         let sog = format!("SOG {:.2} m/s   STW {:.2} m/s", v.length(), stw);
         let sd = measure_text(&sog, None, fs as u16, 1.0);
-        draw_text(&sog, sw * 0.5 - sd.width * 0.5, sa_t + margin + fs, fs, text);
+        // Centred in what the conditions panel leaves free, not in the
+        // whole window: on a phone the panel reaches past the window's
+        // centre line, and a window-centred readout would run straight
+        // through it (the wind dial it replaced was narrow enough not to).
+        let sog_cx = (scen_panel.x + scen_panel.w + sw - sa_r) * 0.5;
+        draw_text(
+            &sog,
+            (sog_cx - sd.width * 0.5).clamp(4.0, (sw - sd.width - 4.0).max(4.0)),
+            sa_t + margin + fs,
+            fs,
+            text,
+        );
 
         // Reset button (bottom-right) — the touch/mouse twin of the R key.
         hud_button(reset_rect, "RESET", fs, false);
@@ -1523,13 +1420,12 @@ async fn main() {
         // indent is harmless dead space in native builds, which have no
         // HTML layer).
         let mut help: Vec<&str> = vec![
-            "left slider = engine, right = rudder; dials set wind & current; pinch/drag = zoom/pan",
+            "left slider = engine, right = rudder",
+            "tap SCENARIO = wind & current; pinch/drag = zoom/pan",
         ];
         if sw >= 700.0 {
-            help.push("keys: W/S throttle, A/D rudder, Space stop engine, arrows wind");
-            help.push(
-                "I/K+J/L = current, R = reset, E = keel, T = lines, O = settings, C = centre",
-            );
+            help.push("keys: W/S throttle, A/D rudder, Space stop engine, V = scenario");
+            help.push("R = reset, E = keel, T = lines, O = settings, C = centre");
         }
         let help_x = sa_l + margin + 40.0;
         // On narrow screens the hint line runs under the buttons (they
@@ -1569,15 +1465,33 @@ async fn main() {
             let layout = SettingsLayout::centred(sw, sh, fs);
             if settings.update(&layout) {
                 settings.active = false;
-                prev_touch_ids = touches().iter().map(|t| t.id).collect();
-                wind_claim = None;
-                current_claim = None;
-                throttle_claim = None;
-                rudder_claim = None;
-                mouse_claim = None;
+                hud.overlay_transition(&mut mooring);
             }
             if settings.active {
                 settings.draw(&layout, sw, sh);
+            }
+        }
+
+        // --- Scenario modal (wind & current) --------------------------------
+        // Freezes the game the same way, and for the same reason: the
+        // conditions are what the run is set IN, so you pick them with the
+        // boat held still rather than while it drifts.
+        if scen.active {
+            let layout = ScenarioLayout::centred(sw, sh, fs);
+            match scen.update(&layout) {
+                ScenarioAction::Apply => {
+                    env = scen.env();
+                    scen.active = false;
+                    hud.overlay_transition(&mut mooring);
+                }
+                ScenarioAction::Cancel => {
+                    scen.active = false;
+                    hud.overlay_transition(&mut mooring);
+                }
+                ScenarioAction::None => {}
+            }
+            if scen.active {
+                scen.draw(&layout);
             }
         }
 
@@ -1607,22 +1521,12 @@ async fn main() {
                     accum = 0.0;
 
                     editor.active = false;
-                    // Same claim reset as the E-key path — see comment there.
-                    prev_touch_ids = touches().iter().map(|t| t.id).collect();
-                    wind_claim = None;
-                    current_claim = None;
-                    throttle_claim = None;
-                    rudder_claim = None;
-                    mouse_claim = None;
+                    // Same reset as the E-key path — see comment there.
+                    hud.overlay_transition(&mut mooring);
                 }
                 EditorAction::Cancel => {
                     editor.active = false;
-                    prev_touch_ids = touches().iter().map(|t| t.id).collect();
-                    wind_claim = None;
-                    current_claim = None;
-                    throttle_claim = None;
-                    rudder_claim = None;
-                    mouse_claim = None;
+                    hud.overlay_transition(&mut mooring);
                 }
                 EditorAction::None => {}
             }
