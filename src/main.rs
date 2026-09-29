@@ -218,6 +218,22 @@ impl Slider {
     }
 }
 
+/// Which control the mouse's current left-button drag belongs to — the
+/// mouse's single claim slot, the twin of the per-control touch claims.
+/// Set on the press, driven while the button is held, dropped on release.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MouseClaim {
+    Wind,
+    Current,
+    Throttle,
+    Rudder,
+    /// A drag on open water: shifts the camera's follow-offset.
+    Pan,
+    /// A mooring gesture (leading a line, holding HAUL/SLACK) — the
+    /// release is forwarded to `MooringUi::release`.
+    Mooring,
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
     // Touches are handled natively below; without this a touch would also
@@ -287,7 +303,7 @@ async fn main() {
     let mut current_claim: Option<u64> = None;
     let mut throttle_claim: Option<u64> = None;
     let mut rudder_claim: Option<u64> = None;
-    let mut mouse_claim: Option<u8> = None; // 0 = wind, 1 = current, 2 = throttle, 3 = rudder
+    let mut mouse_claim: Option<MouseClaim> = None;
     // User camera zoom (see ZOOM_* above) and the live pinch, if any:
     // the two finger ids (sorted) + their separation last frame. Zoom is
     // a camera preference — it survives resets and respawns.
@@ -312,7 +328,7 @@ async fn main() {
     // rather than something the renderer can read off `moored_boats()`.
     let mut moored_poses: Vec<(Vec2, f32)> = sim.moored_poses().collect();
     // Camera pan: an OFFSET from the boat, in world metres (one-finger
-    // drag on the water, or a mouse drag — mouse_claim 4). The camera
+    // drag on the water, or a mouse drag — `MouseClaim::Pan`). The camera
     // keeps FOLLOWING the boat while panned, displaced by this — watch
     // your own approach from over the berth, say — rather than freezing
     // on a fixed world point (owner request 2026-08-05; the fixed-anchor
@@ -626,13 +642,13 @@ async fn main() {
             let mp: Vec2 = mouse_position().into();
             if is_mouse_button_pressed(MouseButton::Left) {
                 if wind_dial.hit(mp) {
-                    mouse_claim = Some(0);
+                    mouse_claim = Some(MouseClaim::Wind);
                 } else if current_dial.hit(mp) {
-                    mouse_claim = Some(1);
+                    mouse_claim = Some(MouseClaim::Current);
                 } else if throttle_slider.hit(mp) {
-                    mouse_claim = Some(2);
+                    mouse_claim = Some(MouseClaim::Throttle);
                 } else if rudder_slider.hit(mp) {
-                    mouse_claim = Some(3);
+                    mouse_claim = Some(MouseClaim::Rudder);
                 } else if reset_rect.contains(mp) {
                     do_reset = true;
                 } else if keel_rect.contains(mp) {
@@ -644,38 +660,38 @@ async fn main() {
                 } else if cam_offset.length() > 0.5 && center_rect.contains(mp) {
                     do_center = true;
                 } else if mooring.press(mp, &mooring_ctx) {
-                    mouse_claim = Some(5);
+                    mouse_claim = Some(MouseClaim::Mooring);
                 } else {
-                    // Anywhere on the water: drag to pan (claim 4).
-                    mouse_claim = Some(4);
+                    // Anywhere on the water: drag to pan.
+                    mouse_claim = Some(MouseClaim::Pan);
                     pan_mouse_prev = mp;
                 }
             }
             if is_mouse_button_down(MouseButton::Left) {
                 match mouse_claim {
-                    Some(0) => {
+                    Some(MouseClaim::Wind) => {
                         let (to, frac) = wind_dial.value(mp);
                         env.wind_from_deg = (to + 180.0).rem_euclid(360.0);
                         env.wind_speed = frac * WIND_MAX;
                     }
-                    Some(1) => {
+                    Some(MouseClaim::Current) => {
                         let (to, frac) = current_dial.value(mp);
                         env.current_to_deg = to;
                         env.current_speed = frac * CURRENT_MAX;
                     }
-                    Some(2) => input.throttle = throttle_slider.value(mp),
-                    Some(3) => input.rudder = rudder_slider.value(mp),
-                    Some(4) => {
+                    Some(MouseClaim::Throttle) => input.throttle = throttle_slider.value(mp),
+                    Some(MouseClaim::Rudder) => input.rudder = rudder_slider.value(mp),
+                    Some(MouseClaim::Pan) => {
                         let d = mp - pan_mouse_prev;
                         cam_offset.x -= d.x / last_scale;
                         cam_offset.y += d.y / last_scale; // screen y is inverted
                         pan_mouse_prev = mp;
                     }
-                    Some(5) => mooring.hold(mp, &mooring_ctx),
-                    _ => {}
+                    Some(MouseClaim::Mooring) => mooring.hold(mp, &mooring_ctx),
+                    None => {}
                 }
             } else {
-                if mouse_claim == Some(5) {
+                if mouse_claim == Some(MouseClaim::Mooring) {
                     mooring.release(mp, &mooring_ctx);
                 }
                 mouse_claim = None;
@@ -1349,7 +1365,7 @@ async fn main() {
             env.wind_vel(),
             env.wind_speed / WIND_MAX,
             wind_col,
-            wind_claim.is_some() || mouse_claim == Some(0),
+            wind_claim.is_some() || mouse_claim == Some(MouseClaim::Wind),
             &format!("WIND {:.1} m/s from {:03.0}", env.wind_speed, env.wind_from_deg),
         );
         draw_dial(
@@ -1357,7 +1373,7 @@ async fn main() {
             env.current_vel(),
             env.current_speed / CURRENT_MAX,
             cur_col,
-            current_claim.is_some() || mouse_claim == Some(1),
+            current_claim.is_some() || mouse_claim == Some(MouseClaim::Current),
             &format!("CURR {:.1} m/s to {:03.0}", env.current_speed, env.current_to_deg),
         );
 
@@ -1405,7 +1421,7 @@ async fn main() {
             &throttle_slider,
             input.throttle,
             eng_col,
-            throttle_claim.is_some() || mouse_claim == Some(2),
+            throttle_claim.is_some() || mouse_claim == Some(MouseClaim::Throttle),
         );
         draw_text("F", tr.x + tr.w + 4.0, tr.y + fs * 0.8, fs * 0.7, dim);
         draw_text("R", tr.x + tr.w + 4.0, tr.y + tr.h - fs * 0.15, fs * 0.7, dim);
@@ -1424,7 +1440,7 @@ async fn main() {
             &rudder_slider,
             input.rudder,
             rud_col,
-            rudder_claim.is_some() || mouse_claim == Some(3),
+            rudder_claim.is_some() || mouse_claim == Some(MouseClaim::Rudder),
         );
         let rud_label = if input.rudder > 0.0 {
             format!("RUD {:.0} STBD", input.rudder * 35.0)

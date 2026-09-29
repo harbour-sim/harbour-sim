@@ -1468,7 +1468,7 @@ like Pegasus.
   (~±100 per notch) — deltas ≥40 are treated as pixels (/240), smaller
   ones as notches (×0.25), both bounded per event. Zoom is a camera
   preference: it survives R-reset and editor Apply. **Pan** (2026-08-05):
-  ONE free finger dragging the water (or a mouse drag — `mouse_claim` 4)
+  ONE free finger dragging the water (or a mouse drag — `MouseClaim::Pan`)
   shifts a FOLLOW-OFFSET (`cam_offset`, world metres relative to the
   boat) — the camera keeps following the boat while panned, displaced
   by the offset (owner spec, second pass same day: a fixed-world-point
@@ -1495,8 +1495,9 @@ like Pegasus.
   dials' 1/20 quantisation, centred at `0.56·sh` to clear the dials+labels
   above and the buttons below down to ~360 px min-dim. A RESET button
   (bottom-right) twins the R key. Mouse drives the same controls via
-  press/drag (`mouse_claim` discriminants: 0 wind, 1 current, 2 throttle,
-  3 rudder). `simulate_mouse_with_touch(false)` at startup so touches
+  press/drag (`mouse_claim: Option<MouseClaim>` — `Wind`, `Current`,
+  `Throttle`, `Rudder`, `Pan`, `Mooring`; an enum, not integer
+  discriminants, so a mistyped claim can't compile). `simulate_mouse_with_touch(false)` at startup so touches
   don't double as mouse presses. **Touch claims are by
   id-not-seen-last-frame, NOT `TouchPhase::Started`** — touchstart
   collapses into the following touchmove whenever touch events outpace
@@ -1523,7 +1524,7 @@ like Pegasus.
   - **One claim covers every mooring gesture** (leading a line, holding
     HAUL/SLACK) — they're mutually exclusive by hand, so it's one
     `Option<Grab>` inside `MooringUi` plus one claim slot outside:
-    `mouse_claim = Some(5)` and
+    `mouse_claim = Some(MouseClaim::Mooring)` and
     `mooring_touch: Option<(u64, Vec2)>`. The touch claim carries the
     finger's LAST SEEN POSITION because `touches()` drops a lifted id
     without reporting a final position, and where the rope was let go is
