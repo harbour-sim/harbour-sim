@@ -1,0 +1,43 @@
+# Version updates for the two dependency ecosystems this repo has. Before
+# this file existed every bump was made by hand, which is how the whole
+# pipeline was still on Node 20 action majors the week GitHub removed
+# Node 20 from its runners (2026-09-23). See CLAUDE.md, "Action versions".
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    # "/" covers .github/workflows/; the composites under .github/actions/
+    # carry their own `uses:` lines (build-site's actions/cache) and are
+    # only scanned when listed.
+    directories:
+      - "/"
+      - "/.github/actions/*"
+    schedule:
+      interval: monthly
+    groups:
+      # deploy-pages only accepts artifacts from a matching
+      # upload-pages-artifact — never land one without the other.
+      pages:
+        patterns:
+          - "actions/upload-pages-artifact"
+          - "actions/deploy-pages"
+      # One PR per action, covering every directory it appears in (cache
+      # is in both ci.yml and the build-site composite).
+      actions:
+        group-by: dependency-name
+        patterns:
+          - "*"
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: cargo
+    # The workspace root; sim-core is a member and is updated with it.
+    directory: "/"
+    schedule:
+      interval: monthly
+    ignore:
+      # glam is pinned to whatever version macroquad re-exports as Vec2, so
+      # the two crates' Vec2s unify across the sim-core boundary. It moves
+      # only when macroquad does, by hand, in the same change (Cargo.toml).
+      - dependency-name: glam
+    commit-message:
+      prefix: deps
