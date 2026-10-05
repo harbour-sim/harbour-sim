@@ -82,6 +82,35 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
 
 `ci.yml` runs on PRs: wasm `cargo check`, clippy `-D warnings`, tests.
 
+### Action versions (Node 24 majors, 2026-10-05)
+Every first-party JavaScript action runs on its Node 24 major:
+`actions/checkout@v7`, `actions/cache@v6`, `actions/github-script@v9`,
+`actions/upload-pages-artifact@v5` + `actions/deploy-pages@v5`. GitHub
+removed Node 20 from hosted runners on 2026-09-23
+([changelog](https://github.blog/changelog/2026-09-23-node-20-is-no-longer-available-in-github-actions/));
+the previous node20 majors kept running only because the runner force-ran
+them on Node 24, with a deprecation warning on every job. Gotchas the new
+majors carry, all checked against this pipeline:
+- **checkout ≥ v6 no longer writes the token into `.git/config`**: it goes
+  into a `$RUNNER_TEMP` file reached through `includeIf "gitdir:<ws>/.git"`
+  plus `includeIf "gitdir:<ws>/.git/worktrees/*"` (the second added in
+  v6.0.1). `sync-pages-branch` commits and pushes from a `git worktree`
+  (`.gh-pages-wt`), so the gh-pages push authenticates ONLY through that
+  worktrees entry — don't move the worktree out of `git worktree add`, and
+  don't nest its name in a subdirectory (`*` doesn't cross `/`).
+- **checkout v7 refuses fork-PR code in `workflow_run`/`pull_request_target`**
+  unless `allow-unsafe-pr-checkout`. Publish Pages' `ref: gh-pages` is a
+  base-repo branch, so it passes; don't add that opt-in.
+- **upload-pages-artifact ≥ v4 drops dotfiles by default.**
+  `include-hidden-files: true` keeps v3's artifact (`.nojekyll` ships;
+  `.git`/`.github` are excluded either way).
+- **github-script v9** is ESM: `require('@actions/github')` fails and
+  `getOctokit` is an injected parameter (`const getOctokit` is a
+  SyntaxError). The sticky-comment scripts use only `github.rest.*` and
+  `context`, which are unchanged.
+- upload-pages-artifact and deploy-pages are bumped TOGETHER
+  (deploy-pages v4+ only takes artifacts from upload-pages-artifact v3+).
+
 ### Fast-forward merges (sequoia-pgp/fast-forward)
 Two workflows wrap the marketplace **Fast Forward Merge** action so PRs can
 land on `main` with `git merge --ff-only` semantics (linear history, commit
