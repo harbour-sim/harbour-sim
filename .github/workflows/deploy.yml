@@ -36,7 +36,7 @@ jobs:
     # and workflow_dispatch have no workflow_run payload, so let them through.
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Deploy the branch TIP as of run time, not the pushed sha. Push runs
       # can start out of order (seen live 2026-08-03: the run for an older

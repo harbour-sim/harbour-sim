@@ -28,7 +28,7 @@ jobs:
     # Fork PRs get a read-only token — they can't push previews or comment.
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Label the build with the PR head sha (the merge-commit sha the
       # checkout sits on means nothing to a reviewer) plus the scope.
@@ -51,7 +51,7 @@ jobs:
           message: "${{ env.SCOPE }}: deploy ${{ steps.rev.outputs.label }}"
 
       - name: Comment preview URL
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           REV: ${{ steps.rev.outputs.label }}
         with:

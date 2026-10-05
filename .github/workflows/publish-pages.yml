@@ -51,14 +51,20 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: gh-pages
 
+      # upload-pages-artifact and deploy-pages are released as a pair
+      # (deploy-pages v4+ only accepts artifacts from upload-pages-artifact
+      # v3+) — move their majors together. From v4 on, upload-pages-artifact
+      # drops dotfiles by default; include-hidden-files keeps the v3
+      # behaviour (.nojekyll ships, .git/.github are still always excluded).
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: .
+          include-hidden-files: true
 
       # The Pages API intermittently rejects deployments created in rapid
       # succession ("Deployment failed, try again later."). One retry after a
@@ -66,10 +72,8 @@ jobs:
       # next branch event re-publishes anyway.
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
         continue-on-error: true
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       - name: Pause before retry
         if: ${{ steps.deployment.outcome == 'failure' }}
@@ -77,6 +81,4 @@ jobs:
 
       - name: Retry deploy (transient Pages API failure)
         if: ${{ steps.deployment.outcome == 'failure' }}
-        uses: actions/deploy-pages@v4
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        uses: actions/deploy-pages@v5
