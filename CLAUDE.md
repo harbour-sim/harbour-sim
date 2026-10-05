@@ -82,6 +82,56 @@ icons + revision injection; `.github/actions/sync-pages-branch` = commit into
 
 `ci.yml` runs on PRs: wasm `cargo check`, clippy `-D warnings`, tests.
 
+### Action versions (Node 24 majors, 2026-10-05)
+Every first-party JavaScript action runs on its Node 24 major:
+`actions/checkout@v7`, `actions/cache@v6`, `actions/github-script@v9`,
+`actions/upload-pages-artifact@v5` + `actions/deploy-pages@v5`. GitHub
+removed Node 20 from hosted runners on 2026-09-23
+([changelog](https://github.blog/changelog/2026-09-23-node-20-is-no-longer-available-in-github-actions/));
+the previous node20 majors kept running only because the runner force-ran
+them on Node 24, with a deprecation warning on every job. Gotchas the new
+majors carry, all checked against this pipeline:
+- **checkout ≥ v6 no longer writes the token into `.git/config`**: it goes
+  into a `$RUNNER_TEMP` file reached through `includeIf "gitdir:<ws>/.git"`
+  plus `includeIf "gitdir:<ws>/.git/worktrees/*"` (the second added in
+  v6.0.1). `sync-pages-branch` commits and pushes from a `git worktree`
+  (`.gh-pages-wt`), so the gh-pages push authenticates ONLY through that
+  worktrees entry — don't move the worktree out of `git worktree add`, and
+  don't nest its name in a subdirectory (`*` doesn't cross `/`).
+- **checkout v7 refuses fork-PR code in `workflow_run`/`pull_request_target`**
+  unless `allow-unsafe-pr-checkout`. Publish Pages' `ref: gh-pages` is a
+  base-repo branch, so it passes; don't add that opt-in.
+- **upload-pages-artifact ≥ v4 drops dotfiles by default.**
+  `include-hidden-files: true` keeps v3's artifact (`.nojekyll` ships;
+  `.git`/`.github` are excluded either way).
+- **github-script v9** is ESM: `require('@actions/github')` fails and
+  `getOctokit` is an injected parameter (`const getOctokit` is a
+  SyntaxError). The sticky-comment scripts use only `github.rest.*` and
+  `context`, which are unchanged.
+- upload-pages-artifact and deploy-pages are bumped TOGETHER
+  (deploy-pages v4+ only takes artifacts from upload-pages-artifact v3+).
+
+`build-site` runs `sudo apt-get update` before installing `librsvg2-bin`
+and `binaryen` — GitHub's own guidance for hosted runners: the image's
+baked-in index goes stale against the mirrors and the install 404s.
+`ubuntu-latest` moves from 24.04 to 26.04 between 2026-10-19 and
+2026-11-19 ([changelog](https://github.blog/changelog/2026-09-17-ubuntu-26-generally-available-and-latest-migration/));
+both packages are published there (packages.ubuntu.com: librsvg2-bin
+2.61, binaryen 120, vs 2.58/108 on 24.04). Not yet exercised on a 26.04
+runner — if the first run there breaks, pin `runs-on: ubuntu-24.04`.
+
+`.github/dependabot.yml` (2026-10-05) raises monthly version-update PRs so
+the next runtime removal isn't found by hand: **github-actions** across
+`.github/workflows/` AND the composites under `.github/actions/*` (only
+scanned because they're listed), one PR per action across every directory
+it appears in, with upload-pages-artifact + deploy-pages grouped into one
+PR; **cargo** from the workspace root, with `glam` ignored — it follows
+macroquad's re-export and moves only with it, by hand. Commit prefixes
+`ci:` / `deps:` match the history. Dependabot-triggered `pull_request`
+runs get a read-only token unless the workflow's `permissions:` raises it
+(GitHub docs); Preview deploy/teardown declare theirs at workflow level,
+so their previews should deploy like any same-repo PR's.
+
 ### Fast-forward merges (sequoia-pgp/fast-forward)
 Two workflows wrap the marketplace **Fast Forward Merge** action so PRs can
 land on `main` with `git merge --ff-only` semantics (linear history, commit
