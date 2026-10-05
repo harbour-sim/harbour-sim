@@ -111,6 +111,15 @@ majors carry, all checked against this pipeline:
 - upload-pages-artifact and deploy-pages are bumped TOGETHER
   (deploy-pages v4+ only takes artifacts from upload-pages-artifact v3+).
 
+`build-site` runs `sudo apt-get update` before installing `librsvg2-bin`
+and `binaryen` — GitHub's own guidance for hosted runners: the image's
+baked-in index goes stale against the mirrors and the install 404s.
+`ubuntu-latest` moves from 24.04 to 26.04 between 2026-10-19 and
+2026-11-19 ([changelog](https://github.blog/changelog/2026-09-17-ubuntu-26-generally-available-and-latest-migration/));
+both packages are published there (packages.ubuntu.com: librsvg2-bin
+2.61, binaryen 120, vs 2.58/108 on 24.04). Not yet exercised on a 26.04
+runner — if the first run there breaks, pin `runs-on: ubuntu-24.04`.
+
 ### Fast-forward merges (sequoia-pgp/fast-forward)
 Two workflows wrap the marketplace **Fast Forward Merge** action so PRs can
 land on `main` with `git merge --ff-only` semantics (linear history, commit
