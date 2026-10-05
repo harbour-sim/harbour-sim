@@ -120,6 +120,18 @@ both packages are published there (packages.ubuntu.com: librsvg2-bin
 2.61, binaryen 120, vs 2.58/108 on 24.04). Not yet exercised on a 26.04
 runner — if the first run there breaks, pin `runs-on: ubuntu-24.04`.
 
+`.github/dependabot.yml` (2026-10-05) raises monthly version-update PRs so
+the next runtime removal isn't found by hand: **github-actions** across
+`.github/workflows/` AND the composites under `.github/actions/*` (only
+scanned because they're listed), one PR per action across every directory
+it appears in, with upload-pages-artifact + deploy-pages grouped into one
+PR; **cargo** from the workspace root, with `glam` ignored — it follows
+macroquad's re-export and moves only with it, by hand. Commit prefixes
+`ci:` / `deps:` match the history. Dependabot-triggered `pull_request`
+runs get a read-only token unless the workflow's `permissions:` raises it
+(GitHub docs); Preview deploy/teardown declare theirs at workflow level,
+so their previews should deploy like any same-repo PR's.
+
 ### Fast-forward merges (sequoia-pgp/fast-forward)
 Two workflows wrap the marketplace **Fast Forward Merge** action so PRs can
 land on `main` with `git merge --ff-only` semantics (linear history, commit
