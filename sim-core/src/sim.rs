@@ -1399,9 +1399,9 @@ fn apply_hull_forces(
     // keel.rs's `drag_clr_offset` — pulled toward whichever end carries
     // more flat-plate keel material, not just where the raw area sits)
     // — aft-of-centre for a typical skeg/rudder boat => weathervaning.
-    rb.add_force(vector![f_surge.x, f_surge.y], wake);
+    rb.add_force(Vector::new(f_surge.x, f_surge.y), wake);
     let clr = pos + fwd * c.keel.drag_clr_offset;
-    rb.add_force_at_point(vector![f_sway.x, f_sway.y], point![clr.x, clr.y], wake);
+    rb.add_force_at_point(Vector::new(f_sway.x, f_sway.y), Vector::new(clr.x, clr.y), wake);
 
     // Yaw drag: the same lateral-area profile, but its Cd-weighted
     // cubic moment — the water resists the hull sweeping around its
@@ -1425,7 +1425,7 @@ fn apply_hull_forces(
     // already the torque above); sway↔yaw cross terms are neglected,
     // consistent with the sway/yaw drag split.
     let f_spin = -side * (0.5 * RHO_WATER * w * w.abs() * c.keel.drag_swept_moment);
-    rb.add_force(vector![f_spin.x, f_spin.y], wake);
+    rb.add_force(Vector::new(f_spin.x, f_spin.y), wake);
 
     // Attached-flow (lifting) lateral force + moment — the OTHER half
     // of the strip model the three drag terms above belong to; see the
@@ -1444,7 +1444,7 @@ fn apply_hull_forces(
         let n_att =
             -surge * p.chi_cut * p.ma_cut * v_cut - surge * (sway * p.j0 + w * p.j1);
         let f_att = side * y_att;
-        rb.add_force(vector![f_att.x, f_att.y], wake);
+        rb.add_force(Vector::new(f_att.x, f_att.y), wake);
         rb.add_torque(n_att, wake);
     }
 
@@ -1457,10 +1457,10 @@ fn apply_hull_forces(
     let cd_air_ax = if a_ax > 0.0 { CD_AIR_STERN } else { CD_AIR_BOW };
     let f_wax = fwd * (0.5 * RHO_AIR * cd_air_ax * WIND_AREA_FRONT * a_ax * a_ax.abs());
     let f_wlat = side * (0.5 * RHO_AIR * CD_AIR_LAT * WIND_AREA_LAT * a_lat * a_lat.abs());
-    rb.add_force(vector![f_wax.x, f_wax.y], wake);
+    rb.add_force(Vector::new(f_wax.x, f_wax.y), wake);
     // Lateral windage centre sits forward => the bow falls off downwind.
     let wc = pos + fwd * WIND_CENTER_OFFSET;
-    rb.add_force_at_point(vector![f_wlat.x, f_wlat.y], point![wc.x, wc.y], wake);
+    rb.add_force_at_point(Vector::new(f_wlat.x, f_wlat.y), Vector::new(wc.x, wc.y), wake);
 }
 
 /// The boat's kinematic state for one tick, as `tick` has already
@@ -1491,9 +1491,12 @@ pub struct Sim {
     narrow_phase: NarrowPhase,
     impulse_joints: ImpulseJointSet,
     multibody_joints: MultibodyJointSet,
+    /// Always empty — Rapier's `step` requires one (0.36+); this sim has
+    /// no soft bodies.
+    soft_bodies: SoftBodySet,
     ccd_solver: CCDSolver,
     integration_params: IntegrationParameters,
-    gravity: Vector<f32>,
+    gravity: Vector,
     boat: RigidBodyHandle,
     /// This boat's hydrodynamic coefficients, derived once at
     /// construction — see `HullCoeffs`.
@@ -1601,9 +1604,9 @@ impl Sim {
         sim.lines.retain(|l| !line_on_broken_fitting(&sim.broken, l));
         {
             let rb = &mut sim.bodies[sim.boat];
-            rb.set_translation(vector![pos.x, pos.y], true);
-            rb.set_rotation(nalgebra::UnitComplex::new(heading), true);
-            rb.set_linvel(vector![vel.x, vel.y], true);
+            rb.set_translation(Vector::new(pos.x, pos.y), true);
+            rb.set_rotation(Rotation::new(heading), true);
+            rb.set_linvel(Vector::new(vel.x, vel.y), true);
             rb.set_angvel(angvel, true);
         }
         sim.engine = engine;
@@ -1649,22 +1652,22 @@ impl Sim {
         // hill shore back sea→head, and the rounded head arc closing the
         // loop. No wall crosses the entrance itself: the marina is open
         // to the sea.
-        let hull_pts: Vec<Point<f32>> = HULL_PTS.iter().map(|&(x, y)| point![x, y]).collect();
+        let hull_pts: Vec<Vector> = HULL_PTS.iter().map(|&(x, y)| Vector::new(x, y)).collect();
         let mut moored: Vec<RigidBodyHandle> = Vec::new();
         let mut fleet_lines: Vec<(Hull, Fairlead, Anchor)> = Vec::new();
         let fleet = if with_harbour { moored_boats() } else { Vec::new() };
         if with_harbour {
-            let mut boundary: Vec<Point<f32>> =
-                road_shore().iter().map(|p| point![p.x, p.y]).collect();
-            let mut hill: Vec<Point<f32>> =
-                hill_shore().iter().map(|p| point![p.x, p.y]).collect();
+            let mut boundary: Vec<Vector> =
+                road_shore().iter().map(|p| Vector::new(p.x, p.y)).collect();
+            let mut hill: Vec<Vector> =
+                hill_shore().iter().map(|p| Vector::new(p.x, p.y)).collect();
             hill.reverse();
             boundary.extend(hill);
             // Head arc runs road[0] → hill[0]; the loop needs hill[0] →
             // road[0], so append its interior reversed and close on road[0].
             let arc = head_arc();
             for p in arc[1..arc.len() - 1].iter().rev() {
-                boundary.push(point![p.x, p.y]);
+                boundary.push(Vector::new(p.x, p.y));
             }
             boundary.push(boundary[0]);
             colliders.insert(
@@ -1680,7 +1683,7 @@ impl Sim {
                 let mid = j.root + j.dir * (j.len * 0.5);
                 colliders.insert(
                     ColliderBuilder::cuboid(j.len * 0.5, JETTY_HALF_W)
-                        .translation(vector![mid.x, mid.y])
+                        .translation(Vector::new(mid.x, mid.y))
                         .rotation(j.dir.y.atan2(j.dir.x))
                         .friction(0.5)
                         .restitution(0.1)
@@ -1694,7 +1697,7 @@ impl Sim {
             for pole in pole_positions() {
                 colliders.insert(
                     ColliderBuilder::ball(POLE_RADIUS)
-                        .translation(vector![pole.x, pole.y])
+                        .translation(Vector::new(pole.x, pole.y))
                         .friction(0.3)
                         .restitution(0.1)
                         .build(),
@@ -1714,7 +1717,7 @@ impl Sim {
             let fleet_displacement = BoatDesign::hallberg_rassy_38().displacement_kg;
             for mb in &fleet {
                 let body = RigidBodyBuilder::dynamic()
-                    .translation(vector![mb.pos.x, mb.pos.y])
+                    .translation(Vector::new(mb.pos.x, mb.pos.y))
                     .rotation(mb.heading)
                     .build();
                 let handle = bodies.insert(body);
@@ -1776,7 +1779,7 @@ impl Sim {
         // The boat: one dynamic body with the convex hull collider.
         let (start, start_heading) = start_pose();
         let body = RigidBodyBuilder::dynamic()
-            .translation(vector![start.x, start.y])
+            .translation(Vector::new(start.x, start.y))
             .rotation(start_heading)
             .ccd_enabled(true)
             .build();
@@ -1832,12 +1835,13 @@ impl Sim {
             narrow_phase: NarrowPhase::new(),
             impulse_joints: ImpulseJointSet::new(),
             multibody_joints: MultibodyJointSet::new(),
+            soft_bodies: SoftBodySet::new(),
             ccd_solver: CCDSolver::new(),
             integration_params: IntegrationParameters {
                 dt: PHYSICS_DT,
                 ..IntegrationParameters::default()
             },
-            gravity: vector![0.0, 0.0],
+            gravity: Vector::new(0.0, 0.0),
             boat,
             hull,
             fleet_hull,
@@ -1901,7 +1905,7 @@ impl Sim {
     #[cfg(test)]
     fn set_pose(&mut self, x: f32, y: f32, heading: f32) {
         let rb = &mut self.bodies[self.boat];
-        rb.set_translation(vector![x, y], true);
+        rb.set_translation(Vector::new(x, y), true);
         rb.set_rotation(Rotation::new(heading), true);
     }
 
@@ -1911,7 +1915,7 @@ impl Sim {
     fn set_forward_speed(&mut self, u: f32) {
         let rb = &mut self.bodies[self.boat];
         let rot = *rb.rotation();
-        rb.set_linvel(vector![rot.re * u, rot.im * u], true);
+        rb.set_linvel(Vector::new(rot.re * u, rot.im * u), true);
     }
 
     /// The mooring lines currently out — read-only, for the HUD and the
@@ -2098,8 +2102,8 @@ impl Sim {
                         continue;
                     }
                     self.bodies[handle].add_force_at_point(
-                        vector![f.x, f.y],
-                        point![p.x, p.y],
+                        Vector::new(f.x, f.y),
+                        Vector::new(p.x, p.y),
                         matches!(line.hull, Hull::Player),
                     );
                     // A rope made fast to a NEIGHBOUR pulls the
@@ -2109,8 +2113,8 @@ impl Sim {
                     if let Some(k) = on_boat {
                         let other = self.moored[k];
                         self.bodies[other].add_force_at_point(
-                            vector![-f.x, -f.y],
-                            point![anchor_at.x, anchor_at.y],
+                            Vector::new(-f.x, -f.y),
+                            Vector::new(anchor_at.x, anchor_at.y),
                             true,
                         );
                     }
@@ -2247,7 +2251,7 @@ impl Sim {
         };
         let prop = pos + fwd * prop_station(self.rudder.x);
         let f_thrust = fwd * thrust;
-        rb.add_force_at_point(vector![f_thrust.x, f_thrust.y], point![prop.x, prop.y], true);
+        rb.add_force_at_point(Vector::new(f_thrust.x, f_thrust.y), Vector::new(prop.x, prop.y), true);
         // Prop walk (right-handed prop): at heading 0, `side` = port (+y).
         // Ahead the stern nudges starboard (-side at the stern => bow falls
         // slightly to port); astern the stern kicks port (+side) — "backs
@@ -2255,7 +2259,7 @@ impl Sim {
         // stern-swinging torque, exactly like the real effect.
         let walk = if n >= 0.0 { -PROP_WALK_AHEAD } else { PROP_WALK_ASTERN } * thrust.abs();
         let f_walk = side * walk;
-        rb.add_force_at_point(vector![f_walk.x, f_walk.y], point![prop.x, prop.y], true);
+        rb.add_force_at_point(Vector::new(f_walk.x, f_walk.y), Vector::new(prop.x, prop.y), true);
 
         // --- Rudder: a foil in the local flow at the stern. δ is the BLADE
         // angle (positive = trailing edge to port => the boat turns to
@@ -2312,7 +2316,7 @@ impl Sim {
             // below.
             let f_local = rudder_force(flow, delta, &self.rudder);
             let f_rudder = fwd * f_local.x + side * f_local.y;
-            rb.add_force_at_point(vector![f_rudder.x, f_rudder.y], point![rud_pt.x, rud_pt.y], true);
+            rb.add_force_at_point(Vector::new(f_rudder.x, f_rudder.y), Vector::new(rud_pt.x, rud_pt.y), true);
             // Prop wash over the blade: motoring ahead the prop's
             // slipstream hits the deflected rudder, which turns it
             // sideways — the reaction is K_WASH·T·sin δ of side force at
@@ -2324,7 +2328,7 @@ impl Sim {
             // behaviours still fall out of the single max(T, 0).
             let share = wash_fraction(y_off) * wash_norm;
             let f_wash = side * (-K_WASH * thrust.max(0.0) * delta.sin() * share);
-            rb.add_force_at_point(vector![f_wash.x, f_wash.y], point![rud_pt.x, rud_pt.y], true);
+            rb.add_force_at_point(Vector::new(f_wash.x, f_wash.y), Vector::new(rud_pt.x, rud_pt.y), true);
         }
 
         // --- Mooring lines: the crew's orders, then whatever the ropes
@@ -2333,7 +2337,7 @@ impl Sim {
         self.step_lines(input, boat);
 
         self.physics_pipeline.step(
-            &self.gravity,
+            self.gravity,
             &self.integration_params,
             &mut self.island_manager,
             &mut self.broad_phase,
@@ -2342,6 +2346,7 @@ impl Sim {
             &mut self.colliders,
             &mut self.impulse_joints,
             &mut self.multibody_joints,
+            &mut self.soft_bodies,
             &mut self.ccd_solver,
             &(),
             &(),
