@@ -1293,6 +1293,33 @@ fn shore_pos(a: Anchor) -> Vec2 {
 /// a `CastOff` aimed at a player line can never name one of theirs.
 const FLEET_LINE_ID_BASE: u32 = 1_000_000;
 
+/// The moored fleet's sleep rule, set explicitly rather than inherited
+/// from Rapier's defaults — which changed under us in the 0.31 → 0.36
+/// upgrade (0.4 m/s centre-of-mass speed for 2 s, became 0.05 units/s of
+/// farthest-point drift for 0.5 s) and froze the fleet short of
+/// equilibrium: a boat on stiff nylon gathers way slowly after a wind
+/// change, so she qualified for sleep straight after the wake-up and was
+/// back asleep at the OLD wind's pose half a second later, ignoring a
+/// moderate turn of the dial entirely. Sleep here has to mean "lying
+/// still on her ropes": the rope is stiff enough (~1 kN per few cm) that
+/// a boat frozen a few centimetres off equilibrium carries a visibly
+/// wrong load into the fitting-failure check. Rapier's drift test is
+/// `drift/2 < threshold·dt`, so `FLEET_SLEEP_SPEED` = 0.002 lets her
+/// doze only when no point of the hull moves faster than 4 mm/s, for
+/// `FLEET_TIME_UNTIL_SLEEP` on end. Measured against the same runs with
+/// sleep disabled (`a_moderate_change_of_wind_reaches_the_awake_fleets_loads`,
+/// rope by rope after 60 s — the fitting check is per fitting, so a
+/// fleet-wide mean would hide errors of mixed sign): the worst single
+/// rope is 38–94 N off for 4 m/s light air, a 12 → 14 m/s step, a 30°
+/// turn of the dial at 8 m/s and a 0.1 m/s current — under 1 % of the
+/// 14 kN deck fitting, though up to ~40 % of a lightly loaded rope's own
+/// few hundred newtons. Rapier's defaults miss by 415–570 N; a 0.005
+/// rule (2.5× looser, ~3 µs/tick cheaper) by up to 153 N, which is why
+/// it is not 0.005. Tightening further does not help: 0.001 and 0.0005
+/// both leave 33–62 N, so that residual is not freeze from this rule.
+const FLEET_TIME_UNTIL_SLEEP: f32 = 2.0;
+const FLEET_SLEEP_SPEED: f32 = 0.002;
+
 /// Everything the hull-force model needs to know about a boat's shape,
 /// derived once at construction. One set per hull KIND: the player's,
 /// from the active `BoatDesign`, and the moored fleet's, from the default
@@ -1716,10 +1743,12 @@ impl Sim {
             // and this loop runs once per berthed hull.
             let fleet_displacement = BoatDesign::hallberg_rassy_38().displacement_kg;
             for mb in &fleet {
-                let body = RigidBodyBuilder::dynamic()
+                let mut body = RigidBodyBuilder::dynamic()
                     .translation(Vector::new(mb.pos.x, mb.pos.y))
                     .rotation(mb.heading)
                     .build();
+                body.activation_mut().time_until_sleep = FLEET_TIME_UNTIL_SLEEP;
+                body.activation_mut().normalized_linear_threshold = FLEET_SLEEP_SPEED;
                 let handle = bodies.insert(body);
                 colliders.insert_with_parent(
                     ColliderBuilder::convex_hull(&hull_pts)
@@ -1916,6 +1945,16 @@ impl Sim {
         let rb = &mut self.bodies[self.boat];
         let rot = *rb.rotation();
         rb.set_linvel(Vector::new(rot.re * u, rot.im * u), true);
+    }
+
+    /// Test-only: the moored fleet never sleeps. The ground truth sleep
+    /// is an optimisation of — whatever a sleeping fleet settles to must
+    /// match what a fleet that is simulated every tick settles to.
+    #[cfg(test)]
+    fn keep_fleet_awake(&mut self) {
+        for &h in &self.moored {
+            self.bodies[h].activation_mut().normalized_linear_threshold = -1.0;
+        }
     }
 
     /// The mooring lines currently out — read-only, for the HUD and the
@@ -4195,6 +4234,71 @@ mod tests {
             .map(|((p, _), &was)| (p - was).length())
             .fold(0.0f32, f32::max);
         assert!(moved > 0.02, "the fleet slept through a gale, moving {moved} m");
+    }
+
+    /// Sleep must not FREEZE the fleet short of where the wind puts it.
+    /// The gale test above is the easy case: a reversal throws the boats
+    /// hard enough to blow straight through any sleep threshold. A
+    /// MODERATE step is the hard one — the boats start from rest on stiff
+    /// nylon and gather way slowly, so a fleet allowed to doze off too
+    /// soon after the wake-up goes straight back to sleep at the old
+    /// wind's pose and ignores the dial (found when the Rapier 0.36
+    /// upgrade shortened the default `time_until_sleep` and loosened the
+    /// default threshold; see `FLEET_SLEEP_SPEED`). The reference is the
+    /// same run with sleep disabled, compared ROPE BY ROPE: the fitting
+    /// check works per fitting, and a fleet-wide mean would let one boat
+    /// frozen heavy cancel another frozen light.
+    #[test]
+    fn a_moderate_change_of_wind_reaches_the_awake_fleets_loads() {
+        // Worst single rope, asleep vs awake, in newtons. Under 1 % of the
+        // 14 kN deck fitting the check compares against. Rapier's own
+        // defaults miss by 415–570 N, a 0.005 rule by up to 153 N; the
+        // shipped rule's worst is 94 N (the 30° turn). Even a rule 4×
+        // tighter leaves 33–62 N, so this is not a knob to chase lower.
+        const FLEET_FREEZE_TOLERANCE_N: f32 = 120.0;
+        let fleet_tensions = |sleep: bool, steps: &[(Env, f32)]| {
+            let mut sim = Sim::new();
+            if !sleep {
+                sim.keep_fleet_awake();
+            }
+            for (env, secs) in steps {
+                run(&mut sim, env, *secs);
+            }
+            sim.lines()
+                .iter()
+                .filter(|l| matches!(l.hull, Hull::Moored(_)))
+                .map(|l| (l.id, l.tension))
+                .collect::<Vec<_>>()
+        };
+        let wind = |from: f32, speed: f32| Env { wind_from_deg: from, wind_speed: speed, ..Env::CALM };
+        let cases: [&[(Env, f32)]; 4] = [
+            // Light air: small loads, so millimetres of freeze are a big fraction.
+            &[(wind(135.0, 4.0), 60.0)],
+            // A moderate step in strength...
+            &[(wind(135.0, 12.0), 60.0), (wind(135.0, 14.0), 30.0)],
+            // ...and in direction, the dial's other axis.
+            &[(wind(200.0, 8.0), 60.0), (wind(230.0, 8.0), 60.0)],
+            // A gentle current: water is ~800× denser than air.
+            &[(Env { current_to_deg: 90.0, current_speed: 0.1, ..Env::CALM }, 60.0)],
+        ];
+        for steps in cases {
+            let asleep = fleet_tensions(true, steps);
+            let awake = fleet_tensions(false, steps);
+            assert_eq!(asleep.len(), awake.len());
+            let (worst_id, worst) = asleep
+                .iter()
+                .zip(&awake)
+                .map(|(&(ia, ta), &(ib, tb))| {
+                    assert_eq!(ia, ib, "the two runs rigged the fleet differently");
+                    (ia, (ta - tb).abs())
+                })
+                .fold((0, 0.0f32), |m, x| if x.1 > m.1 { x } else { m });
+            assert!(
+                worst < FLEET_FREEZE_TOLERANCE_N,
+                "after {steps:?}: fleet rope {worst_id} carries {worst:.0} N more or less \
+                 asleep than awake"
+            );
+        }
     }
 
 
