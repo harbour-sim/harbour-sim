@@ -179,7 +179,21 @@ already solves structurally, the same way Publish Pages does.
 - `sim-core/` — the **`harbour-sim-core` library crate** (workspace member):
   the whole deterministic half. **Nothing in it may depend on macroquad or
   any nondeterminism**; it uses `glam` (pinned to the version macroquad
-  0.4.15 re-exports, so `Vec2` unifies across the boundary) + `rapier2d`.
+  0.4.15 re-exports, so `Vec2` unifies across the boundary) + `rapier2d`
+  (0.36). Rapier 0.36 does its math in glam too, but ITS glam (0.33,
+  via `glamx`) is a different crate version from ours, so the
+  `Vector::new(v.x, v.y)` conversions at every Rapier call stay — don't
+  try to pass our `Vec2` straight in. **Cost of the 0.36 upgrade: wasm
+  size.** The release `harbour-sim.wasm` grew 1.10 → 1.73 MB raw (392 →
+  630 KB gzip -9, before build-site's `wasm-opt -Oz`, not measured
+  locally). Rapier's own code went ~98 → ~448 KB (function bodies,
+  attributed by symbol name), ~170 KB of it soft-body code
+  (`dynamics::soft_body` plus soft-contact assembly/narrow-phase passes)
+  that `PhysicsPipeline::step` reaches unconditionally — it takes a
+  `SoftBodySet`, always empty here — and no cargo feature gates it
+  (`fem` is already off; dropping the default `block-solver` feature left
+  the size unchanged). Most of the rest is `dynamics::solver`. Traded
+  knowingly for a ~35 % cheaper tick (see the sleep bullet).
   - `sim-core/src/sim.rs` — `Sim` (Rapier world: the marina's boundary
     polyline, jetties, mooring poles, the moored fleet — DYNAMIC bodies
     on their own mooring lines since 2026-08-20 — plus the boat),
@@ -685,23 +699,33 @@ like Pegasus.
     itself at the top of the wind dial, losing 63 harbour cleats to a
     slammed wind reversal, because those breast lines sat at 87 % of a
     9 kN limit before anything happened. With the ordering right the same
-    reversal peaks at 10.6 kN against 14 kN and costs nothing.
+    reversal peaks at 10.8 kN against 14 kN and costs nothing.
   - **What the weather can do to the marina** (2026-08-20, re-measured
-    2026-08-21; `measure_resting_mooring_loads` and
+    2026-08-21 and again 2026-11-15 after the Rapier 0.31 → 0.36
+    upgrade; `measure_resting_mooring_loads` and
     `measure_mooring_loads`). At `WIND_MAX` (25 m/s) the fleet's
-    most-loaded ropes sit at a p90 of 7.8 kN — 56 % of the 14 kN deck
+    most-loaded ropes sit at a p90 of 7.2 kN — 51 % of the 14 kN deck
     fitting that holds them — and a slammed SE→NW reversal peaks at
-    10.6 kN and costs nothing. The suddenness was never the issue: a
-    step from calm to 50 knots in one tick peaks at 4.8 kN. What made
+    10.8 kN and costs nothing. The suddenness was never the issue: a
+    step from calm to 50 knots in one tick peaks at 5.8 kN. What made
     the marina fragile was the FITTING ORDERING (see
     `DECK_FITTING_MBL`), not the weather model. Two things worth
     remembering from that investigation: a berth's breast lines carry
-    more than its crossed pole lines (p90 7.8 vs 6.9 kN at `WIND_MAX`)
+    more than its crossed pole lines (p90 7.2 vs 6.2 kN at `WIND_MAX`)
     because the pole lines meet a beam load at poor angles; and a wind
     DIRECTION swept round has a resonance band at 6–8 s per revolution,
     the mooring system's own period (12.4 kN at 6 s against 7.8 kN at
     45 s), far more punishing than any step — so "smooth the dial" would
-    move a fast sweep toward the dangerous band, not away from it. Max
+    move a fast sweep toward the dangerous band, not away from it.
+    **The pre-2026-11-15 figures here were partly SLEEP artefacts**
+    (found re-measuring for the Rapier upgrade): the one-tick step's
+    4.8 kN and the resting p90s (8.0/7.2 kN at 25 m/s) were boats frozen
+    short of equilibrium by Rapier 0.31's default sleep rule. Run with
+    fleet sleep DISABLED, 0.31 and 0.36 agree within ~1 % on every
+    figure except the 10 s and 14 s sweeps (9.2 → 10.5 kN, 9.0 →
+    9.7 kN), a genuine solver difference. The figures above come from
+    the explicit sleep rule (`FLEET_SLEEP_SPEED`, see the sleep bullet),
+    every one within ~1 % of the no-sleep run. Max
     wind AND max current together still reach 14 kN, which is correct
     (water is ~800× denser than air) and a marina nobody would have
     built; `CURRENT_MAX` is the knob there, not the physics.
@@ -914,7 +938,31 @@ like Pegasus.
     she shares with someone else's rope has to carry her load too, so
     her ropes are now WORKED OUT every tick and only the force
     APPLICATION is skipped; see the per-fitting-sum bullet below for the
-    updated 121 µs figure.)
+    updated 121 µs figure.) The Rapier 0.31 → 0.36 upgrade
+    (2026-11-15) cut a full-marina tick from ≈85 to ≈55 µs on the same
+    machine (8 m/s breeze, after a 10 s settle; never-sleeping fleet
+    ≈92 µs; absolute numbers are machine-specific, compare within one
+    run only).
+    **Gotcha (2026-11-15): the fleet's sleep rule is EXPLICIT now**
+    (`FLEET_SLEEP_SPEED`, `FLEET_TIME_UNTIL_SLEEP` in sim.rs — 4 mm/s of
+    farthest-point motion for 2 s), not Rapier's default. 0.36's default
+    (0.5 s below ≈10 cm/s) put a boat back to sleep half a second after
+    a wind-change wake-up, before she had gathered way, so a moderate
+    turn of the dial was ignored and rope loads froze far from
+    equilibrium (fleet-mean −87 % at 4 m/s, +9 % after 12 → 14 m/s;
+    single ropes up to ~570 N off). Sleep has to mean "lying still on
+    her ropes"; on stiff nylon a few centimetres of freeze is a visibly
+    wrong load in the fitting check.
+    `a_moderate_change_of_wind_reaches_the_awake_fleets_loads` pins it
+    against the same runs with sleep disabled, ROPE BY ROPE (worst
+    single rope under 120 N; the shipped rule's worst is 94 N), over a
+    strength step, a 30° direction turn, light air and a gentle current.
+    Two lessons from getting there: test BOTH dial axes and the current
+    (a looser 0.005 passed the strength cases and was 11–12 % out on the
+    turn and the current), and compare per rope, not a fleet mean — the
+    fitting check is per fitting, and freeze errors of mixed sign cancel
+    in a mean (a 0.9 % mean hid a 39 % single rope). Re-check it
+    whenever Rapier moves, since its defaults are not ours to rely on.
     **Gotcha**: `reset_forces(true)` was the one that kept the whole
     marina awake — easy to miss, since it reads as bookkeeping rather
     than as a force. The one thing sleep would otherwise break is that
